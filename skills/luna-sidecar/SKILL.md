@@ -5,19 +5,18 @@ description: Let Luna do a clear piece of work while you stay on the main task. 
 
 # Luna Helper
 
-Give Luna one clear job. It keeps its session, so you can come back to it.
+Run the bundled script. It sends the task through stdin, so quoting and long prompts stay reliable.
 
 ```sh
-codex exec --model gpt-5.6-luna -c model_reasoning_effort=medium --sandbox workspace-write -C "." "<what Luna should do>"
+node "<skill-folder>/scripts/luna-sidecar.mjs" --effort medium -- "<one clear task>"
 ```
 
 - Luna can edit the current project by default.
-- Pick the thinking level you want: `low`, `medium`, `high`, `xhigh`, or `max`.
-- Keep the session id printed by the command if you want a follow-up:
+- Pick `low`, `medium`, `high`, `xhigh`, or `max` with `--effort`.
+- Add `--read-only` when Luna should only inspect.
+- Add `--cwd <project-folder>` to work in another folder.
+- Keep the session id printed by Codex if you need a follow-up:
 
 ```sh
 codex exec resume <session-id> "<what to do next>"
 ```
-
-- Want Luna to only look? Change `workspace-write` to `read-only`.
-- If Luna cannot run commands, say that the local Codex setup is broken.
