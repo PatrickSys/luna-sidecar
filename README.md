@@ -1,30 +1,32 @@
 # Luna Sidecar
 
-Use `gpt-5.6-luna` as a bounded external worker while your current Codex task stays in charge.
+Let your AI hand a clear piece of work to Luna.
 
-## Install for Codex
+## Install
+
+For Codex:
 
 ```sh
 npx skills add PatrickSys/luna-sidecar -g -a codex -y
 ```
 
-The Skills CLI installs Codex skills into its shared `.agents/skills` location. Codex discovers that location globally, so do not manually duplicate the skill.
+For another supported AI, replace `codex` with that AI's name.
 
-Start a new Codex task after installing.
+The installer puts Codex skills in `.agents/skills`. Codex reads that folder automatically.
 
 ## Use
 
-Ask Codex:
+Tell your AI:
 
 ```text
-Use $luna-sidecar to inspect the authentication flow and return a minimal fix plan.
+Use luna-sidecar to fix the validation bug in src/auth and run the focused tests.
 ```
 
-Luna runs as an isolated `codex exec` task. It is not a native `spawn_agent` child: give it one self-contained task, then review and integrate its response in the coordinating task.
+Luna can edit the project by default. Give it one clear job, the files it should touch, and the result you want.
 
-## Safety
+## What you need
 
-The skill defaults to `read-only`. Use `workspace-write` only when edits are explicitly authorized and Luna owns a non-overlapping file slice.
+The machine needs the Codex CLI, signed in with access to `gpt-5.6-luna`. Any AI that understands skills can use this skill to launch Luna through that CLI.
 
 ## License
 
