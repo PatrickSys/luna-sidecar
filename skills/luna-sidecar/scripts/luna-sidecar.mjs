@@ -9,6 +9,7 @@ let effort = "medium";
 let sandbox = "workspace-write";
 let cwd = process.cwd();
 let prompt = "";
+let bypass = false;
 
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
@@ -23,6 +24,10 @@ for (let index = 0; index < args.length; index += 1) {
   }
   if (arg === "--read-only") {
     sandbox = "read-only";
+    continue;
+  }
+  if (arg === "--bypass") {
+    bypass = true;
     continue;
   }
   if (arg === "--cwd") {
@@ -41,8 +46,7 @@ const codexArgs = [
   "gpt-5.6-luna",
   "-c",
   `model_reasoning_effort=${effort}`,
-  "--sandbox",
-  sandbox,
+  ...(bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", sandbox]),
   "-C",
   cwd,
   "-",
