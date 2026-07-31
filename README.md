@@ -1,6 +1,6 @@
 # Luna Sidecar
 
-Give Luna a clear piece of work while your main AI keeps going.
+Give Luna clear work while your main AI keeps going. Start one or several real Luna workers, then inspect, resume, or stop them by id.
 
 ## Install
 
@@ -12,33 +12,41 @@ npx skills add PatrickSys/luna-sidecar -g -a codex -y
 
 For another supported AI, replace codex with that AI name. The installer copies the skill and its bundled launcher into that AI skills folder.
 
-## Use
+## Start workers
 
 Tell your AI:
 
 ~~~text
-Use luna-sidecar to fix the validation bug in src/auth and run the focused tests.
+Use luna-sidecar to start two independent Luna workers: one reviews auth and one reviews billing. Keep them on separate files.
 ~~~
 
-The skill runs its local bundled script. It does not use npx for each Luna job.
-
-## Direct use
+Or call the installed script directly:
 
 ~~~sh
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" --effort high -- "Find the root cause and fix it."
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" start --effort high -- "Review src/auth and report the bug."
 ~~~
+
+Start returns a worker id immediately. The worker keeps running after the command ends. Start more workers when your AI host can make parallel shell calls. Do not give two writing workers the same files.
+
+## Control workers
+
+~~~sh
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" status <worker-id>
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" wait <worker-id>
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" resume <worker-id> -- "Run the focused tests and fix failures."
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" cancel <worker-id>
+node "<installed-skill-folder>/scripts/luna-sidecar.mjs" list
+~~~
+
+The manager commands print JSON with the real worker id, Codex session id, state, and final message. Luna session records persist locally, so resume continues the same Luna conversation.
+
+## Options
 
 Luna can edit the project by default. Use --read-only for inspection only, --bypass for full access with no approvals or sandbox, --cwd <project-folder> for another project, and choose low, medium, high, xhigh, or max with --effort.
 
-The launcher passes the task over stdin, avoiding shell quoting and command-length trouble.
+Use run instead of start for a blocking one-off command. Leaving off run keeps the same one-off behavior for older uses.
 
-## Continue a Luna session
-
-Codex prints a session id. Use it for a follow-up:
-
-~~~sh
-codex exec resume <session-id> "Run the tests and fix anything that fails."
-~~~
+The launcher passes tasks over stdin, avoiding shell quoting and command-length trouble. It does not use npx for each Luna job.
 
 ## What you need
 
