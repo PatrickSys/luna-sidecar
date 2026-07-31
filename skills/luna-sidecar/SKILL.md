@@ -14,6 +14,7 @@ node "<skill-folder>/scripts/luna-sidecar.mjs" --effort medium -- "<one clear ta
 - Luna can edit the current project by default.
 - Pick `low`, `medium`, `high`, `xhigh`, or `max` with `--effort`.
 - Add `--read-only` when Luna should only inspect.
+- Add `--bypass` when you explicitly want full access with no approvals or sandbox.
 - Add `--cwd <project-folder>` to work in another folder.
 - Keep the session id printed by Codex if you need a follow-up:
 
