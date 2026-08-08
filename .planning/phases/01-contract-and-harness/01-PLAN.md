@@ -7,6 +7,7 @@ runtime: codex-cli
 assurance: self_checked
 depends_on: []
 files-modified:
+  - .planning/phases/01-contract-and-harness/01-PLAN.md
   - package.json
   - test/helpers/cli-harness.mjs
   - test/fixtures/fake-codex.mjs
@@ -172,8 +173,9 @@ Execute `01-01 -> 01-02 -> 01-03`. Do not begin a task until every command in th
     executable shebang `codex` shim on POSIX, both forwarding argv/stdin to the Node fake without
     interpolating the prompt. Prepend that directory to the child `PATH` so the unmodified
     production `cmd.exe`/bare-`codex` launch path is exercised. Build a helper that creates unique
-    temporary cwd/state roots, invokes the real launcher, captures stdout/stderr/exit code, parses
-    exactly one manager JSON value, and always verifies fixture processes are gone.
+    temporary cwd/state roots, invokes the real launcher, and captures stdout/stderr/exit code.
+    Parse exactly one JSON value only for manager paths that currently emit JSON; retain raw output
+    for foreground `run`, help, and parse/usage failures. Always verify fixture processes are gone.
     Add a focused fixture proving `--help` cannot accidentally launch a provider before Phase 4
     implements successful help output.
   </action>
@@ -182,8 +184,11 @@ Execute `01-01 -> 01-02 -> 01-03`. Do not begin a task until every command in th
     - Run `node --test --test-name-pattern="help does not launch provider" test/harness.test.mjs`
   </verify>
   <done>
-    Tests reach the fake only through the real entrypoint and production executable lookup, exact
-    stdin/argv/cwd are asserted, the launcher source is unchanged, and no test process survives.
+    Tests reach the fake only through the real entrypoint and production executable lookup. Assert
+    exact captured stdin/argv/requested-cwd/observed-child-cwd values. Known AUTH-01 differences are
+    characterized as present behavior and explicitly assigned to Phase 2; Phase 1 neither requires
+    desired authority behavior nor freezes the defect as a lasting contract. The launcher source is
+    unchanged and no test process survives.
   </done>
 </task>
 
@@ -215,7 +220,7 @@ Execute `01-01 -> 01-02 -> 01-03`. Do not begin a task until every command in th
 ## Verification
 
 - Run `npm test` twice; both runs must exit 0, and the harness's recorded-PID assertions must report no survivors.
-- Run `node --test test/harness.test.mjs test/contract.test.mjs`; it must exit 0 without credentials, network, or live Codex/Luna.
+- Run `node --test --test-concurrency=1 test/harness.test.mjs test/contract.test.mjs`; it must exit 0 without credentials, network, or live Codex/Luna.
 - Run `git diff --check`; it must exit 0.
 
 ## Phase Closure

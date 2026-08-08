@@ -1,0 +1,10 @@
+{
+  "name": "luna-sidecar-private-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/harness.test.mjs test/contract.test.mjs",
+    "test:harness": "node --test test/harness.test.mjs",
+    "test:contract": "node --test test/contract.test.mjs"
+  }
+}
