@@ -1,9 +1,12 @@
 # Work-laptop Luna-sidecar evidence handoff
 
-**Branch:** `audit/work-laptop-evidence-2026-08-08`  
-**Status:** Evidence collection and reconciliation only  
+**Status:** Completed historical handoff; preserved on `main`.  
+**Historical note:** These are the original instructions for the temporary evidence branch. That branch was folded into `main` and deleted. Do not execute this handoff again.
+
+## Original instructions
+
 **Audience:** The user's coding agent on the other Windows laptop  
-**Do not implement Luna-sidecar changes during this pass.**
+**Constraint at the time:** Do not implement Luna-sidecar changes during this pass.
 
 ## Mission
 
