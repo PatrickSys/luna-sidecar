@@ -16,6 +16,8 @@ files-modified:
   - test/fixtures/fake-codex.mjs
   - test/fixtures/fake-grandchild.mjs
   - test/fixtures/legacy-worker.json
+  - test/harness.test.mjs
+  - test/contract.test.mjs
   - test/authority.test.mjs
   - test/lifecycle.test.mjs
   - test/concurrency.test.mjs
@@ -158,6 +160,8 @@ Execute `02-01 -> 02-02 -> 02-03`. First require Phase 1's verification file to 
   <files>
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
     - MODIFY: test/fixtures/legacy-worker.json
+    - MODIFY: test/harness.test.mjs
+    - MODIFY: test/contract.test.mjs
     - CREATE: test/authority.test.mjs
   </files>
   <action>
@@ -181,6 +185,8 @@ Execute `02-01 -> 02-02 -> 02-03`. First require Phase 1's verification file to 
     sandbox_mode=\"<mode>\" <sessionId> -`; both spawn with `cwd: <cwd>`; bypass replaces only the
     sandbox selector with the bypass flag. Inherit omitted cwd/effort/sandbox/bypass, reject
     `--read-only` plus `--bypass`, and stop/replan if the supported Codex version rejects this form.
+    Update the Phase 1 cwd characterization assertions from the known AUTH-01 defect to the desired
+    child-cwd contract while preserving their exact argv/stdin/raw-output and compatibility coverage.
   </action>
   <verify>
     - Run `node --test test/authority.test.mjs`
