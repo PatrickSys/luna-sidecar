@@ -1,8 +1,7 @@
 # Luna Sidecar Reliability Plan
 
 **Status:** Ready for implementation  
-**Working branch:** `audit/work-laptop-evidence-2026-08-08`  
-**Branch policy:** Use this one branch for the plan, implementation, and verification. Merge once to `main`, then delete it.
+**Development policy:** Work directly on `main`; keep commits small and verified. Do not create planning or evidence branches.
 
 ## Outcome
 
@@ -66,7 +65,7 @@ Use the 43 pre-existing work-laptop worker lineages as historical evidence. The 
 
 W044/W045 were created during an audit that explicitly prohibited starting or resuming workers. Do not count them as historical usage. Their isolated probe can inform a test case, but the process violation must remain visible.
 
-The audit response remains draft evidence and must not be merged unchanged. Its exact source diff and independently corroborated historical findings are usable.
+The audit response is preserved as historical evidence, not as an implementation specification. Its W044/W045 boundary violation remains explicit; its exact source diff and independently corroborated findings are usable.
 
 ## Problems to fix, in order
 
@@ -313,7 +312,7 @@ Required scenarios:
 
 Only after deterministic tests pass:
 
-- install from the working branch through the normal Agent Skills path;
+- install from the current verified `main` commit through the normal Agent Skills path;
 - run one read-only Luna worker;
 - resume it with a write attempt and verify blocking/cwd;
 - cancel one intentionally slow worker and verify the complete process tree is gone;
@@ -323,14 +322,13 @@ Only after deterministic tests pass:
 - measure process count, working set, log growth, wait/status cost, and cleanup;
 - do not use bypass.
 
-### Documentation and merge
+### Documentation and release
 
-- Correct the draft audit status and disclose its W044/W045 boundary violation.
+- Preserve the audit response as historical evidence and keep its W044/W045 boundary violation explicit.
 - Keep 43 as the historical work-laptop count; separate audit-created probes.
 - Update README and skill instructions to match verified behavior.
 - Record test commands, versions, results, and known limitations.
-- Merge this one branch to `main`.
-- Delete the working branch.
+- Keep implementation commits small, coherent, and direct on `main`.
 - Update installed copies with the normal `npx skills` flow; never patch installed files manually again.
 - Add a concise linked synthesis to IdeaSpine after canonical release truth exists.
 
@@ -352,11 +350,11 @@ The work is done only when:
 - the skill remains installable through `npx skills add`;
 - Windows and Linux deterministic tests pass;
 - live dogfood leaves no orphan processes or stray files;
-- main receives one coherent merge, with no leftover planning branches.
+- `main` remains the single canonical branch, with no planning or evidence branches.
 
 ## Commit sequence
 
-Use small commits on the same branch:
+Use small commits directly on `main`:
 
 1. `test: add Luna-sidecar regression harness`
 2. `fix: preserve resume cwd and authority`
