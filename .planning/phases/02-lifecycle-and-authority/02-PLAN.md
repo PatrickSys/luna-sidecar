@@ -8,7 +8,11 @@ assurance: self_checked
 depends_on:
   - 01
 files-modified:
+  - .planning/ROADMAP.md
+  - .planning/phases/02-lifecycle-and-authority/02-PLAN.md
+  - package.json
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
+  - test/helpers/cli-harness.mjs
   - test/fixtures/fake-codex.mjs
   - test/fixtures/fake-grandchild.mjs
   - test/fixtures/legacy-worker.json
@@ -19,6 +23,7 @@ files-modified:
   - .planning/phases/02-lifecycle-and-authority/02-VERIFICATION.md
 autonomous: true
 requirements:
+  - COMPAT-01
   - AUTH-01
   - LINEAGE-01
   - LIFE-01
@@ -86,6 +91,7 @@ Replace optimistic/stale lifecycle behavior with one runner-owned, revisioned co
 
 ## Requirements Covered
 
+- COMPAT-01
 - AUTH-01
 - LINEAGE-01
 - LIFE-01
@@ -181,14 +187,16 @@ Execute `02-01 -> 02-02 -> 02-03`. First require Phase 1's verification file to 
     - Run `node --test test/contract.test.mjs`
   </verify>
   <done>
-    AUTH-01 and LINEAGE-01 pass for initial, inherited, narrowed, explicitly broadened, contradictory,
-    different-caller-cwd, duplicate-resume, and legacy-upgrade fixtures without eager read mutation.
+    COMPAT-01's explicit-mutation upgrade clause, AUTH-01, and LINEAGE-01 pass for initial,
+    inherited, narrowed, explicitly broadened, contradictory, different-caller-cwd,
+    duplicate-resume, and legacy-upgrade fixtures without eager read mutation.
   </done>
 </task>
 
 <task id="02-02" type="auto">
   <files>
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
+    - MODIFY: test/helpers/cli-harness.mjs
     - MODIFY: test/fixtures/fake-codex.mjs
     - CREATE: test/lifecycle.test.mjs
   </files>
@@ -223,6 +231,7 @@ Execute `02-01 -> 02-02 -> 02-03`. First require Phase 1's verification file to 
 
 <task id="02-03" type="auto">
   <files>
+    - MODIFY: package.json
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
     - MODIFY: test/fixtures/fake-codex.mjs
     - MODIFY: test/fixtures/fake-grandchild.mjs
@@ -249,7 +258,11 @@ Execute `02-01 -> 02-02 -> 02-03`. First require Phase 1's verification file to 
     handled request only after terminal persistence; cleanup failure adds
     `cancel_request_cleanup_failed` without changing state. Add runner-crash, starting-state cancel,
     duplicate cancel, cancel/complete/resume, survivor, and paused-stale-writer tests; every revision
-    race must select one specified result without resurrecting terminal state.
+    race must select one specified result without resurrecting terminal state. For the paused stale
+    writer, use a fixture-only file barrier accepted only when its resolved path is inside the
+    isolated `LUNA_SIDECAR_HOME`; pause after lock/base-revision capture and before the final
+    lock-token/revision ownership check. Do not use timing sleeps as assertions or add a public test
+    command. Extend the private package test script so `npm test` runs all Phase 1+2 suites serially.
   </action>
   <verify>
     - Run `node --test --test-name-pattern="cancel|tree|grandchild" test/lifecycle.test.mjs`

@@ -1,6 +1,6 @@
 # Roadmap: Luna Sidecar v1 reliability
 
-**Status:** Planned
+**Status:** In progress
 
 **Execution order:** `Phase 1 -> Phase 2 -> Phase 3 -> Phase 4`
 **Parallel phase execution:** Not allowed. All phases touch the launcher contract.
@@ -22,7 +22,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 ## Phase 1 — Contract and deterministic harness
 
-**Status:** `[ ]`
+**Status:** `[x]`
 
 **Plan:** [`phases/01-contract-and-harness/01-PLAN.md`](phases/01-contract-and-harness/01-PLAN.md)
 
@@ -48,7 +48,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 **Plan:** [`phases/02-lifecycle-and-authority/02-PLAN.md`](phases/02-lifecycle-and-authority/02-PLAN.md)
 
-**Requirements:** AUTH-01, LINEAGE-01, LIFE-01, CANCEL-01, CONCURRENCY-01
+**Requirements:** COMPAT-01, AUTH-01, LINEAGE-01, LIFE-01, CANCEL-01, CONCURRENCY-01
 **Depends on:** Phase 1 verified
 
 **Goal:** Make authority, identity, state transitions, process exit, and cancellation truthful under normal starts, resumes, races, and failures.
