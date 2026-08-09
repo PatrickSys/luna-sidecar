@@ -126,6 +126,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   });
   const broadenedCapture = await harness.waitForCapture(broadened);
   assert.equal(broadened.json().bypass, true);
+  assert.equal(broadened.json().sandbox, "workspace-write");
   assert.equal(broadened.json().effort, "max");
   assert.equal(broadened.json().cwd, overrideCwd);
   assert.deepEqual(broadenedCapture.argv, [
@@ -133,6 +134,9 @@ test("default authority and explicit resume broadening then narrowing use exact 
     "--dangerously-bypass-approvals-and-sandbox", "override-thread", "-",
   ]);
   assert.equal(broadenedCapture.cwd, overrideCwd);
+  const broadenedWorker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${workerId}.json`), "utf8"));
+  assert.equal(broadenedWorker.turns.at(-1).sandbox, "workspace-write");
+  assert.equal(broadenedWorker.turns.at(-1).bypass, true);
   await harness.invoke(["wait", workerId]);
 
   const narrowed = await harness.invoke(["resume", workerId, "--read-only", "--", "narrow explicitly"], {

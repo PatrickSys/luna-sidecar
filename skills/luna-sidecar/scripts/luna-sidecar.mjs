@@ -150,7 +150,7 @@ function resolvedTask(task, previous = {}) {
   const explicitReadOnly = task.sandbox === "read-only";
   const result = {
     effort: task.effort ?? previous.effort ?? "medium",
-    sandbox: task.sandbox ?? previous.sandbox ?? "workspace-write",
+    sandbox: task.bypass === true ? "workspace-write" : (task.sandbox ?? previous.sandbox ?? "workspace-write"),
     bypass: explicitReadOnly ? false : (task.bypass ?? previous.bypass ?? false),
     cwd: task.cwd ?? previous.cwd ?? resolve(process.cwd()),
     prompt: task.prompt,
@@ -1317,6 +1317,7 @@ function validateNativeTurn(turn) {
   if (!efforts.has(turn.effort)) fail("Malformed turn effort");
   if (turn.sandbox !== "read-only" && turn.sandbox !== "workspace-write") fail("Malformed turn sandbox");
   if (typeof turn.bypass !== "boolean") fail("Malformed turn bypass");
+  if (turn.bypass && turn.sandbox !== "workspace-write") fail("Malformed bypass authority receipt");
   if (turn.sessionId !== null && typeof turn.sessionId !== "string") fail("Malformed provider session id");
   if (typeof turn.promptSha256 !== "string" || !/^[0-9a-f]{64}$/.test(turn.promptSha256)) fail("Malformed prompt hash");
   if (!Array.isArray(turn.warnings) || turn.warnings.some((warning) => typeof warning !== "string")) fail("Malformed turn warnings");
