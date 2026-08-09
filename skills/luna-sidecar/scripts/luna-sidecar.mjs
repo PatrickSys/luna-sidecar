@@ -8,6 +8,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -23,6 +24,14 @@ const efforts = new Set(["low", "medium", "high", "xhigh", "max"]);
 const workerStates = new Set(["starting", "running", "cancelling", "completed", "failed", "cancelled", "unknown"]);
 const providerStates = new Set(["not_started", "running", "completed", "failed", "unknown"]);
 const commands = new Set(["start", "status", "wait", "resume", "cancel", "list", "run", "_worker"]);
+const nestedMarkerEnv = "LUNA_SIDECAR_WORKER_MARKER";
+const nestedMarkerVersion = 1;
+const stdoutCapBytes = 32 * 1024 * 1024;
+const stderrCapBytes = 4 * 1024 * 1024;
+const terminalRawCapBytes = 256 * 1024 * 1024;
+const maxWarnings = 64;
+const maxFinalMessageBytes = 1024 * 1024;
+const completeLineCapBytes = maxFinalMessageBytes + 64 * 1024;
 const rawArgs = process.argv.slice(2);
 const command = commands.has(rawArgs[0]) ? rawArgs.shift() : "run";
 const stateRoot = resolve(process.env.LUNA_SIDECAR_HOME ?? defaultStateRoot());
@@ -46,19 +55,8 @@ class RevisionConflict extends SidecarError {
   }
 }
 
-try {
-  await main();
-} catch (error) {
-  if (error instanceof SidecarError && error.exitCode === 1) {
-    printFailure(command, null, error.code, error.message);
-    process.exitCode = 1;
-  } else if (!(error instanceof SidecarError)) {
-    process.stderr.write(`luna-sidecar: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 2;
-  }
-}
-
 async function main() {
+  assertExecutionAllowed(command);
   if (command === "run") return runForeground(parseTask(rawArgs));
   if (command === "start") return startWorker(parseTask(rawArgs));
   if (command === "status") return showStatus(requireWorkerId(rawArgs));
@@ -67,6 +65,40 @@ async function main() {
   if (command === "cancel") return cancelWorker(requireWorkerId(rawArgs));
   if (command === "list") return listWorkers();
   if (command === "_worker") return runWorker(requireWorkerId(rawArgs));
+}
+
+function assertExecutionAllowed(commandName) {
+  if (!["start", "run", "resume", "cancel", "_worker"].includes(commandName)) return;
+  const raw = process.env[nestedMarkerEnv];
+  if (raw === undefined) return;
+  let marker;
+  try { marker = JSON.parse(raw); } catch { marker = null; }
+  const valid = marker
+    && typeof marker === "object"
+    && !Array.isArray(marker)
+    && marker.version === nestedMarkerVersion
+    && Object.keys(marker).sort().join(",") === "turnId,version,workerId"
+    && isCanonicalUuid(marker.workerId)
+    && isCanonicalUuid(marker.turnId);
+  if (!valid) fail("Nested sidecar marker is malformed", "nested_sidecar_marker_malformed");
+  fail("Nested sidecar execution is forbidden", "nested_sidecar_forbidden");
+}
+
+function isCanonicalUuid(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+function runnerEnvironment() {
+  const env = { ...process.env };
+  delete env[nestedMarkerEnv];
+  return env;
+}
+
+function providerEnvironment(workerId, turnId) {
+  return {
+    ...process.env,
+    [nestedMarkerEnv]: JSON.stringify({ version: nestedMarkerVersion, workerId, turnId }),
+  };
 }
 
 function defaultStateRoot() {
@@ -231,7 +263,7 @@ async function runForeground(taskInput) {
   const task = resolvedTask(taskInput);
   const child = spawnCodex(execArgs(task), {
     cwd: task.cwd,
-    env: { ...process.env },
+    env: providerEnvironment(randomUUID(), randomUUID()),
     stdio: ["pipe", "inherit", "inherit"],
     windowsHide: true,
   });
@@ -246,17 +278,25 @@ async function runForeground(taskInput) {
 
 async function startWorker(taskInput, parentWorkerId = null, threadId = null) {
   const task = resolvedTask(taskInput);
-  await ensureState();
-  const workerId = randomUUID();
-  const turn = makeTurn(task, threadId);
-  const worker = makeWorker(workerId, parentWorkerId, turn);
-  try {
-    await publishPrompt(turn, task.prompt);
-    await writeWorker(worker);
-  } catch (error) {
-    await cleanupPublishedPrompt(turn);
-    throw error;
-  }
+  let worker;
+  let workerId;
+  await withRetentionLock(async () => {
+    await pruneTerminalLogsLocked();
+    workerId = randomUUID();
+    const cwdRealpath = await safeRealpath(task.cwd);
+    const sameCwdWarnings = task.sandbox === "workspace-write"
+      ? await sameCwdWriterWarnings(cwdRealpath)
+      : [];
+    const turn = makeTurn(task, threadId, cwdRealpath, sameCwdWarnings);
+    worker = makeWorker(workerId, parentWorkerId, turn);
+    try {
+      await publishPrompt(turn, task.prompt);
+      await writeWorker(worker);
+    } catch (error) {
+      await cleanupPublishedPrompt(turn);
+      throw error;
+    }
+  });
   return launchRunner(workerId, worker, { printResult: true });
 }
 
@@ -273,7 +313,7 @@ function makeWorker(workerId, parentWorkerId, turn) {
   });
 }
 
-function makeTurn(task, sessionId = null) {
+function makeTurn(task, sessionId = null, cwdRealpath = null, initialWarnings = []) {
   const turnId = randomUUID();
   const stdoutPath = join(logsRoot, `${turnId}.jsonl`);
   const stderrPath = join(logsRoot, `${turnId}.stderr.log`);
@@ -287,6 +327,7 @@ function makeTurn(task, sessionId = null) {
     providerPid: null,
     pid: null,
     cwd: task.cwd,
+    cwdRealpath,
     effort: task.effort,
     sandbox: task.sandbox,
     bypass: task.bypass,
@@ -297,7 +338,29 @@ function makeTurn(task, sessionId = null) {
     stdinAcceptedAt: null,
     stdoutPath,
     stderrPath,
-    logs: { stdoutPath, stderrPath, stdoutBytes: 0, stderrBytes: 0, truncated: false },
+    logs: {
+      stdoutPath,
+      stderrPath,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      stdoutObservedBytes: 0,
+      stderrObservedBytes: 0,
+      stdoutPersistedBytes: 0,
+      stderrPersistedBytes: 0,
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      stdoutMissing: false,
+      stderrMissing: false,
+      truncated: false,
+      sealed: false,
+      sealedAt: null,
+      pruned: false,
+      prunedAt: null,
+      pruning: false,
+      pruningAt: null,
+    },
     createdAt: new Date().toISOString(),
     startedAt: null,
     completedAt: null,
@@ -305,7 +368,7 @@ function makeTurn(task, sessionId = null) {
     signal: null,
     errorCode: null,
     error: null,
-    warnings: [],
+    warnings: [...initialWarnings],
     finalMessage: null,
     cancel: null,
   };
@@ -351,7 +414,7 @@ async function launchRunner(workerId, worker, { printResult }) {
   const runner = spawn(process.execPath, [launcherPath, "_worker", workerId], {
     cwd: worker.turns.at(-1).cwd,
     detached: true,
-    env: { ...process.env },
+    env: runnerEnvironment(),
     stdio: "ignore",
     windowsHide: true,
   });
@@ -476,8 +539,8 @@ async function runWorkerLifecycle(workerId) {
   const beforeProvider = await readWorker(workerId);
   if (beforeProvider.state === "cancelling" && await finishStartingCancel(workerId)) return;
 
-  const stdout = await open(turn.stdoutPath, "a");
-  const stderr = await open(turn.stderrPath, "a");
+  let stdoutWriter = null;
+  let stderrWriter = null;
   let child;
   let launchError = null;
   let closeInfo = null;
@@ -486,40 +549,41 @@ async function runWorkerLifecycle(workerId) {
   let providerFailed = false;
   let finalMessage = null;
   let sessionId = turn.sessionId;
-  const warnings = [];
-  let stdoutBytes = 0;
-  let stderrBytes = 0;
-  const stdoutDecoder = new StringDecoder("utf8");
-  let stdoutTail = "";
+  const warnings = new WarningCollector();
+  const stdoutParser = new IncrementalJsonlParser((line, collector) => handleLine(line, collector), warnings);
   let cancelPromise = null;
-  let stdoutWork = Promise.resolve();
-  let stderrWork = Promise.resolve();
   let stdinWork = Promise.resolve();
   let streamError = null;
   let stdinError = null;
+  let spawnPersistPromise = Promise.resolve();
+  let spawnPersistError = null;
+  let parserFinished = false;
 
-  const handleLine = (line) => {
+  const handleLine = (line, warningCollector) => {
     if (!line) return;
     let event;
     try { event = JSON.parse(line); }
-    catch { warnings.push("malformed_provider_json"); return; }
+    catch { warningCollector.add("malformed_provider_json"); return; }
     if (event.type === "thread.started" && typeof event.thread_id === "string") sessionId = event.thread_id;
     if (event.type === "turn.completed") providerCompleted = true;
     if (event.type === "turn.failed" || event.type === "error") providerFailed = true;
     if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
-      finalMessage = event.item.text;
+      finalMessage = utf8Prefix(event.item.text, maxFinalMessageBytes);
+      if (finalMessage !== event.item.text) warningCollector.add("final_message_truncated");
     }
     if (event.type === "item.error" || (event.type === "item.completed" && event.item?.type === "error")) {
-      warnings.push("provider_item_error");
+      warningCollector.add("provider_item_error");
     }
   };
 
   try {
+    stdoutWriter = await CappedRawWriter.open(turn.stdoutPath, stdoutCapBytes);
+    stderrWriter = await CappedRawWriter.open(turn.stderrPath, stderrCapBytes);
     child = spawnCodex(
       turn.sessionId ? resumeArgs(turn.sessionId, turn) : execArgs(turn, true),
       {
         cwd: turn.cwd,
-        env: { ...process.env },
+        env: providerEnvironment(workerId, turn.turnId),
         detached: platform() !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -530,29 +594,23 @@ async function runWorkerLifecycle(workerId) {
       return result;
     });
     child.__sidecarClosePromise = closePromise;
-    let spawnPersistPromise = Promise.resolve();
     child.once("spawn", () => {
       spawnSeen = true;
-      spawnPersistPromise = persistProviderSpawn(workerId, child.pid, sessionId);
+      spawnPersistPromise = persistProviderSpawn(workerId, child.pid, sessionId).catch((error) => {
+        spawnPersistError = error;
+      });
     });
     child.once("error", (error) => { launchError = error; });
     child.stdout.on("data", (chunk) => {
       const bytes = Buffer.from(chunk);
-      stdoutWork = stdoutWork.then(async () => {
-        stdoutBytes += bytes.length;
-        await stdout.write(bytes);
-        stdoutTail += stdoutDecoder.write(bytes);
-        const lines = stdoutTail.split(/\r?\n/);
-        stdoutTail = lines.pop() ?? "";
-        for (const line of lines) handleLine(line);
-      }).catch((error) => { streamError ??= error; });
+      stdoutWriter.write(bytes);
+      stdoutParser.push(bytes);
+      if (stdoutWriter.error) streamError ??= stdoutWriter.error;
     });
     child.stderr.on("data", (chunk) => {
       const bytes = Buffer.from(chunk);
-      stderrWork = stderrWork.then(async () => {
-        stderrBytes += bytes.length;
-        await stderr.write(bytes);
-      }).catch((error) => { streamError ??= error; });
+      stderrWriter.write(bytes);
+      if (stderrWriter.error) streamError ??= stderrWriter.error;
     });
     stdinWork = new Promise((resolve) => {
       let settled = false;
@@ -570,12 +628,16 @@ async function runWorkerLifecycle(workerId) {
         stdinError = error;
         return;
       }
-      await mutateWorker(workerId, (current) => {
-        const active = latestTurn(current);
-        if (!active) return current;
-        active.stdinAcceptedAt = new Date().toISOString();
-        return syncProjection(current);
-      });
+      try {
+        await mutateWorker(workerId, (current) => {
+          const active = latestTurn(current);
+          if (!active) return current;
+          active.stdinAcceptedAt = new Date().toISOString();
+          return syncProjection(current);
+        });
+      } catch {
+        warnings.add("stdin_receipt_unavailable");
+      }
       await cleanupPublishedPrompt(turn, workerId);
     });
 
@@ -587,22 +649,32 @@ async function runWorkerLifecycle(workerId) {
     }, 250);
     await closePromise;
     clearInterval(cancelTimer);
-    await Promise.all([stdoutWork, stderrWork, stdinWork]);
-    if (streamError) throw streamError;
-    stdoutTail += stdoutDecoder.end();
-    if (stdoutTail) handleLine(stdoutTail);
+    stdoutParser.finish();
+    parserFinished = true;
+    await Promise.all([stdoutWriter.seal(), stderrWriter.seal(), stdinWork]);
+    const stdoutMeta = await stdoutWriter.metadata();
+    const stderrMeta = await stderrWriter.metadata();
+    streamError ??= stdoutWriter.error ?? stderrWriter.error;
+    if (streamError) {
+      await persistSealedLogMetadata(workerId, stdoutMeta, stderrMeta);
+      throw streamError;
+    }
     if (cancelPromise) await cancelPromise;
     await spawnPersistPromise;
+    if (spawnPersistError) warnings.add("provider_state_persist_failed");
 
     if (stdinError && !launchError) {
-      await persistRunnerFailure(workerId, "stdin_write_failed", stdinError, spawnSeen ? "failed" : "not_started");
+      await persistRunnerFailure(workerId, "stdin_write_failed", stdinError, spawnSeen ? "failed" : "not_started", stdoutMeta, stderrMeta);
       return;
     }
 
     const current = await readWorker(workerId);
-    if (isTerminal(current.state)) return;
+    if (isTerminal(current.state)) {
+      await persistSealedLogMetadata(workerId, stdoutMeta, stderrMeta);
+      return;
+    }
     if (current.state === "cancelling" && current.cancel?.acknowledgedAt) {
-      await persistUnknown(workerId, "cancel_failed", "Cancellation acknowledgement lacked a terminal cleanup receipt");
+      await finalizeCancelled(workerId, stdoutMeta, stderrMeta);
       return;
     }
     await finalizeProvider(workerId, {
@@ -613,20 +685,298 @@ async function runWorkerLifecycle(workerId) {
       providerFailed,
       sessionId,
       finalMessage,
-      warnings,
-      stdoutBytes,
-      stderrBytes,
+      warnings: warnings.values(),
+      stdoutMeta,
+      stderrMeta,
     });
   } catch (error) {
+    if (child) {
+      try {
+        if (!closeInfo) await waitForClose(child, 5_000);
+        if (!parserFinished) {
+          stdoutParser.finish();
+          parserFinished = true;
+        }
+        await Promise.all([stdoutWriter?.seal(), stderrWriter?.seal(), stdinWork]);
+        const recoveredStdout = stdoutWriter ? await stdoutWriter.metadata() : emptyLogMetadata();
+        const recoveredStderr = stderrWriter ? await stderrWriter.metadata() : emptyLogMetadata();
+        streamError ??= stdoutWriter?.error ?? stderrWriter?.error;
+        await spawnPersistPromise;
+        if (spawnPersistError) warnings.add("provider_state_persist_failed");
+        if (!streamError && !stdinError) {
+          const recoveredCurrent = await readWorker(workerId);
+          if (recoveredCurrent.state === "cancelling" && recoveredCurrent.cancel?.acknowledgedAt) {
+            await finalizeCancelled(workerId, recoveredStdout, recoveredStderr);
+          } else {
+            await finalizeProvider(workerId, {
+              spawnSeen,
+              launchError,
+              closeInfo,
+              providerCompleted,
+              providerFailed,
+              sessionId,
+              finalMessage,
+              warnings: warnings.values(),
+              stdoutMeta: recoveredStdout,
+              stderrMeta: recoveredStderr,
+            });
+          }
+          return;
+        }
+      } catch {
+        // The controlled failure below is the durable outcome when recovery cannot seal evidence.
+      }
+    }
+    await stdoutWriter?.seal().catch(() => {});
+    await stderrWriter?.seal().catch(() => {});
+    const stdoutMeta = stdoutWriter ? await stdoutWriter.metadata() : emptyLogMetadata();
+    const stderrMeta = stderrWriter ? await stderrWriter.metadata() : emptyLogMetadata();
     if (spawnSeen) {
-      await persistUnknown(workerId, "runner_provider_error", error instanceof Error ? error.message : String(error));
+      await persistUnknown(workerId, "runner_provider_error", error instanceof Error ? error.message : String(error), null, stdoutMeta, stderrMeta);
     } else {
-      await persistRunnerFailure(workerId, "runner_provider_error", error, "not_started");
+      await persistRunnerFailure(workerId, "runner_provider_error", error, "not_started", stdoutMeta, stderrMeta);
     }
   } finally {
-    await stdout.close().catch(() => {});
-    await stderr.close().catch(() => {});
+    await stdoutWriter?.seal().catch(() => {});
+    await stderrWriter?.seal().catch(() => {});
   }
+}
+
+class WarningCollector {
+  constructor() {
+    this.items = [];
+    this.seen = new Set();
+  }
+
+  add(code) {
+    if (this.seen.has(code) || this.items.length >= maxWarnings) return;
+    this.seen.add(code);
+    this.items.push(code);
+  }
+
+  values() {
+    return [...this.items];
+  }
+}
+
+class IncrementalJsonlParser {
+  constructor(onLine, warningCollector) {
+    this.onLine = onLine;
+    this.decoder = new StringDecoder("utf8");
+    this.tailParts = [];
+    this.tailBytes = 0;
+    this.warning = warningCollector;
+    this.discarding = false;
+  }
+
+  push(bytes) {
+    this.consume(this.decoder.write(bytes));
+  }
+
+  finish() {
+    this.consume(this.decoder.end());
+    if (this.tailBytes > 0) {
+      const line = this.tailParts.join("");
+      this.tailParts = [];
+      this.tailBytes = 0;
+      this.onLine(line, this.warning);
+    }
+  }
+
+  consume(text) {
+    let cursor = 0;
+    let newline;
+    if (this.discarding) {
+      newline = text.indexOf("\n");
+      if (newline === -1) return;
+      cursor = newline + 1;
+      this.discarding = false;
+    }
+    while ((newline = text.indexOf("\n", cursor)) !== -1) {
+      if (this.discarding) {
+        cursor = newline + 1;
+        this.discarding = false;
+        continue;
+      }
+      const segment = text.slice(cursor, newline);
+      cursor = newline + 1;
+      if (this.tailBytes + Buffer.byteLength(segment, "utf8") > completeLineCapBytes) {
+        this.tailParts = [];
+        this.tailBytes = 0;
+        this.warning.add("oversized_incomplete_line");
+        continue;
+      }
+      const fragment = this.tailParts.join("") + segment;
+      this.tailParts = [];
+      this.tailBytes = 0;
+      this.onLine(fragment.replace(/\r$/, ""), this.warning);
+    }
+    const remainder = text.slice(cursor);
+    const remainderBytes = Buffer.byteLength(remainder, "utf8");
+    if (this.tailBytes + remainderBytes > completeLineCapBytes) {
+      this.tailParts = [];
+      this.tailBytes = 0;
+      this.warning.add("oversized_incomplete_line");
+      this.discarding = true;
+    } else {
+      if (remainder) this.tailParts.push(remainder);
+      this.tailBytes += remainderBytes;
+    }
+  }
+}
+
+class CappedRawWriter {
+  static async open(filePath, capBytes) {
+    return new CappedRawWriter(filePath, await open(filePath, "wx"), capBytes);
+  }
+
+  constructor(filePath, handle, capBytes) {
+    this.filePath = filePath;
+    this.handle = handle;
+    this.capBytes = capBytes;
+    this.observedBytes = 0;
+    this.persistedBytes = 0;
+    this.droppedBytes = 0;
+    this.pending = null;
+    this.inFlight = null;
+    this.inFlightBytes = 0;
+    this.sealed = false;
+    this.closed = false;
+    this.sealPromise = null;
+    this.closeError = null;
+    this.error = null;
+  }
+
+  write(bytes) {
+    const input = Buffer.from(bytes);
+    this.observedBytes += input.length;
+    const available = Math.max(0, this.capBytes - this.persistedBytes - this.inFlightBytes - (this.pending?.length ?? 0));
+    const queueRoom = Math.max(0, 256 * 1024 - this.inFlightBytes - (this.pending?.length ?? 0));
+    if (available === 0 || queueRoom === 0 || this.sealed || this.error) {
+      this.droppedBytes += input.length;
+      return;
+    }
+    const accepted = input.subarray(0, Math.min(input.length, available, queueRoom));
+    if (accepted.length === 0) {
+      this.droppedBytes += input.length;
+      return;
+    }
+    const dropped = input.length - accepted.length;
+    if (dropped > 0) this.droppedBytes += dropped;
+    if (!this.inFlight) {
+      this.schedule(accepted);
+      return;
+    }
+    if (!this.pending) this.pending = Buffer.from(accepted);
+    else {
+      const room = Math.max(0, 256 * 1024 - this.pending.length);
+      const queued = accepted.subarray(0, room);
+      this.pending = Buffer.concat([this.pending, queued]);
+      this.droppedBytes += accepted.length - queued.length;
+    }
+  }
+
+  schedule(bytes) {
+    this.inFlightBytes = bytes.length;
+    this.inFlight = (async () => {
+      let next = bytes;
+      while (next) {
+        const complete = await this.persistBuffer(next);
+        if (!complete) {
+          if (this.pending) this.droppedBytes += this.pending.length;
+          this.pending = null;
+          break;
+        }
+        next = this.pending;
+        this.pending = null;
+        if (next) this.inFlightBytes = next.length;
+      }
+      this.inFlightBytes = 0;
+    })().finally(() => { this.inFlight = null; });
+  }
+
+  async persistBuffer(bytes) {
+    let offset = 0;
+    while (offset < bytes.length) {
+      try {
+        const result = await this.handle.write(bytes, offset, bytes.length - offset);
+        const written = result.bytesWritten ?? 0;
+        if (written <= 0) throw new Error("Raw log write made no progress");
+        this.persistedBytes += written;
+        offset += written;
+      } catch (error) {
+        this.error ??= error;
+        this.droppedBytes += bytes.length - offset;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async seal() {
+    if (this.sealPromise) return this.sealPromise;
+    this.sealed = true;
+    this.sealPromise = (async () => {
+      while (this.inFlight) await this.inFlight;
+      await this.handle.close().catch((error) => { this.error ??= error; this.closeError = error; });
+      this.closed = !this.closeError;
+    })();
+    return this.sealPromise;
+  }
+
+  async metadata() {
+    let fileBytes = null;
+    try { fileBytes = (await stat(this.filePath)).size; }
+    catch (error) { this.error ??= error; }
+    if (this.observedBytes !== this.persistedBytes + this.droppedBytes) {
+      this.droppedBytes += Math.max(0, this.observedBytes - this.persistedBytes - this.droppedBytes);
+      this.error ??= new Error("Raw log byte accounting did not close");
+    }
+    return {
+      observedBytes: this.observedBytes,
+      persistedBytes: this.persistedBytes,
+      droppedBytes: this.droppedBytes,
+      truncated: this.droppedBytes > 0,
+      sealed: this.closed,
+      fileBytes,
+      missing: fileBytes === null,
+      accountingValid: this.observedBytes === this.persistedBytes + this.droppedBytes
+        && fileBytes === this.persistedBytes,
+    };
+  }
+}
+
+try {
+  await main();
+} catch (error) {
+  if (error instanceof SidecarError && error.exitCode === 1) {
+    printFailure(command, null, error.code, error.message);
+    process.exitCode = 1;
+  } else if (!(error instanceof SidecarError)) {
+    process.stderr.write(`luna-sidecar: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 2;
+  }
+}
+
+async function finalizeCancelled(workerId, stdoutMeta, stderrMeta) {
+  const result = await mutateWorker(workerId, (current) => {
+    const turn = latestTurn(current);
+    if (!turn || isTerminal(current.state) && current.state !== "cancelling") return current;
+    turn.state = "cancelled";
+    turn.providerState = "unknown";
+    turn.completedAt = turn.completedAt ?? new Date().toISOString();
+    if (turn.cancel) {
+      turn.cancel.finishedAt = turn.completedAt;
+      turn.cancel.result = "cancelled";
+      turn.cancel.errorCode = null;
+    }
+    turn.errorCode = null;
+    turn.error = null;
+    turn.logs = mergeLogMetadata(turn.logs, stdoutMeta, stderrMeta);
+    return syncProjection(current);
+  });
+  const turn = latestTurn(result.worker);
+  if (turn) await removeCancelRequest(workerId, turn.turnId);
 }
 
 async function persistProviderSpawn(workerId, providerPid, sessionId) {
@@ -650,9 +1000,8 @@ async function finalizeProvider(workerId, facts) {
     turn.exitCode = facts.closeInfo?.code ?? null;
     turn.signal = facts.closeInfo?.signal ?? null;
     turn.finalMessage = facts.finalMessage;
-    turn.warnings = [...new Set([...(turn.warnings ?? []), ...facts.warnings])];
-    turn.logs.stdoutBytes = facts.stdoutBytes;
-    turn.logs.stderrBytes = facts.stderrBytes;
+    turn.warnings = boundedWarnings([...(turn.warnings ?? []), ...facts.warnings]);
+    turn.logs = mergeLogMetadata(turn.logs, facts.stdoutMeta, facts.stderrMeta);
     turn.completedAt = new Date().toISOString();
     if (current.state === "cancelling" && turn.cancel && !turn.cancel.acknowledgedAt) {
       turn.cancel.finishedAt = turn.completedAt;
@@ -665,12 +1014,12 @@ async function finalizeProvider(workerId, facts) {
       turn.state = "failed";
       turn.providerState = "failed";
       turn.errorCode = "provider_spawn_failed";
-      turn.error = facts.launchError?.message ?? "Provider did not spawn";
+    turn.error = controlledErrorMessage("provider_spawn_failed");
     } else if (facts.providerFailed || (facts.closeInfo?.code ?? 0) !== 0 || facts.closeInfo?.signal) {
       turn.state = "failed";
       turn.providerState = "failed";
       turn.errorCode = facts.providerFailed ? "provider_failed" : "provider_exit_failed";
-      turn.error = facts.providerFailed ? "Provider reported a fatal failure" : "Provider exited unsuccessfully";
+      turn.error = controlledErrorMessage(turn.errorCode);
     } else if (facts.providerCompleted && facts.closeInfo?.code === 0) {
       turn.state = "completed";
       turn.providerState = "completed";
@@ -678,7 +1027,7 @@ async function finalizeProvider(workerId, facts) {
       turn.state = "unknown";
       turn.providerState = "unknown";
       turn.errorCode = "missing_provider_completion";
-      turn.error = "Provider closed without a terminal completion event";
+      turn.error = controlledErrorMessage("missing_provider_completion");
     }
     return syncProjection(current);
   });
@@ -686,14 +1035,51 @@ async function finalizeProvider(workerId, facts) {
   if (turn?.cancel?.result === "not_applied") await removeCancelRequest(workerId, turn.turnId);
 }
 
-async function persistRunnerFailure(workerId, errorCode, error, providerState = "failed") {
+async function persistSealedLogMetadata(workerId, stdoutMeta, stderrMeta) {
+  await mutateWorker(workerId, (current) => {
+    const turn = latestTurn(current);
+    if (!turn) return current;
+    turn.logs = mergeLogMetadata(turn.logs, stdoutMeta, stderrMeta);
+    return syncProjection(current);
+  });
+}
+
+function mergeLogMetadata(existing, stdoutMeta, stderrMeta) {
+  const sealed = Boolean(stdoutMeta?.sealed && stderrMeta?.sealed && stdoutMeta?.accountingValid && stderrMeta?.accountingValid);
+  return {
+    ...existing,
+    stdoutBytes: stdoutMeta?.observedBytes ?? 0,
+    stderrBytes: stderrMeta?.observedBytes ?? 0,
+    stdoutObservedBytes: stdoutMeta?.observedBytes ?? 0,
+    stderrObservedBytes: stderrMeta?.observedBytes ?? 0,
+    stdoutPersistedBytes: stdoutMeta?.persistedBytes ?? 0,
+    stderrPersistedBytes: stderrMeta?.persistedBytes ?? 0,
+    stdoutDroppedBytes: stdoutMeta?.droppedBytes ?? 0,
+    stderrDroppedBytes: stderrMeta?.droppedBytes ?? 0,
+    stdoutTruncated: stdoutMeta?.truncated === true,
+    stderrTruncated: stderrMeta?.truncated === true,
+    stdoutMissing: stdoutMeta?.missing === true,
+    stderrMissing: stderrMeta?.missing === true,
+    truncated: stdoutMeta?.truncated === true || stderrMeta?.truncated === true,
+    sealed,
+    sealedAt: sealed ? (existing.sealedAt ?? new Date().toISOString()) : null,
+  };
+}
+
+function emptyLogMetadata() {
+  return { observedBytes: 0, persistedBytes: 0, droppedBytes: 0, truncated: false, sealed: true, fileBytes: 0, missing: true, accountingValid: true };
+}
+
+async function persistRunnerFailure(workerId, errorCode, error, providerState = "failed", stdoutMeta = emptyLogMetadata(), stderrMeta = emptyLogMetadata()) {
   await mutateWorker(workerId, (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
+    errorCode = normalizeErrorCode(errorCode);
     turn.state = "failed";
     turn.providerState = providerState;
     turn.errorCode = errorCode;
-    turn.error = error instanceof Error ? error.message : String(error);
+    turn.error = controlledErrorMessage(errorCode);
+    turn.logs = mergeLogMetadata(turn.logs, stdoutMeta, stderrMeta);
     turn.completedAt = new Date().toISOString();
     return syncProjection(current);
   });
@@ -706,27 +1092,35 @@ async function resumeWorker(workerId, taskInput) {
   let becameUnknown = false;
   let publishedTurn = null;
   let result;
-  try {
-    result = await mutateWorker(workerId, async (current) => {
-      const active = latestTurn(current);
-      if (!active) throw new SidecarError("Worker has no turn to resume", "missing_turn", 1);
-      if (current.state === "unknown") throw new SidecarError("Worker is unknown; start a new worker", "worker_unknown", 1);
-      if (!isTerminal(current.state)) {
-        if (!active.runnerPid) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
-        const live = await runnerLiveness(active.runnerPid);
-        if (live !== false) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
-        markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive");
-        becameUnknown = true;
+  const cwdRealpath = await safeRealpath(task.cwd);
+  const reserveResume = async () => {
+    const sameCwdWarnings = task.sandbox === "workspace-write"
+      ? await sameCwdWriterWarnings(cwdRealpath, workerId)
+      : [];
+    return mutateWorker(workerId, async (current) => {
+        const active = latestTurn(current);
+        if (!active) throw new SidecarError("Worker has no turn to resume", "missing_turn", 1);
+        if (current.state === "unknown") throw new SidecarError("Worker is unknown; start a new worker", "worker_unknown", 1);
+        if (!isTerminal(current.state)) {
+          if (!active.runnerPid) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
+          const live = await runnerLiveness(active.runnerPid);
+          if (live !== false) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
+          markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive");
+          becameUnknown = true;
+          return syncProjection(current);
+        }
+        if (!active.sessionId) throw new SidecarError("Worker has no recorded Codex session id", "missing_session", 1);
+        const turn = makeTurn(task, active.sessionId, cwdRealpath, sameCwdWarnings);
+        turn.promptBody = task.prompt;
+        await publishPrompt(turn, task.prompt);
+        publishedTurn = turn;
+        current.turns.push(turn);
         return syncProjection(current);
-      }
-      if (!active.sessionId) throw new SidecarError("Worker has no recorded Codex session id", "missing_session", 1);
-      const turn = makeTurn(task, active.sessionId);
-      turn.promptBody = task.prompt;
-      await publishPrompt(turn, task.prompt);
-      publishedTurn = turn;
-      current.turns.push(turn);
-      return syncProjection(current);
     });
+  };
+  try {
+    const coordination = task.sandbox === "workspace-write";
+    result = coordination ? await withRetentionLock(reserveResume) : await reserveResume();
   } catch (error) {
     if (publishedTurn) await cleanupPublishedPrompt(publishedTurn);
     throw error;
@@ -746,28 +1140,54 @@ function markUnknown(worker, errorCode, message) {
   if (!turn || isTerminal(worker.state)) return;
   turn.state = "unknown";
   turn.providerState = "unknown";
-  turn.errorCode = errorCode;
-  turn.error = message;
+  turn.errorCode = normalizeErrorCode(errorCode);
+  turn.error = controlledErrorMessage(turn.errorCode);
   turn.completedAt = new Date().toISOString();
+  if (turn.logs && !turn.logs.sealed
+    && turn.logs.stdoutObservedBytes === 0 && turn.logs.stderrObservedBytes === 0) {
+    turn.logs = mergeLogMetadata(turn.logs, emptyLogMetadata(), emptyLogMetadata());
+  }
   return syncProjection(worker);
 }
 
+async function observeWorker(workerId) {
+  const worker = await readWorker(workerId);
+  const turn = latestTurn(worker);
+  if (!turn || isTerminal(worker.state) || !turn.runnerPid) return worker;
+  if (await runnerLiveness(turn.runnerPid) !== false) return worker;
+  const projection = structuredClone(worker);
+  const projectedTurn = latestTurn(projection);
+  projectedTurn.state = "unknown";
+  projectedTurn.errorCode = "runner_not_alive";
+  projectedTurn.error = controlledErrorMessage("runner_not_alive");
+  projectedTurn.warnings = boundedWarnings([...(projectedTurn.warnings ?? []), "runner_not_alive"]);
+  syncProjection(projection);
+  return projection;
+}
+
 async function showStatus(workerId) {
-  print(workerView(await readWorker(workerId)));
+  print(workerView(await observeWorker(workerId)));
 }
 
 async function waitForWorker(workerId, { timeoutMs }) {
-  const deadline = timeoutMs === 0 ? null : Date.now() + timeoutMs;
+  const deadline = timeoutMs === 0 ? null : performance.now() + timeoutMs;
   while (true) {
-    const worker = await readWorker(workerId);
-    if (isTerminal(worker.state) || (deadline !== null && Date.now() >= deadline)) {
+    const worker = await observeWorker(workerId);
+    if (isTerminal(worker.state)) {
       const view = workerView(worker);
-      if (deadline !== null && !isTerminal(worker.state)) view.timedOut = true;
-      else view.timedOut = false;
+      view.timedOut = false;
       print(view);
       return;
     }
-    await delay(250);
+    if (deadline !== null && performance.now() >= deadline) {
+      const boundary = await observeWorker(workerId);
+      const view = workerView(boundary);
+      view.timedOut = !isTerminal(boundary.state);
+      print(view);
+      return;
+    }
+    const remaining = deadline === null ? 250 : Math.max(0, deadline - performance.now());
+    await delay(Math.min(250, remaining));
   }
 }
 
@@ -953,16 +1373,10 @@ async function maybeRunnerCancel(workerId, child) {
     await mutateWorker(workerId, (latest) => {
       const active = latestTurn(latest);
       if (!active || isTerminal(latest.state)) return latest;
-      active.state = "cancelled";
       active.providerState = "unknown";
-      active.completedAt = new Date().toISOString();
-      active.cancel.finishedAt = active.completedAt;
-      active.cancel.result = "cancelled";
-      active.cancel.errorCode = null;
-      active.errorCode = null;
+      active.cancel.result = "terminating";
       return syncProjection(latest);
     });
-    await removeCancelRequest(workerId, turn.turnId);
   } catch (error) {
     await persistUnknown(workerId, "cancel_failed", error instanceof Error ? error.message : String(error), "cancel_failed");
   }
@@ -989,6 +1403,7 @@ async function finishStartingCancel(workerId) {
         turn.cancel.result = "cancel_failed";
         turn.cancel.errorCode = "cancel_failed";
       }
+      turn.logs = mergeLogMetadata(turn.logs, emptyLogMetadata(), emptyLogMetadata());
       handled = true;
       cancelledTurn = turn;
       return syncProjection(current);
@@ -1001,6 +1416,7 @@ async function finishStartingCancel(workerId) {
     turn.providerState = "not_started";
     turn.completedAt = turn.cancel.finishedAt;
     turn.errorCode = null;
+    turn.logs = mergeLogMetadata(turn.logs, emptyLogMetadata(), emptyLogMetadata());
     handled = true;
     cancelledTurn = turn;
     return syncProjection(current);
@@ -1014,11 +1430,13 @@ async function finishStartingCancel(workerId) {
   return true;
 }
 
-async function persistUnknown(workerId, errorCode, message, cancelResult = null) {
+async function persistUnknown(workerId, errorCode, message, cancelResult = null, stdoutMeta = null, stderrMeta = null) {
   const result = await mutateWorker(workerId, (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
+    errorCode = normalizeErrorCode(errorCode);
     markUnknown(current, errorCode, message);
+    if (stdoutMeta || stderrMeta) turn.logs = mergeLogMetadata(turn.logs, stdoutMeta ?? emptyLogMetadata(), stderrMeta ?? emptyLogMetadata());
     if (cancelResult && turn.cancel) {
       turn.cancel.finishedAt = new Date().toISOString();
       turn.cancel.result = cancelResult;
@@ -1084,30 +1502,273 @@ async function cleanupPublishedPrompt(turn, workerId = null) {
   }
 }
 
-async function listWorkers() {
+async function safeRealpath(cwd) {
+  try { return await realpath(cwd); }
+  catch { return null; }
+}
+
+function normalizedPath(value) {
+  if (typeof value !== "string") return null;
+  const resolvedValue = resolve(value);
+  return platform() === "win32" ? resolvedValue.toLowerCase() : resolvedValue;
+}
+
+async function sameCwdWriterWarnings(cwdRealpath, excludeWorkerId = null) {
+  const warnings = [];
+  if (!cwdRealpath) return ["cwd_realpath_unavailable"];
+  let files;
+  try { files = (await readdir(workersRoot)).filter((file) => file.endsWith(".json")); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  const ids = [];
+  for (const file of files) {
+    const id = file.slice(0, -5);
+    if (id === excludeWorkerId) continue;
+    try {
+      const worker = await readWorker(id);
+      const turn = latestTurn(worker);
+      if (!turn || isTerminal(worker.state) || turn.sandbox !== "workspace-write") continue;
+      const candidateRealpath = turn.cwdRealpath ?? await safeRealpath(turn.cwd);
+      if (!candidateRealpath) {
+        warnings.push("cwd_realpath_unavailable");
+        continue;
+      }
+      if (normalizedPath(candidateRealpath) === normalizedPath(cwdRealpath)) ids.push(worker.workerId);
+    } catch (error) {
+      if (error.code !== "ENOENT") continue;
+    }
+  }
+  ids.sort();
+  return boundedWarnings([...warnings, ...(ids.length ? [`active_same_cwd_writers:${ids.join(",")}`] : [])]);
+}
+
+async function pruneTerminalLogsLocked() {
+  let candidates = await collectPruneCandidates();
+  for (const candidate of candidates.filter((value) => value.eligible && value.pruning)) {
+    await pruneOneTerminalTurn(candidate);
+  }
+  candidates = await collectPruneCandidates();
+  for (const candidate of candidates.filter((value) => value.eligible && !value.pruning && value.missing)) {
+    await reconcileMissingEvidence(candidate);
+  }
+  candidates = await collectPruneCandidates();
+  let total = candidates.reduce((sum, candidate) => sum + candidate.bytes, 0);
+  for (const candidate of candidates
+    .filter((value) => value.eligible && !value.pruning)
+    .sort((left, right) => left.sortKey.localeCompare(right.sortKey))) {
+    if (total <= terminalRawCapBytes) break;
+    const before = candidate.bytes;
+    if (await pruneOneTerminalTurn(candidate)) total -= before;
+  }
+}
+
+async function collectPruneCandidates() {
+  let files;
+  try { files = (await readdir(workersRoot)).filter((file) => file.endsWith(".json")); }
+  catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  const candidates = [];
+  for (const file of files) {
+    const workerId = file.slice(0, -5);
+    const worker = await readWorker(workerId).catch(() => null);
+    if (!worker) continue;
+    for (const turn of worker.turns ?? []) {
+      if (!turn || !isTerminal(turn.state) || !worker.workerId) continue;
+      const paths = [turn.stdoutPath, turn.stderrPath];
+      if (!paths.every((value, index) => isCanonicalLogPath(value, turn.turnId, index === 0 ? "jsonl" : "stderr.log"))) continue;
+      const sizes = await Promise.all(paths.map(rawFileSize));
+      if (sizes.some((value) => value === null)) continue;
+      candidates.push({
+        workerId,
+        turnId: turn.turnId,
+        eligible: pruneEligible(worker, turn),
+        pruning: turn.logs?.pruning === true,
+        stdoutMissing: sizes[0].missing,
+        stderrMissing: sizes[1].missing,
+        missing: sizes.some((value) => value.missing),
+        bytes: sizes.reduce((sum, value) => sum + value.bytes, 0),
+        sortKey: `${turn.completedAt ?? turn.createdAt ?? ""}\u0000${workerId}\u0000${turn.turnId}`,
+      });
+    }
+  }
+  return candidates;
+}
+
+async function reconcileMissingEvidence(candidate) {
+  await mutateWorker(candidate.workerId, (worker) => {
+    const active = worker.turns.find((value) => value.turnId === candidate.turnId);
+    if (!active || !pruneEligible(worker, active)) return worker;
+    active.logs.stdoutMissing = candidate.stdoutMissing;
+    active.logs.stderrMissing = candidate.stderrMissing;
+    return syncProjection(worker);
+  }).catch(() => null);
+}
+
+async function pruneOneTerminalTurn(candidate) {
+  const intent = await mutateWorker(candidate.workerId, (worker) => {
+    const active = worker.turns.find((value) => value.turnId === candidate.turnId);
+    if (!active || !pruneEligible(worker, active)) return worker;
+    active.logs.pruning = true;
+    active.logs.pruningAt = new Date().toISOString();
+    return syncProjection(worker);
+  }).catch(() => null);
+  if (!intent) return false;
+  const current = await readWorker(candidate.workerId).catch(() => null);
+  const turn = current?.turns?.find((value) => value.turnId === candidate.turnId);
+  if (!turn || !pruneEligible(current, turn)) return false;
+  const paths = [turn.stdoutPath, turn.stderrPath];
+  const sizes = await Promise.all(paths.map(rawFileSize));
+  if (sizes.some((value) => value === null)) return false;
+  let failed = false;
+  for (const [index, target] of paths.entries()) {
+    if (sizes[index].missing) continue;
+    try { await rm(target, { force: true }); }
+    catch { failed = true; }
+  }
+  const after = await Promise.all(paths.map(rawFileSize));
+  const absent = after.every((value) => value?.missing === true);
+  const result = await mutateWorker(candidate.workerId, (worker) => {
+    const active = worker.turns.find((value) => value.turnId === candidate.turnId);
+    if (!active || !pruneEligible(worker, active)) return worker;
+    active.logs.stdoutMissing = after[0]?.missing === true;
+    active.logs.stderrMissing = after[1]?.missing === true;
+    if (!failed && absent) {
+      active.logs.pruned = true;
+      active.logs.prunedAt = new Date().toISOString();
+      active.logs.pruning = false;
+      active.logs.pruningAt = null;
+    } else {
+      active.warnings = boundedWarnings([...(active.warnings ?? []), "raw_log_prune_failed"]);
+    }
+    return syncProjection(worker);
+  }).catch(() => null);
+  return Boolean(result && !failed && absent);
+}
+
+function pruneEligible(worker, turn) {
+  return turn
+    && turn.sourceSchemaVersion !== 0
+    && isTerminal(turn.state)
+    && turn.logs?.sealed === true
+    && !turn.logs?.pruned
+    && worker?.workerId;
+}
+
+function isCanonicalLogPath(value, turnId, suffix) {
+  if (typeof value !== "string") return false;
+  const expected = resolve(logsRoot, `${turnId}.${suffix}`);
+  const actual = resolve(value);
+  return platform() === "win32" ? actual.toLowerCase() === expected.toLowerCase() : actual === expected;
+}
+
+async function rawFileSize(filePath) {
+  try {
+    const details = await stat(filePath);
+    return details.isFile() ? { bytes: details.size, missing: false } : null;
+  } catch (error) {
+    if (error.code === "ENOENT") return { bytes: 0, missing: true };
+    return null;
+  }
+}
+
+async function withRetentionLock(callback) {
   await ensureState();
-  const files = (await readdir(workersRoot)).filter((file) => file.endsWith(".json"));
+  const target = resolve(stateRoot, "retention.lock");
+  assertWithin(target, stateRoot, "retention lock path");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    let handle = null;
+    let created = false;
+    let tokenWritten = false;
+    const token = randomUUID();
+    try {
+      handle = await open(target, "wx");
+      created = true;
+      await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, token, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`, "utf8");
+      tokenWritten = true;
+      return await callback();
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      await recoverRetentionLock(target);
+      await delay(10);
+    } finally {
+      await handle?.close().catch(() => {});
+      if (created && !tokenWritten) await rm(target, { force: true }).catch(() => {});
+      else if (tokenWritten) await removeOwnedRetentionLock(target, token);
+    }
+  }
+  throw new SidecarError("Timed out acquiring retention lock", "retention_lock_timeout", 1);
+}
+
+async function recoverRetentionLock(target) {
+  let raw = null;
+  let details;
+  try {
+    raw = await readFile(target, "utf8");
+    details = await stat(target);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    return;
+  }
+  let lock = null;
+  try { lock = JSON.parse(raw); } catch {}
+  const acquiredAt = typeof lock?.acquiredAt === "string" ? Date.parse(lock.acquiredAt) : details.mtimeMs;
+  if (lock && lock.schemaVersion === 1 && typeof lock.token === "string" && Number.isSafeInteger(lock.pid) && lock.pid > 0) {
+    const live = await runnerLiveness(lock.pid);
+    if (live === false) {
+      // A definitely dead valid owner is recoverable immediately.
+    } else return;
+  } else if (Date.now() - details.mtimeMs <= 30_000) {
+    return;
+  }
+  if (!(lock && lock.schemaVersion === 1 && typeof lock.token === "string" && Number.isSafeInteger(lock.pid) && lock.pid > 0)
+    && (!Number.isFinite(acquiredAt) || Date.now() - acquiredAt <= 30_000)) return;
+  const stale = `${target}.stale-${randomUUID()}`;
+  try { await rename(target, stale); await rm(stale, { force: true }); } catch {}
+}
+
+async function removeOwnedRetentionLock(target, token) {
+  try {
+    const lock = JSON.parse(await readFile(target, "utf8"));
+    if (lock?.token === token) await rm(target, { force: true });
+  } catch {}
+}
+
+async function listWorkers() {
+  let files;
+  try { files = (await readdir(workersRoot)).filter((file) => file.endsWith(".json")); }
+  catch (error) {
+    if (error.code === "ENOENT") { print([]); return; }
+    throw error;
+  }
   const workers = [];
-  for (const file of files) workers.push(workerView(await readWorker(file.slice(0, -5))));
+  for (const file of files) {
+    const view = workerView(await observeWorker(file.slice(0, -5)));
+    delete view.turns;
+    workers.push(view);
+  }
   print(workers.sort((left, right) => right.createdAt.localeCompare(left.createdAt)));
 }
 
 function workerView(worker) {
   const turn = latestTurn(worker);
+  const turns = (worker.turns ?? []).map(compactTurnView);
   return {
     schemaVersion,
     workerId: worker.workerId,
+    id: worker.workerId,
     turnId: turn?.turnId ?? null,
-    turnCount: worker.turns?.length ?? 0,
+    turnCount: turns.length,
+    turns,
     state: turn ? turn.state : (worker.state ?? "unknown"),
     providerState: turn ? turn.providerState : (worker.providerState ?? "unknown"),
     taskOutcome: turn ? turn.taskOutcome : (worker.taskOutcome ?? "not_evaluated"),
     sessionId: turn ? turn.sessionId : (worker.threadId ?? null),
+    threadId: turn ? turn.sessionId : (worker.threadId ?? null),
     parentWorkerId: worker.parentWorkerId ?? null,
     pid: turn ? turn.pid : (worker.pid ?? null),
     runnerPid: turn ? turn.runnerPid : (worker.runnerPid ?? null),
     providerPid: turn ? turn.providerPid : (worker.providerPid ?? null),
     cwd: turn ? turn.cwd : (worker.cwd ?? null),
+    cwdRealpath: turn ? (turn.cwdRealpath ?? null) : null,
     effort: turn ? turn.effort : (worker.effort ?? null),
     sandbox: turn ? turn.sandbox : (worker.sandbox ?? null),
     bypass: turn ? turn.bypass : (worker.bypass ?? false),
@@ -1115,13 +1776,52 @@ function workerView(worker) {
     signal: turn ? turn.signal : (worker.signal ?? null),
     errorCode: turn ? turn.errorCode : (worker.errorCode ?? null),
     error: turn ? turn.error : (worker.error ?? null),
-    warnings: [...new Set([...(worker.warnings ?? []), ...(turn?.warnings ?? [])])],
+    warnings: boundedWarnings([...(worker.warnings ?? []), ...(turn?.warnings ?? [])]),
     createdAt: worker.createdAt,
     startedAt: turn ? turn.startedAt : (worker.startedAt ?? null),
     completedAt: turn ? turn.completedAt : (worker.completedAt ?? null),
     finalMessage: turn ? turn.finalMessage : (worker.finalMessage ?? null),
+    promptSha256: turn ? turn.promptSha256 : null,
+    stdoutPath: turn ? turn.stdoutPath : (worker.stdoutPath ?? null),
+    stderrPath: turn ? turn.stderrPath : (worker.stderrPath ?? null),
+    promptPath: turn ? turn.promptPath : (worker.promptPath ?? null),
     logs: turn ? turn.logs : (worker.logs ?? null),
     cancel: turn ? turn.cancel : (worker.cancel ?? null),
+  };
+}
+
+function compactTurnView(turn) {
+  return {
+    turnId: turn.turnId,
+    sessionId: turn.sessionId ?? null,
+    state: turn.state,
+    providerState: turn.providerState,
+    taskOutcome: "not_evaluated",
+    runnerPid: turn.runnerPid ?? null,
+    providerPid: turn.providerPid ?? null,
+    pid: turn.pid ?? null,
+    cwd: turn.cwd ?? null,
+    cwdRealpath: turn.cwdRealpath ?? null,
+    effort: turn.effort ?? null,
+    sandbox: turn.sandbox ?? null,
+    bypass: turn.bypass ?? false,
+    promptSha256: turn.promptSha256 ?? null,
+    promptClaimedAt: turn.promptClaimedAt ?? null,
+    stdinAcceptedAt: turn.stdinAcceptedAt ?? null,
+    stdoutPath: turn.stdoutPath ?? null,
+    stderrPath: turn.stderrPath ?? null,
+    promptPath: turn.promptPath ?? null,
+    logs: turn.logs ?? null,
+    createdAt: turn.createdAt ?? null,
+    startedAt: turn.startedAt ?? null,
+    completedAt: turn.completedAt ?? null,
+    exitCode: turn.exitCode ?? null,
+    signal: turn.signal ?? null,
+    errorCode: turn.errorCode ?? null,
+    error: turn.error ?? null,
+    warnings: boundedWarnings(turn.warnings ?? []),
+    finalMessage: turn.finalMessage ?? null,
+    cancel: turn.cancel ?? null,
   };
 }
 
@@ -1135,7 +1835,7 @@ function syncProjection(worker) {
   for (const key of [
     "state", "providerState", "taskOutcome", "sessionId", "runnerPid", "providerPid", "pid", "cwd", "effort",
     "sandbox", "bypass", "exitCode", "signal", "errorCode", "error", "startedAt", "completedAt", "finalMessage",
-    "logs", "cancel",
+    "logs", "cancel", "cwdRealpath",
   ]) worker[key] = key === "sessionId" ? turn.sessionId : turn[key];
   worker.threadId = turn.sessionId;
   worker.stdoutPath = turn.stdoutPath;
@@ -1198,8 +1898,9 @@ function normalizeWorker(raw, requestedId) {
   validateUuid(workerId, "worker id");
   if (workerId !== requestedId) fail(`Worker path identity mismatch: ${requestedId}`);
   if (raw.schemaVersion === schemaVersion) {
-    validateV2Worker(raw);
-    return raw;
+    const normalized = normalizeV2Worker(raw, workerId);
+    validateV2Worker(normalized);
+    return normalized;
   }
   if (raw.schemaVersion !== undefined) {
     fail(`Unsupported worker schema version: ${raw.schemaVersion}`);
@@ -1223,6 +1924,7 @@ function normalizeWorker(raw, requestedId) {
     providerPid: null,
     pid: raw.pid ?? null,
     cwd: raw.cwd,
+    cwdRealpath: null,
     effort: raw.effort,
     sandbox: raw.sandbox,
     bypass: raw.bypass ?? false,
@@ -1233,16 +1935,16 @@ function normalizeWorker(raw, requestedId) {
     stdinAcceptedAt: null,
     stdoutPath: raw.stdoutPath,
     stderrPath: raw.stderrPath,
-    logs: { stdoutPath: raw.stdoutPath, stderrPath: raw.stderrPath, stdoutBytes: 0, stderrBytes: 0, truncated: false },
+    logs: normalizeLogs(raw.logs, raw.stdoutPath, raw.stderrPath),
     createdAt: raw.createdAt,
     startedAt: null,
     completedAt: raw.completedAt ?? null,
     exitCode: raw.exitCode ?? null,
     signal: raw.signal ?? null,
-    errorCode: raw.errorCode ?? null,
-    error: raw.error ?? null,
-    warnings: raw.warnings ?? [],
-    finalMessage: raw.finalMessage ?? null,
+    errorCode: raw.errorCode ? normalizeErrorCode(raw.errorCode) : null,
+    error: raw.errorCode ? controlledErrorMessage(normalizeErrorCode(raw.errorCode)) : null,
+    warnings: boundedWarnings(raw.warnings ?? []),
+    finalMessage: safeFinalMessage(raw.finalMessage),
     cancel: null,
   };
   const normalized = {
@@ -1258,6 +1960,155 @@ function normalizeWorker(raw, requestedId) {
   };
   Object.defineProperty(normalized, "legacy", { value: true, enumerable: false, writable: true });
   return syncProjection(normalized);
+}
+
+function normalizeV2Worker(raw, workerId) {
+  const turns = Array.isArray(raw.turns) ? raw.turns.map(normalizeTurnRecord) : [];
+  return syncProjection({
+    schemaVersion,
+    revision: raw.revision,
+    workerId,
+    id: workerId,
+    parentWorkerId: raw.parentWorkerId ?? null,
+    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date(0).toISOString(),
+    ...(raw.migratedFromSchemaVersion === 0 ? { migratedFromSchemaVersion: 0 } : {}),
+    turns,
+    warnings: boundedWarnings(raw.warnings ?? []),
+  });
+}
+
+function normalizeTurnRecord(raw) {
+  const stdoutPath = raw?.stdoutPath ?? raw?.logs?.stdoutPath;
+  const stderrPath = raw?.stderrPath ?? raw?.logs?.stderrPath;
+  const turn = {
+    ...(raw?.sourceSchemaVersion === 0 ? { sourceSchemaVersion: 0 } : {}),
+    turnId: raw?.turnId,
+    sessionId: typeof raw?.sessionId === "string" ? raw.sessionId : null,
+    state: raw?.state ?? "unknown",
+    providerState: raw?.providerState ?? "unknown",
+    taskOutcome: "not_evaluated",
+    runnerPid: raw?.runnerPid ?? null,
+    providerPid: raw?.providerPid ?? null,
+    pid: raw?.pid ?? raw?.runnerPid ?? null,
+    cwd: raw?.cwd,
+    cwdRealpath: typeof raw?.cwdRealpath === "string" ? raw.cwdRealpath : null,
+    effort: raw?.effort,
+    sandbox: raw?.sandbox,
+    bypass: raw?.bypass ?? false,
+    promptPath: raw?.promptPath,
+    promptClaimedPath: raw?.promptClaimedPath ?? null,
+    promptSha256: raw?.promptSha256 ?? null,
+    promptClaimedAt: raw?.promptClaimedAt ?? null,
+    stdinAcceptedAt: raw?.stdinAcceptedAt ?? null,
+    stdoutPath,
+    stderrPath,
+    logs: normalizeLogs(raw?.logs, stdoutPath, stderrPath),
+    createdAt: raw?.createdAt,
+    startedAt: raw?.startedAt ?? null,
+    completedAt: raw?.completedAt ?? null,
+    exitCode: raw?.exitCode ?? null,
+    signal: raw?.signal ?? null,
+    errorCode: typeof raw?.errorCode === "string" ? normalizeErrorCode(raw.errorCode) : null,
+    error: typeof raw?.errorCode === "string" ? controlledErrorMessage(normalizeErrorCode(raw.errorCode)) : null,
+    warnings: boundedWarnings(raw?.warnings ?? []),
+    finalMessage: safeFinalMessage(raw?.finalMessage),
+    cancel: normalizeCancel(raw?.cancel),
+  };
+  return turn;
+}
+
+function normalizeLogs(raw = {}, stdoutPath = null, stderrPath = null) {
+  return {
+    stdoutPath: raw?.stdoutPath ?? stdoutPath,
+    stderrPath: raw?.stderrPath ?? stderrPath,
+    stdoutBytes: Number.isSafeInteger(raw?.stdoutBytes) && raw.stdoutBytes >= 0 ? raw.stdoutBytes : 0,
+    stderrBytes: Number.isSafeInteger(raw?.stderrBytes) && raw.stderrBytes >= 0 ? raw.stderrBytes : 0,
+    stdoutObservedBytes: Number.isSafeInteger(raw?.stdoutObservedBytes) ? raw.stdoutObservedBytes : (raw?.stdoutBytes ?? 0),
+    stderrObservedBytes: Number.isSafeInteger(raw?.stderrObservedBytes) ? raw.stderrObservedBytes : (raw?.stderrBytes ?? 0),
+    stdoutPersistedBytes: Number.isSafeInteger(raw?.stdoutPersistedBytes) ? raw.stdoutPersistedBytes : (raw?.stdoutBytes ?? 0),
+    stderrPersistedBytes: Number.isSafeInteger(raw?.stderrPersistedBytes) ? raw.stderrPersistedBytes : (raw?.stderrBytes ?? 0),
+    stdoutDroppedBytes: Number.isSafeInteger(raw?.stdoutDroppedBytes) ? raw.stdoutDroppedBytes : 0,
+    stderrDroppedBytes: Number.isSafeInteger(raw?.stderrDroppedBytes) ? raw.stderrDroppedBytes : 0,
+    stdoutTruncated: raw?.stdoutTruncated === true,
+    stderrTruncated: raw?.stderrTruncated === true,
+    stdoutMissing: raw?.stdoutMissing === true,
+    stderrMissing: raw?.stderrMissing === true,
+    truncated: raw?.truncated === true,
+    sealed: raw?.sealed === true,
+    sealedAt: typeof raw?.sealedAt === "string" ? raw.sealedAt : null,
+    pruned: raw?.pruned === true,
+    prunedAt: typeof raw?.prunedAt === "string" ? raw.prunedAt : null,
+    pruning: raw?.pruning === true,
+    pruningAt: typeof raw?.pruningAt === "string" ? raw.pruningAt : null,
+  };
+}
+
+function normalizeCancel(raw) {
+  if (!raw) return null;
+  return {
+    requestId: raw.requestId,
+    requestedAt: raw.requestedAt,
+    acknowledgedAt: raw.acknowledgedAt ?? null,
+    finishedAt: raw.finishedAt ?? null,
+    result: raw.result,
+    errorCode: raw.errorCode ? normalizeErrorCode(raw.errorCode) : null,
+  };
+}
+
+function boundedWarnings(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of values ?? []) {
+    if (typeof value !== "string" || value.length > 160 || !/^[a-z0-9_]+(?::[a-z0-9_,\-]+)?$/.test(value)) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+    if (result.length >= maxWarnings) break;
+  }
+  return result;
+}
+
+function safeFinalMessage(value) {
+  if (typeof value !== "string") return null;
+  return utf8Prefix(value, maxFinalMessageBytes);
+}
+
+function utf8Prefix(value, maxBytes) {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+function controlledErrorMessage(code) {
+  const messages = {
+    sidecar_error: "Sidecar evidence is unavailable",
+    legacy_runner_unsupported: "A legacy turn cannot be replayed by the v2 runner",
+    runner_ownership_invalid: "Runner ownership could not be established",
+    prompt_already_claimed: "Prompt replay is forbidden",
+    provider_spawn_failed: "Provider did not start",
+    provider_failed: "Provider reported a fatal failure",
+    provider_exit_failed: "Provider exited unsuccessfully",
+    missing_provider_completion: "Provider closed without a terminal completion event",
+    runner_provider_error: "The runner could not safely materialize provider evidence",
+    runner_startup_error: "The runner failed before provider launch",
+    runner_spawn_failed: "The sidecar runner did not start",
+    prompt_claim_failed: "The runner could not claim the prompt",
+    prompt_missing_after_claim: "The claimed prompt was unavailable",
+    stdin_write_failed: "The provider prompt could not be delivered",
+    runner_not_alive: "The recorded runner is no longer alive",
+    cancel_failed: "Cancellation could not be verified",
+    cancel_timeout: "Cancellation is still pending",
+    revision_conflict: "Worker changed while the mutation was in progress",
+  };
+  return code && messages[code] ? messages[code] : (code ? "Sidecar evidence is unavailable" : null);
+}
+
+function normalizeErrorCode(code) {
+  return typeof code === "string" && controlledErrorMessage(code) !== "Sidecar evidence is unavailable"
+    ? code
+    : "sidecar_error";
 }
 
 function validateV2Worker(worker) {
@@ -1291,6 +2142,7 @@ function validateV2Worker(worker) {
     providerPid: turn.providerPid,
     pid: turn.pid,
     cwd: turn.cwd,
+    cwdRealpath: turn.cwdRealpath,
     effort: turn.effort,
     sandbox: turn.sandbox,
     bypass: turn.bypass,
@@ -1314,6 +2166,7 @@ function validateV2Worker(worker) {
 
 function validateNativeTurn(turn) {
   if (typeof turn.cwd !== "string" || !isAbsolute(turn.cwd) || turn.cwd.includes("\0")) fail("Malformed turn cwd");
+  if (turn.cwdRealpath !== null && (typeof turn.cwdRealpath !== "string" || !isAbsolute(turn.cwdRealpath))) fail("Malformed turn cwd realpath");
   if (!efforts.has(turn.effort)) fail("Malformed turn effort");
   if (turn.sandbox !== "read-only" && turn.sandbox !== "workspace-write") fail("Malformed turn sandbox");
   if (typeof turn.bypass !== "boolean") fail("Malformed turn bypass");
@@ -1330,10 +2183,38 @@ function validateNativeTurn(turn) {
   }
   if (turn.pid !== turn.runnerPid) fail("Malformed runner pid projection");
   if (turn.cancel !== null) validateCancelReceipt(turn.cancel);
+  validateLogs(turn.logs, turn.turnId);
   assertExpectedTurnPath(turn.promptPath, join(promptsRoot, `${turn.turnId}.prompt`), "prompt path");
   assertExpectedTurnPath(turn.promptClaimedPath, join(promptsRoot, `${turn.turnId}.prompt.claimed`), "claimed prompt path");
   assertExpectedTurnPath(turn.stdoutPath, join(logsRoot, `${turn.turnId}.jsonl`), "stdout path");
   assertExpectedTurnPath(turn.stderrPath, join(logsRoot, `${turn.turnId}.stderr.log`), "stderr path");
+}
+
+function validateLogs(logs, turnId) {
+  if (!logs || typeof logs !== "object" || Array.isArray(logs)) fail("Malformed log metadata");
+  for (const key of [
+    "stdoutBytes", "stderrBytes", "stdoutObservedBytes", "stderrObservedBytes",
+    "stdoutPersistedBytes", "stderrPersistedBytes", "stdoutDroppedBytes", "stderrDroppedBytes",
+  ]) {
+    if (!Number.isSafeInteger(logs[key]) || logs[key] < 0) fail(`Malformed log byte count: ${key}`);
+  }
+  for (const key of ["stdoutTruncated", "stderrTruncated", "stdoutMissing", "stderrMissing", "truncated", "sealed", "pruned", "pruning"]) {
+    if (typeof logs[key] !== "boolean") fail(`Malformed log flag: ${key}`);
+  }
+  for (const key of ["sealedAt", "prunedAt", "pruningAt"]) {
+    if (logs[key] !== null && typeof logs[key] !== "string") fail(`Malformed log timestamp: ${key}`);
+  }
+  if (logs.stdoutPersistedBytes > logs.stdoutObservedBytes || logs.stderrPersistedBytes > logs.stderrObservedBytes) fail("Malformed persisted log byte count");
+  if (logs.stdoutDroppedBytes > logs.stdoutObservedBytes || logs.stderrDroppedBytes > logs.stderrObservedBytes) fail("Malformed dropped log byte count");
+  if (logs.stdoutObservedBytes !== logs.stdoutPersistedBytes + logs.stdoutDroppedBytes || logs.stderrObservedBytes !== logs.stderrPersistedBytes + logs.stderrDroppedBytes) fail("Malformed log accounting");
+  if (logs.stdoutTruncated !== (logs.stdoutDroppedBytes > 0) || logs.stderrTruncated !== (logs.stderrDroppedBytes > 0)) fail("Malformed log truncation truth");
+  if (logs.truncated !== (logs.stdoutTruncated || logs.stderrTruncated)) fail("Malformed aggregate log truncation truth");
+  if (logs.sealed && !logs.sealedAt) fail("Sealed logs need a timestamp");
+  if (logs.pruned && !logs.prunedAt) fail("Pruned logs need a timestamp");
+  if (logs.pruning && !logs.pruningAt) fail("Pruning logs need a timestamp");
+  if (logs.pruned && logs.pruning) fail("Pruned logs cannot retain pruning intent");
+  assertExpectedTurnPath(logs.stdoutPath, join(logsRoot, `${turnId}.jsonl`), "stdout log metadata path");
+  assertExpectedTurnPath(logs.stderrPath, join(logsRoot, `${turnId}.stderr.log`), "stderr log metadata path");
 }
 
 function validateCancelReceipt(cancel) {

@@ -61,6 +61,7 @@ test("a paused stale writer cannot commit after a newer revision", async (t) => 
   });
   await waitForFile(`${barrier}.ready`);
   await rm(join(harness.stateRoot, "workers", `${workerId}.lock`), { force: true });
+  await rm(join(harness.stateRoot, "retention.lock"), { force: true });
 
   const fresh = await harness.invoke(["resume", workerId, "--", "fresh"], {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },

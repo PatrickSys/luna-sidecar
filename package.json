@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/harness.test.mjs test/contract.test.mjs test/authority.test.mjs test/lifecycle.test.mjs test/concurrency.test.mjs",
+    "test": "node --test --test-concurrency=1 test/harness.test.mjs test/contract.test.mjs test/authority.test.mjs test/lifecycle.test.mjs test/concurrency.test.mjs test/observation.test.mjs test/resources.test.mjs test/safety.test.mjs",
     "test:harness": "node --test test/harness.test.mjs",
     "test:contract": "node --test test/contract.test.mjs"
   }

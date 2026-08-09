@@ -82,6 +82,7 @@ function allowlistedEnv() {
     "FAKE_CODEX_CAPTURE",
     "FAKE_CODEX_READY",
     "FAKE_CODEX_RELEASE",
+    "LUNA_SIDECAR_WORKER_MARKER",
   ];
   return Object.fromEntries(keys.filter((key) => key in process.env).map((key) => [key, process.env[key]]));
 }
