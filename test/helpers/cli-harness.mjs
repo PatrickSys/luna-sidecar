@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +13,7 @@ const WATCHDOG_MS = 10_000;
 const FILE_WAIT_MS = 10_000;
 const PROCESS_WAIT_MS = 5_000;
 const TERMINATION_WAIT_MS = 3_000;
+const knownProcessIdentities = new Map();
 
 export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
@@ -128,9 +129,7 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
 
   async function readCapture(result) {
     const capture = JSON.parse(await readFile(result.capturePath, "utf8"));
-    if (capture.pid) ownedPids.add(capture.pid);
-    if (capture.grandchildPid) ownedPids.add(capture.grandchildPid);
-    if (capture.grandchild?.pid) ownedPids.add(capture.grandchild.pid);
+    registerCapturePids(capture, ownedPids);
     return capture;
   }
 
@@ -145,7 +144,7 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
 
   function observePid(pid) {
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("An observed PID must be a positive safe integer");
-    ownedPids.add(pid);
+    rememberOwnedPid(ownedPids, pid, "luna-sidecar.mjs");
     return pid;
   }
 
@@ -215,6 +214,7 @@ async function createCodexShim(shimRoot) {
 }
 
 export function watchSpawnedChild(child, promise, label, timeoutMs = WATCHDOG_MS) {
+  rememberSpawnedChildIdentity(child);
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(async () => {
@@ -265,8 +265,18 @@ async function waitForFile(filePath) {
 export async function waitForProcessGone(pid) {
   if (!pid) return;
   const deadline = Date.now() + PROCESS_WAIT_MS;
+  const expected = knownProcessIdentities.get(pid) ?? { commandTokens: ["fake-codex.mjs", "fake-grandchild.mjs", "luna-sidecar.mjs"] };
+  let nextIdentityCheck = 0;
   while (Date.now() < deadline) {
     if (!isAlive(pid)) return;
+    if (expected && process.platform === "win32" && Date.now() >= nextIdentityCheck) {
+      const actual = await inspectWindowsProcess(pid);
+      if (!actual.exists) return;
+      if (actual.uncertain) throw new Error(`Owned fixture process ${pid} identity could not be verified`);
+      const commandTokens = expected.commandTokens ?? [expected.commandToken];
+      if (!commandTokens.some((token) => actual.commandLine.toLowerCase().includes(token.toLowerCase()))) return;
+      nextIdentityCheck = Date.now() + 100;
+    }
     await delay(10);
   }
   throw new Error(`Owned fixture process ${pid} survived cleanup`);
@@ -282,7 +292,10 @@ function settlesWithin(promise, timeoutMs) {
 export async function terminateSpawnedChild(child) {
   const pid = child?.pid;
   if (!pid || child.exitCode !== null || child.signalCode !== null) return;
+  rememberSpawnedChildIdentity(child);
   if (process.platform === "win32") {
+    const ownership = await verifyExpectedProcess(pid);
+    if (ownership === "gone") return;
     const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     const result = await waitForChildClose(killer, TERMINATION_WAIT_MS, "taskkill");
     if (result.code !== 0 && isAlive(pid)) throw new Error(`taskkill exited ${result.code} for spawn-owned PID ${pid}`);
@@ -298,7 +311,10 @@ export async function terminateSpawnedChild(child) {
 
 export async function terminateOwnedPid(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("An owned PID is required");
+  rememberProcessIdentity(pid, "luna-sidecar.mjs");
   if (process.platform === "win32") {
+    const ownership = await verifyExpectedProcess(pid);
+    if (ownership === "gone") return;
     const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     const result = await waitForChildClose(killer, TERMINATION_WAIT_MS, "taskkill owned pid");
     if (result.code !== 0 && isAlive(pid)) throw new Error(`taskkill exited ${result.code} for owned PID ${pid}`);
@@ -341,9 +357,26 @@ function shimPathValue(shimRoot) {
 }
 
 function registerCapturePids(capture, target) {
-  for (const pid of [capture?.pid, capture?.grandchildPid, capture?.grandchild?.pid]) {
-    if (Number.isSafeInteger(pid) && pid > 0) target.add(pid);
-  }
+  rememberOwnedPid(target, capture?.pid, "fake-codex.mjs");
+  rememberOwnedPid(target, capture?.grandchildPid, "fake-grandchild.mjs");
+  rememberOwnedPid(target, capture?.grandchild?.pid, "fake-grandchild.mjs");
+}
+
+function rememberSpawnedChildIdentity(child) {
+  const pid = child?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  const script = child.spawnargs?.find((value) => typeof value === "string" && /(?:^|[\\/])[^\\/]+\.mjs$/i.test(value));
+  rememberProcessIdentity(pid, script ? basename(script) : basename(child.spawnfile ?? process.execPath));
+}
+
+async function verifyExpectedProcess(pid) {
+  const expected = knownProcessIdentities.get(pid);
+  if (!expected || process.platform !== "win32") return "owned";
+  const actual = await inspectWindowsProcess(pid);
+  if (!actual.exists) return "gone";
+  if (actual.uncertain) throw new Error(`Owned fixture process ${pid} identity could not be verified`);
+  if (!actual.commandLine.toLowerCase().includes(expected.commandToken.toLowerCase())) return "gone";
+  return "owned";
 }
 
 async function collectManifestPids(stateRoot, target) {
@@ -357,10 +390,56 @@ async function collectManifestPids(stateRoot, target) {
   }
   for (const file of files.filter((value) => value.endsWith(".json"))) {
     const worker = await readJsonIfPresent(join(workersRoot, file));
-    for (const pid of [worker?.pid, worker?.runnerPid, worker?.providerPid]) {
-      if (Number.isSafeInteger(pid) && pid > 0) target.add(pid);
-    }
+    rememberOwnedPid(target, worker?.pid, "luna-sidecar.mjs");
+    rememberOwnedPid(target, worker?.runnerPid, "luna-sidecar.mjs");
+    rememberOwnedPid(target, worker?.providerPid, "codex");
   }
+}
+
+function rememberOwnedPid(target, pid, commandToken) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  target.add(pid);
+  rememberProcessIdentity(pid, commandToken);
+}
+
+function rememberProcessIdentity(pid, commandToken) {
+  if (Number.isSafeInteger(pid) && pid > 0 && typeof commandToken === "string" && commandToken.length > 0) {
+    knownProcessIdentities.set(pid, { commandToken });
+  }
+}
+
+function inspectWindowsProcess(pid) {
+  return new Promise((resolve) => {
+    const query = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -eq $p) { Write-Output '{"exists":false}' } else { $p | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress }`;
+    let stdout = "";
+    let settled = false;
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", query], {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      resolve({ exists: true, uncertain: true });
+    }, 1_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.once("error", () => {
+      if (!settled) { settled = true; clearTimeout(timer); resolve({ exists: true, uncertain: true }); }
+    });
+    child.once("close", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        if (parsed?.exists === false) resolve({ exists: false });
+        else resolve({ exists: true, uncertain: typeof parsed?.CommandLine !== "string", commandLine: parsed?.CommandLine ?? "" });
+      } catch {
+        resolve({ exists: true, uncertain: true });
+      }
+    });
+  });
 }
 
 function isAlive(pid) {
