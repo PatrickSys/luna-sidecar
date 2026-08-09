@@ -113,10 +113,26 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
 });
 
 test("Codex output schema literals declare JSON Schema types", () => {
+  assert.equal(hostObservationSchema.type, "object");
+  assert.equal(hostObservationSchema.additionalProperties, false);
+  assert.deepEqual(hostObservationSchema.required, ["schemaVersion", "skill", "workflow", "taskOutcome", "sidecarReceipt"]);
   assert.deepEqual(hostObservationSchema.properties.schemaVersion, { type: "integer", const: 1 });
   assert.deepEqual(hostObservationSchema.properties.skill, { type: "string", const: "luna-sidecar" });
   assert.deepEqual(hostObservationSchema.properties.workflow, { type: "string", const: "subagent" });
   assert.deepEqual(hostObservationSchema.properties.taskOutcome, { type: "string", const: "not_evaluated" });
+  const receipt = hostObservationSchema.properties.sidecarReceipt;
+  assert.equal(receipt.type, "object");
+  assert.equal(receipt.additionalProperties, false);
+  assert.deepEqual(receipt.required, ["schemaVersion", "workerId", "turnId", "state", "providerState", "errorCode", "taskOutcome"]);
+  assert.deepEqual(receipt.properties, {
+    schemaVersion: { type: "integer", const: 2 },
+    workerId: { type: "string" },
+    turnId: { type: "string" },
+    state: { type: "string", const: "completed" },
+    providerState: { type: "string", const: "completed" },
+    errorCode: { type: "null", const: null },
+    taskOutcome: { type: "string", const: "not_evaluated" },
+  });
 });
 
 test("structured Codex schema failures retain a bounded redacted diagnostic", async (t) => {
@@ -146,6 +162,31 @@ test("structured Codex schema failures retain a bounded redacted diagnostic", as
   assert.match(diagnostic.stdout.summary, /Invalid schema/);
   assert.ok(diagnostic.stdout.summary.length <= 240);
   assert.doesNotMatch(diagnostic.stdout.summary, /SECRET_PROMPT|secret\.invalid|C:\\Users\\secret/);
+});
+
+test("Claude error result diagnostics are bounded while ordinary results stay opaque", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna claude result diagnostic-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const stateRoot = join(root, "state");
+  const callerRoot = join(root, "caller");
+  const skillRoot = join(projectRoot, ".claude", "skills", "luna-sidecar");
+  await Promise.all([projectRoot, join(stateRoot, "workers"), callerRoot, skillRoot].map((path) => mkdir(path, { recursive: true })));
+  const base = { host: "claude_code", hostVersion: "2.1.220", projectRoot, skillRoot, stateRoot, cancellationCaller: callerRoot, schemaPath: join(root, "schema.json"), environment: {}, deadline: { at: Date.now() + 10_000, timedOut: false } };
+  const failed = await runHostObservation({
+    ...base,
+    run: async () => ({ code: 1, signal: null, timedOut: false, pid: null, stdout: `${JSON.stringify({ type: "result", is_error: true, subtype: "error", result: "Not logged in · Please run /login prompt=SECRET_PROMPT" })}\n`, stderr: "" }),
+  });
+  assert.match(failed.evidence.failureDiagnostics.stdout.summary, /Not logged in/);
+  assert.ok(failed.evidence.failureDiagnostics.stdout.summary.length <= 240);
+  assert.doesNotMatch(failed.evidence.failureDiagnostics.stdout.summary, /SECRET_PROMPT/);
+
+  const ordinary = await runHostObservation({
+    ...base,
+    run: async () => ({ code: 1, signal: null, timedOut: false, pid: null, stdout: `${JSON.stringify({ type: "result", is_error: false, result: "ordinary model output SECRET_PROMPT" })}\n`, stderr: "" }),
+  });
+  assert.equal(ordinary.evidence.failureDiagnostics.stdout.summary, "structured output present");
+  assert.doesNotMatch(ordinary.evidence.failureDiagnostics.stdout.summary, /ordinary|SECRET_PROMPT/);
 });
 
 test("host event parsing requires copied-skill execution, a v2 receipt, and no task-success claim", () => {
@@ -297,7 +338,7 @@ const goneChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windows
 await new Promise((resolve) => goneChild.once("close", resolve));
 const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: goneChild.pid };
 const command = "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" start --cwd \\\"" + project + "\\\" --sandbox read-only --effort medium -- \\\"inspect\\\"";
-const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
+const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: { schemaVersion: receipt.schemaVersion, workerId: receipt.workerId, turnId: receipt.turnId, state: receipt.state, providerState: receipt.providerState, errorCode: receipt.errorCode, taskOutcome: receipt.taskOutcome } };
 await mkdir(join(skill, "scripts"), { recursive: true });
 await writeFile(join(skill, "scripts", "luna-sidecar.mjs"), "process.exit(0);", "utf8");
 await mkdir(join(state, "workers"), { recursive: true });

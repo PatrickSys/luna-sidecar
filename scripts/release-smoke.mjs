@@ -740,6 +740,11 @@ function structuredHostFailureSummary(value) {
     let event;
     try { event = JSON.parse(line); }
     catch { continue; }
+    if (event?.type === "result" && (event.is_error === true || event.subtype === "error")) {
+      const code = typeof event.error?.code === "string" ? event.error.code : null;
+      const message = typeof event.result === "string" ? event.result : (typeof event.error?.message === "string" ? event.error.message : null);
+      if (code || message) return [code, message].filter(Boolean).join(": ");
+    }
     if (event?.type !== "error" && event?.type !== "turn.failed") continue;
     let payload = event;
     for (let depth = 0; depth < 3 && typeof payload?.error === "string"; depth++) {
@@ -958,7 +963,20 @@ export const hostObservationSchema = Object.freeze({
     skill: { type: "string", const: "luna-sidecar" },
     workflow: { type: "string", const: "subagent" },
     taskOutcome: { type: "string", const: "not_evaluated" },
-    sidecarReceipt: { type: "object" },
+    sidecarReceipt: {
+      type: "object",
+      additionalProperties: false,
+      required: ["schemaVersion", "workerId", "turnId", "state", "providerState", "errorCode", "taskOutcome"],
+      properties: {
+        schemaVersion: { type: "integer", const: 2 },
+        workerId: { type: "string" },
+        turnId: { type: "string" },
+        state: { type: "string", const: "completed" },
+        providerState: { type: "string", const: "completed" },
+        errorCode: { type: "null", const: null },
+        taskOutcome: { type: "string", const: "not_evaluated" },
+      },
+    },
   },
 });
 const hostCommands = Object.freeze({ codex_cli: "codex", claude_code: "claude" });
