@@ -206,6 +206,118 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
   assert.equal(cleanupUncertain.evidence.failureCode, "cleanup_identity_uncertain");
 });
 
+test("host adapters execute exact Codex and Claude shims and retain bounded failure diagnostics", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna host adapter e2e-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const shimRoot = join(root, "shims");
+  const schemaPath = join(root, "host-schema.json");
+  const callerRoot = join(root, "caller");
+  const fixturePath = join(root, "host-fixture.mjs");
+  const hosts = [
+    { name: "codex_cli", command: "codex", version: "0.147.0", skillRoot: join(projectRoot, ".agents", "skills", "luna-sidecar"), stateRoot: join(projectRoot, ".luna-host-state-codex") },
+    { name: "claude_code", command: "claude", version: "2.1.220", skillRoot: join(projectRoot, ".claude", "skills", "luna-sidecar"), stateRoot: join(projectRoot, ".luna-host-state-claude") },
+  ];
+  await Promise.all([
+    projectRoot,
+    callerRoot,
+    join(projectRoot, ".agents", "skills", "luna-sidecar"),
+    join(projectRoot, ".claude", "skills", "luna-sidecar"),
+    ...hosts.map(({ stateRoot }) => join(stateRoot, "workers")),
+  ].map((path) => mkdir(path, { recursive: true })));
+  await writeFile(schemaPath, "{}", "utf8");
+  await writeFile(fixturePath, `
+import { strict as assert } from "node:assert";
+import { mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+
+const host = process.env.LUNA_HOST_FIXTURE_HOST;
+const mode = process.env.LUNA_HOST_FIXTURE_MODE;
+const project = process.env.LUNA_HOST_FIXTURE_PROJECT;
+const state = process.env.LUNA_HOST_FIXTURE_STATE;
+const schema = process.env.LUNA_HOST_FIXTURE_SCHEMA;
+const skill = process.env.LUNA_HOST_FIXTURE_SKILL;
+const args = process.argv.slice(2);
+const fail = (message) => { process.stderr.write(message + "\\n"); process.exit(2); };
+if (process.cwd() !== project || process.env.LUNA_SIDECAR_HOME !== state) fail("fixture contract mismatch");
+if (host === "codex_cli") {
+  assert.deepEqual(args, ["exec", "--json", "--ephemeral", "--output-schema", schema, "--sandbox", "workspace-write", "--cd", project, "--skip-git-repo-check", "-"]);
+} else if (host === "claude_code") {
+  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", project]);
+} else fail("unknown host");
+const input = await new Promise((resolve) => { const chunks = []; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8"))); });
+if (host === "codex_cli" && input.includes("/luna-sidecar")) fail("codex used Claude activation syntax");
+if (host === "codex_cli" && !input.includes("Agent Skill named luna-sidecar")) fail("Codex skill activation missing");
+if (host === "claude_code" && !input.includes("/luna-sidecar")) fail("Claude skill activation missing");
+if (mode === "failure") {
+  process.stdout.write(JSON.stringify({ error: "structured output unavailable" }) + "\\n");
+  process.stderr.write("authentication failed token=super-secret-value prompt=do-not-store-this\\n");
+  process.exit(7);
+}
+const goneChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+await new Promise((resolve) => goneChild.once("close", resolve));
+const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: goneChild.pid };
+const command = "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" start --cwd \\\"" + project + "\\\" --sandbox read-only --effort medium -- \\\"inspect\\\"";
+const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
+await mkdir(join(skill, "scripts"), { recursive: true });
+await writeFile(join(skill, "scripts", "luna-sidecar.mjs"), "process.exit(0);", "utf8");
+await mkdir(join(state, "workers"), { recursive: true });
+await writeFile(join(state, "workers", receipt.workerId + ".json"), JSON.stringify({ schemaVersion: 2, workerId: receipt.workerId, state: "completed", turns: [{ turnId: receipt.turnId, cwd: project, pid: receipt.pid }] }), "utf8");
+if (host === "codex_cli") {
+  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: JSON.stringify(receipt) } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }) + "\\n");
+} else {
+  process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } }) + "\\n");
+}
+`, "utf8");
+  await writeHostShim(shimRoot, "codex", fixturePath);
+  await writeHostShim(shimRoot, "claude", fixturePath);
+  const baseEnvironment = topLevelEnvironment({ PATH: `${shimRoot}${delimiter}${process.env.PATH ?? ""}` });
+  const runObservation = (spec, mode) => runHostObservation({
+    host: spec.name,
+    hostVersion: spec.version,
+    projectRoot,
+    skillRoot: spec.skillRoot,
+    stateRoot: spec.stateRoot,
+    cancellationCaller: callerRoot,
+    schemaPath,
+    environment: {
+      ...baseEnvironment,
+      LUNA_HOST_FIXTURE_HOST: spec.name,
+      LUNA_HOST_FIXTURE_MODE: mode,
+      LUNA_HOST_FIXTURE_PROJECT: projectRoot,
+      LUNA_HOST_FIXTURE_STATE: spec.stateRoot,
+      LUNA_HOST_FIXTURE_SCHEMA: schemaPath,
+      LUNA_HOST_FIXTURE_SKILL: spec.skillRoot,
+    },
+    run: runCapturedCommand,
+    inspect: async (pid) => ({ exists: false, pid }),
+    deadline: { at: Date.now() + 30_000, timedOut: false },
+  });
+  for (const spec of hosts) {
+    const success = await runObservation(spec, "success");
+    assert.equal(success.evidence.available, true, `${spec.name}: ${JSON.stringify(success.evidence)}`);
+    assert.equal(success.evidence.sidecarReceipt.schemaResult, "valid", spec.name);
+    assert.equal(success.evidence.cleanup.ownedPidsGone, true, `${spec.name}: ${JSON.stringify(success.evidence)}`);
+    assert.equal(success.evidence.claimEligible, true, spec.name);
+    const failed = await runObservation(spec, "failure");
+    assert.equal(failed.evidence.failureCode, `${spec.name}_host_failed`, spec.name);
+    assert.equal(failed.evidence.claimEligible, false, spec.name);
+    assert.equal(failed.evidence.failureDiagnostics.kind, "auth", spec.name);
+    assert.equal(failed.evidence.failureDiagnostics.exitCode, 7, spec.name);
+    assert.equal(failed.evidence.failureDiagnostics.signal, null, spec.name);
+    assert.equal(failed.evidence.failureDiagnostics.spawnError, null, spec.name);
+    assert.match(failed.evidence.failureDiagnostics.stderr.summary, /authentication failed/);
+    assert.doesNotMatch(JSON.stringify(failed.evidence.failureDiagnostics), /super-secret-value/);
+    assert.doesNotMatch(JSON.stringify(failed.evidence.failureDiagnostics), /do-not-store-this/);
+    assert.ok(failed.evidence.failureDiagnostics.stderr.summary.length <= 240);
+    assert.equal(failed.evidence.failureDiagnostics.stdout.summary, "structured output present", spec.name);
+  }
+});
+
 test("host cleanup treats reused, matching, and uncertain PIDs distinctly", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna host pid identity-"));
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
@@ -644,6 +756,18 @@ async function writeFakeShim(shimRoot, fakePath) {
     const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
     const executable = join(shimRoot, "codex");
     await writeFile(executable, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fakePath)} "$@"\n`, "utf8");
+    await chmod(executable, 0o755);
+  }
+}
+
+async function writeHostShim(shimRoot, command, fixturePath) {
+  await mkdir(shimRoot, { recursive: true });
+  if (process.platform === "win32") {
+    await writeFile(join(shimRoot, `${command}.cmd`), `@echo off\r\n"${process.execPath}" "${fixturePath}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
+  } else {
+    const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+    const executable = join(shimRoot, command);
+    await writeFile(executable, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fixturePath)} "$@"\n`, "utf8");
     await chmod(executable, 0o755);
   }
 }

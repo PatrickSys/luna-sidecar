@@ -115,6 +115,8 @@ const gapCodes = new Set([
 ]);
 const fixedClaim = "Agent Skills copied-install portability plus bounded Codex CLI and Claude Code host observations for the recorded commit, platforms, and CI run only; no task-success or universal-host claim.";
 const releaseMarkerBasenamePattern = /^luna-release-marker-[0-9a-f-]+\.txt$/;
+const hostDiagnosticKinds = new Set(["spawn", "timeout", "signal", "invocation", "auth", "task", "output", "unknown"]);
+const hostDiagnosticMaxChars = 240;
 
 export class ReleaseSmokeError extends Error {
   constructor(code, stage = "validation") {
@@ -675,11 +677,80 @@ function normalizeHosts(value) {
         ownedPids: [],
         ownedPidsGone: cleanup.ownedPidsGone === true,
       },
+      failureDiagnostics: normalizeHostFailureDiagnostics(host.failureDiagnostics),
       failureCode: typeof host.failureCode === "string" && host.failureCode.length > 0 ? host.failureCode : (eligible ? null : "host_evidence_invalid"),
       claimEligible: eligible,
     };
   }
   return output;
+}
+
+function normalizeHostFailureDiagnostics(value) {
+  if (!value || typeof value !== "object") return null;
+  const stream = (item) => {
+    if (!item || typeof item !== "object") return { present: false, summary: "", truncated: false };
+    const summary = redactHostDiagnosticText(item.summary);
+    return {
+      present: item.present === true,
+      summary: summary.text,
+      truncated: item.truncated === true || summary.truncated,
+    };
+  };
+  return {
+    kind: hostDiagnosticKinds.has(value.kind) ? value.kind : "unknown",
+    exitCode: Number.isSafeInteger(value.exitCode) ? value.exitCode : null,
+    signal: typeof value.signal === "string" && /^SIG[A-Z0-9]+$/.test(value.signal) ? value.signal : null,
+    spawnError: typeof value.spawnError === "string" && /^[A-Z0-9_]+$/.test(value.spawnError) ? value.spawnError.slice(0, 32) : null,
+    stdout: stream(value.stdout),
+    stderr: stream(value.stderr),
+  };
+}
+
+function redactHostDiagnosticText(value) {
+  let text = typeof value === "string" ? value : "";
+  text = text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r?\n/g, " ");
+  text = text.replace(/https?:\/\/[^\s]+/gi, "<url>");
+  text = text.replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs])-[A-Za-z0-9_-]+\b/gi, "<secret>");
+  text = text.replace(/((?:api[-_ ]?key|token|secret|password|authorization|bearer)\s*[:=]\s*)[^\s]+/gi, "$1<secret>");
+  text = text.replace(/\b[A-Za-z]:\\[^\s"'`]+/g, "<path>");
+  text = text.replace(/(?:^|\s)\/(?:[^\s"'`]+\/)+[^\s"'`]+/g, " <path>");
+  text = text.replace(/\b(?:prompt|input|message)\s*[:=].*$/i, (match) => match.replace(/([:=]).*$/, "$1<redacted>"));
+  text = text.replace(/\s+/g, " ").trim();
+  return { text: text.slice(0, hostDiagnosticMaxChars), truncated: text.length > hostDiagnosticMaxChars };
+}
+
+function summarizeHostDiagnosticStream(value, stream) {
+  const raw = typeof value === "string" ? value : "";
+  if (!raw) return { present: false, summary: "", truncated: false };
+  if (stream === "stdout") {
+    const structured = raw.split(/\r?\n/).some((line) => /^[\s]*[{[]/.test(line));
+    return { present: true, summary: structured ? "structured output present" : "non-structured output present", truncated: raw.length > hostDiagnosticMaxChars };
+  }
+  const summary = redactHostDiagnosticText(raw);
+  return { present: true, summary: summary.text, truncated: summary.truncated };
+}
+
+function classifyHostFailure(result) {
+  if (result?.timedOut) return "timeout";
+  if (result?.spawnError) return "spawn";
+  if (result?.signal) return "signal";
+  const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}`.toLowerCase();
+  if (/\b(?:authentication|unauthori[sz]ed|forbidden|api key|credential|login|sign in|bearer token)\b/.test(text)) return "auth";
+  if (/\b(?:unknown|unrecognized|invalid|unsupported|missing required|usage:|option|argument|command not found)\b/.test(text)) return "invocation";
+  if (/\b(?:json|schema|parse|structured output|malformed|unexpected end)\b/.test(text)) return "output";
+  if (/\b(?:task|agent|worker|execution|provider)\b[^\n]{0,80}\b(?:failed|failure|error|timed out)\b/.test(text)) return "task";
+  return "unknown";
+}
+
+function hostFailureDiagnostics(result) {
+  return {
+    kind: classifyHostFailure(result),
+    exitCode: Number.isSafeInteger(result?.code) ? result.code : null,
+    signal: typeof result?.signal === "string" ? result.signal : null,
+    spawnError: typeof result?.spawnError === "string" ? result.spawnError : null,
+    stdout: summarizeHostDiagnosticStream(result?.stdout, "stdout"),
+    stderr: summarizeHostDiagnosticStream(result?.stderr, "stderr"),
+  };
 }
 
 function normalizeOtherGates(value) {
@@ -1007,6 +1078,7 @@ function unavailableHostEvidence(host, failureCode) {
     hostVersion: null,
     sidecarReceipt: { schemaVersion: null, schemaResult: "not_run" },
     cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
+    failureDiagnostics: null,
     failureCode,
     claimEligible: false,
     host,
@@ -1128,6 +1200,7 @@ export async function runHostObservation({
       schemaResult: parsed ? "valid" : (result?.stdout ? "invalid" : "missing"),
     },
     cleanup,
+    failureDiagnostics: result && (result.timedOut || result.spawnError || result.code !== 0 || result.signal) ? hostFailureDiagnostics(result) : null,
     failureCode: failureCode ?? null,
     claimEligible: Boolean(parsed && cleanupVerified && !failureCode),
     host,
