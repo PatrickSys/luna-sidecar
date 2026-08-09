@@ -1,24 +1,24 @@
 ---
 name: luna-sidecar
-description: Let Luna do a clear piece of work while you stay on the main task. Use when someone wants Luna to research, review, plan, or make a change without switching the main model.
+description: Request activation only when a human explicitly mentions “Luna subagent”, “Luna sidecar”, or “sidecar”, case-insensitively.
 ---
 
-# Luna Helper
+# Luna Sidecar
 
-Run the bundled script. It sends tasks through stdin and keeps real Luna workers after `start` returns.
+Use this skill only after the human explicitly mentions “Luna subagent”, “Luna sidecar”, or “sidecar”. The host agent owns commands, worker IDs, lifecycle results, and the final report; the human talks to the host agent, not this CLI.
+
+Start with the bundled launcher and retain the returned worker ID:
 
 ```sh
-node "<skill-folder>/scripts/luna-sidecar.mjs" start --effort medium -- "<one clear task>"
+node "<skill-folder>/scripts/luna-sidecar.mjs" start --effort high --read-only -- "<bounded task>"
 ```
 
-- The command prints a worker id immediately. Start independent workers in parallel when the host supports parallel shell calls.
-- Give writing workers separate files or worktrees. Do not point two workers at the same edits.
-- Check a worker with `status <worker-id>` or wait for it with `wait <worker-id>`.
-- Continue its Luna session with `resume <worker-id> -- "<follow-up>"`.
-- Stop it with `cancel <worker-id>` and see saved workers with `list`.
-- Use `run` instead of `start` when you want the old blocking one-off command.
-- Luna can edit the current project by default.
-- Pick `low`, `medium`, `high`, `xhigh`, or `max` with `--effort`.
-- Add `--read-only` when Luna should only inspect.
-- Add `--bypass` when you explicitly want full access with no approvals or sandbox.
-- Add `--cwd <project-folder>` to work in another folder.
+Use `node "<skill-folder>/scripts/luna-sidecar.mjs" --help` for the protocol surface.
+
+- Choose effort and authority deliberately. Default `workspace-write` is compatibility behavior, not inferred approval. Resume inherits stored effort, cwd, sandbox, and bypass when omitted.
+- An explicit cwd, sandbox, or bypass change is a host choice. Bypass or any broader reachable scope requires direct human intent through the host; narrowing is allowed.
+- Start independent workers with separate file/worktree ownership. Bound requested native subagents, and never invoke this sidecar recursively.
+- Treat `failed`, `unknown`, cancellation timeout/failure, and `taskOutcome: not_evaluated` honestly. The host evaluates the final evidence against the task.
+- Never delegate secrets. The local state root, raw logs, and provider final messages are sensitive and are not generically redacted; compact receipts use an allowlist.
+
+For prompting patterns and lifecycle meanings, read [references/USAGE.md](references/USAGE.md).

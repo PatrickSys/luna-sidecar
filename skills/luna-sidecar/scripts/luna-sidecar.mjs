@@ -23,7 +23,8 @@ const schemaVersion = 2;
 const efforts = new Set(["low", "medium", "high", "xhigh", "max"]);
 const workerStates = new Set(["starting", "running", "cancelling", "completed", "failed", "cancelled", "unknown"]);
 const providerStates = new Set(["not_started", "running", "completed", "failed", "unknown"]);
-const commands = new Set(["start", "status", "wait", "resume", "cancel", "list", "run", "_worker"]);
+const commands = new Set(["start", "status", "wait", "resume", "cancel", "stop", "list", "run", "_worker"]);
+const managerCommands = new Set(["start", "status", "wait", "resume", "cancel", "stop", "list"]);
 const nestedMarkerEnv = "LUNA_SIDECAR_WORKER_MARKER";
 const nestedMarkerVersion = 1;
 const stdoutCapBytes = 32 * 1024 * 1024;
@@ -33,13 +34,15 @@ const maxWarnings = 64;
 const maxFinalMessageBytes = 1024 * 1024;
 const completeLineCapBytes = maxFinalMessageBytes + 64 * 1024;
 const rawArgs = process.argv.slice(2);
-const command = commands.has(rawArgs[0]) ? rawArgs.shift() : "run";
+const invokedToken = rawArgs[0];
+const command = commands.has(invokedToken) ? rawArgs.shift() : "run";
 const stateRoot = resolve(process.env.LUNA_SIDECAR_HOME ?? defaultStateRoot());
 const workersRoot = join(stateRoot, "workers");
 const logsRoot = join(stateRoot, "logs");
 const promptsRoot = join(stateRoot, "prompts");
 const requestsRoot = join(stateRoot, "requests");
 const launcherPath = fileURLToPath(import.meta.url);
+const globalHelpRequested = invokedToken === "--help";
 
 class SidecarError extends Error {
   constructor(message, code = "sidecar_error", exitCode = 2) {
@@ -56,19 +59,55 @@ class RevisionConflict extends SidecarError {
 }
 
 async function main() {
+  if (isHelpInvocation(rawArgs)) {
+    printHelp(command);
+    return;
+  }
   assertExecutionAllowed(command);
   if (command === "run") return runForeground(parseTask(rawArgs));
   if (command === "start") return startWorker(parseTask(rawArgs));
   if (command === "status") return showStatus(requireWorkerId(rawArgs));
   if (command === "wait") return waitForWorker(requireWorkerId(rawArgs), parseWait(rawArgs.slice(1)));
   if (command === "resume") return resumeWorker(requireWorkerId(rawArgs), parseTask(rawArgs.slice(1)));
-  if (command === "cancel") return cancelWorker(requireWorkerId(rawArgs));
+  if (command === "cancel" || command === "stop") return cancelWorker(requireWorkerId(rawArgs));
   if (command === "list") return listWorkers();
   if (command === "_worker") return runWorker(requireWorkerId(rawArgs));
 }
 
+function isHelpInvocation(args) {
+  if (globalHelpRequested) return true;
+  if (!commands.has(invokedToken) || command === "_worker") return false;
+  const separator = args.indexOf("--");
+  return args.slice(0, separator === -1 ? args.length : separator).includes("--help");
+}
+
+function printHelp(commandName) {
+  const usage = {
+    run: "Usage: luna-sidecar run [options] -- <task>",
+    start: "Usage: luna-sidecar start [options] -- <task>",
+    status: "Usage: luna-sidecar status <worker-id>",
+    wait: "Usage: luna-sidecar wait <worker-id> [--timeout <milliseconds>]",
+    resume: "Usage: luna-sidecar resume <worker-id> [options] -- <follow-up>",
+    cancel: "Usage: luna-sidecar cancel <worker-id>",
+    stop: "Usage: luna-sidecar stop <worker-id> (same lifecycle operation as cancel)",
+    list: "Usage: luna-sidecar list",
+  };
+  if (commandName === "run" && globalHelpRequested) {
+    process.stdout.write([
+      "luna-sidecar — host-managed Luna workers",
+      "",
+      "Commands: start, run, status, wait, resume, cancel, stop, list",
+      "Use <command> --help for command-specific usage.",
+      "",
+      "Options: --effort <low|medium|high|xhigh|max>, --read-only, --bypass, --cwd <folder>",
+    ].join("\n") + "\n");
+    return;
+  }
+  process.stdout.write(`${usage[commandName] ?? usage.run}\n`);
+}
+
 function assertExecutionAllowed(commandName) {
-  if (!["start", "run", "resume", "cancel", "_worker"].includes(commandName)) return;
+  if (!["start", "run", "resume", "cancel", "stop", "_worker"].includes(commandName)) return;
   const raw = process.env[nestedMarkerEnv];
   if (raw === undefined) return;
   let marker;
@@ -205,13 +244,13 @@ function resolvedResumeTask(task, previous) {
   const storedBypass = typeof previous.bypass === "boolean" ? previous.bypass : null;
 
   if (task.effort === null && storedEffort === null) {
-    fail("Stored effort is missing or invalid; pass --effort explicitly");
+    throw new SidecarError("Stored effort is missing or invalid; pass --effort explicitly", "stored_authority", 2);
   }
   if (task.cwd === null && storedCwd === null) {
-    fail("Stored cwd is missing or invalid; pass --cwd explicitly");
+    throw new SidecarError("Stored cwd is missing or invalid; pass --cwd explicitly", "stored_authority", 2);
   }
   if (task.sandbox === null && task.bypass === null && (storedSandbox === null || storedBypass === null)) {
-    fail("Stored authority is missing or invalid; pass --read-only or --bypass explicitly");
+    throw new SidecarError("Stored authority is missing or invalid; pass --read-only or --bypass explicitly", "stored_authority", 2);
   }
 
   return resolvedTask(task, {
@@ -949,12 +988,15 @@ class CappedRawWriter {
 try {
   await main();
 } catch (error) {
-  if (error instanceof SidecarError && error.exitCode === 1) {
-    printFailure(command, null, error.code, error.message);
-    process.exitCode = 1;
-  } else if (!(error instanceof SidecarError)) {
+  if (managerCommands.has(command)) {
+    const sidecarError = error instanceof SidecarError
+      ? error
+      : new SidecarError("Sidecar evidence is unavailable; inspect the local state root and retry", "sidecar_error", 2);
+    printFailure(command, null, sidecarError.code, sidecarError.message);
+    process.exitCode = Number.isInteger(sidecarError.exitCode) ? sidecarError.exitCode : 2;
+  } else {
     process.stderr.write(`luna-sidecar: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 2;
+    process.exitCode = error instanceof SidecarError && Number.isInteger(error.exitCode) ? error.exitCode : 2;
   }
 }
 
@@ -1887,7 +1929,7 @@ async function readWorker(workerId) {
     const raw = JSON.parse(await readFile(target, "utf8"));
     return normalizeWorker(raw, workerId);
   } catch (error) {
-    if (error.code === "ENOENT") fail(`Unknown worker: ${workerId}`);
+    if (error.code === "ENOENT") throw new SidecarError(`Unknown worker: ${workerId}`, "unknown_worker", 2);
     throw error;
   }
 }
@@ -2493,9 +2535,6 @@ function print(value) {
 }
 
 function fail(message, code = null) {
-  process.stderr.write(`luna-sidecar: ${message}\n`);
-  process.exitCode = 2;
-  if (code === "ENOENT") process.exitCode = 2;
   throw new SidecarError(message, code ?? "invalid_input", 2);
 }
 

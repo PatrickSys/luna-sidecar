@@ -1,56 +1,24 @@
 # Luna Sidecar
 
-Give Luna clear work while your main AI keeps going. Start one or several real Luna workers, then inspect, resume, or stop them by id.
+Luna Sidecar is an Agent Skill asset plus a zero-dependency Node launcher for a host agent to manage Luna workers. The human asks the host agent; the host owns worker IDs, commands, results, and reporting. The CLI is an agent-facing protocol, not the human workflow.
 
 ## Install
 
-Install the skill once:
+Install through an existing Agent Skills flow in the project or user scope:
 
 ~~~sh
-npx skills add PatrickSys/luna-sidecar -g -a codex -y
+npx skills add PatrickSys/luna-sidecar -a codex -y
 ~~~
 
-For another supported AI, replace codex with that AI name. The installer copies the skill and its bundled launcher into that AI skills folder.
+This repository does not add a host adapter or claim that every host routes skill metadata identically.
 
-## Start workers
+## Prerequisites and claim boundary
 
-Tell your AI:
+The host needs Agent Skills support, Node.js, and a signed-in Codex CLI with access to `gpt-5.6-luna`. The launcher uses the host-selected cwd, effort, sandbox, and bypass authority; bypass requires direct human intent through the host.
 
-~~~text
-Use luna-sidecar to start two independent Luna workers: one reviews auth and one reviews billing. Keep them on separate files.
-~~~
+The current repository claim is limited to this Agent Skills boundary and the deterministic local launcher contract. It does not claim universal-host behavior, live Claude execution, model task success, or secret redaction of local state, raw logs, or final messages.
 
-Or call the installed script directly:
-
-~~~sh
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" start --effort high -- "Review src/auth and report the bug."
-~~~
-
-Start returns a worker id immediately. The worker keeps running after the command ends. Start more workers when your AI host can make parallel shell calls. Do not give two writing workers the same files.
-
-## Control workers
-
-~~~sh
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" status <worker-id>
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" wait <worker-id>
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" resume <worker-id> -- "Run the focused tests and fix failures."
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" cancel <worker-id>
-node "<installed-skill-folder>/scripts/luna-sidecar.mjs" list
-~~~
-
-The manager commands print JSON with the real worker id, Codex session id, state, and final message. Luna session records persist locally, so resume continues the same Luna conversation.
-
-## Options
-
-Luna can edit the project by default. Use --read-only for inspection only, --bypass for full access with no approvals or sandbox, --cwd <project-folder> for another project, and choose low, medium, high, xhigh, or max with --effort.
-
-Use run instead of start for a blocking one-off command. Leaving off run keeps the same one-off behavior for older uses.
-
-The launcher passes tasks over stdin, avoiding shell quoting and command-length trouble. It does not use npx for each Luna job.
-
-## What you need
-
-The machine needs the Codex CLI, signed in with access to gpt-5.6-luna. Any AI that understands skills can use this skill; the Codex CLI is only the route used to reach Luna.
+Detailed prompting patterns are in [skills/luna-sidecar/references/USAGE.md](skills/luna-sidecar/references/USAGE.md).
 
 ## License
 

@@ -220,7 +220,10 @@ test("legacy resume fails closed when stored authority is incomplete", async (t)
   }));
   const failed = await harness.invoke(["resume", legacyWorkerId, "--", "unsafe omission"]);
   assert.equal(failed.code, 2);
-  assert.match(failed.stderr.toString(), /Stored effort is missing or invalid/);
+  assert.equal(failed.json().command, "resume");
+  assert.equal(failed.json().error.code, "stored_authority");
+  assert.match(failed.json().error.message, /Stored effort is missing or invalid/);
+  assert.deepEqual(failed.stderr, Buffer.alloc(0));
   assert.equal(JSON.parse(await readFile(workerPath, "utf8")).prompt, "must not migrate");
 });
 

@@ -120,20 +120,19 @@ test("background start preserves manager shape and transports exact prompt bytes
   await harness.verifyCaptureProcessesGone();
 });
 
-test("public commands retain command-specific recognition and current validation", async (t) => {
+test("manager validation errors use one schema-v2 value and foreground run keeps passthrough errors", async (t) => {
   const harness = await createCliHarness(t);
   const failures = [
-    { args: [], message: /Pass one task/ },
-    { args: ["run"], message: /Pass one task/ },
     { args: ["start"], message: /Pass one task/ },
     { args: ["status"], message: /A worker id is required/ },
     { args: ["wait"], message: /A worker id is required/ },
     { args: ["resume"], message: /A worker id is required/ },
     { args: ["cancel"], message: /A worker id is required/ },
-    { args: ["run", "--effort", "impossible", "--", "task"], message: /--effort must be one of/ },
-    { args: ["run", "--cwd"], message: /--cwd needs a folder/ },
-    { args: ["run", "--unknown", "--", "task"], message: /Unknown option: --unknown/ },
-    { args: ["run", "--", "   "], message: /Pass one task/ },
+    { args: ["stop"], message: /A worker id is required/ },
+    { args: ["start", "--effort", "impossible", "--", "task"], message: /--effort must be one of/ },
+    { args: ["start", "--cwd"], message: /--cwd needs a folder/ },
+    { args: ["start", "--unknown", "--", "task"], message: /Unknown option: --unknown/ },
+    { args: ["start", "--", "   "], message: /Pass one task/ },
     { args: ["wait", absentWorkerId, "--timeout", "later"], message: /--timeout must be a non-negative whole number/ },
     { args: ["status", "../../outside"], message: /Invalid worker id/ },
     { args: ["status", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"], message: /Invalid worker id/ },
@@ -142,12 +141,24 @@ test("public commands retain command-specific recognition and current validation
 
   for (const { args, message } of failures) {
     const result = await harness.invoke(args);
-    assert.equal(result.code, 2, `${args[0] ?? "default run"} should reject invalid input`);
+    assert.equal(result.code, 2, `${args[0]} should reject invalid input`);
     assert.equal(result.signal, null);
-    assert.deepEqual(result.stdout, Buffer.alloc(0));
-    assert.match(result.stderr.toString("utf8"), message);
+    const value = result.json();
+    assert.deepEqual(Object.keys(value).sort(), ["command", "error", "ok", "schemaVersion", "workerId"]);
+    assert.equal(value.schemaVersion, 2);
+    assert.equal(value.ok, false);
+    assert.equal(value.command, args[0]);
+    assert.equal(value.workerId, null);
+    assert.match(value.error.message, message);
+    assert.deepEqual(result.stderr, Buffer.alloc(0));
     await harness.assertNoCapture(result);
   }
+
+  const run = await harness.invoke(["run"]);
+  assert.equal(run.code, 2);
+  assert.deepEqual(run.stdout, Buffer.alloc(0));
+  assert.match(run.stderr.toString("utf8"), /Pass one task/);
+  await harness.assertNoCapture(run);
 
   const list = await harness.invoke(["list"]);
   assert.equal(list.code, 0);
@@ -172,7 +183,9 @@ test("future schemas and poisoned v2 paths fail closed without rewriting state",
   const before = await fingerprint(futurePath);
   const future = await harness.invoke(["status", absentWorkerId]);
   assert.equal(future.code, 2);
-  assert.match(future.stderr.toString(), /Unsupported worker schema version: 3/);
+  assert.equal(future.json().error.code, "invalid_input");
+  assert.match(future.json().error.message, /Unsupported worker schema version: 3/);
+  assert.deepEqual(future.stderr, Buffer.alloc(0));
   assert.deepEqual(await fingerprint(futurePath), before);
 
   const started = await harness.invoke(["start", "--", "path integrity"], {
@@ -189,24 +202,33 @@ test("future schemas and poisoned v2 paths fail closed without rewriting state",
   await writeFile(workerPath, `${JSON.stringify(worker, null, 2)}\n`, "utf8");
   const poisoned = await harness.invoke(["status", workerId]);
   assert.equal(poisoned.code, 2);
-  assert.match(poisoned.stderr.toString(), /Malformed prompt path/);
+  assert.equal(poisoned.json().error.code, "invalid_input");
+  assert.match(poisoned.json().error.message, /Malformed prompt path/);
+  assert.deepEqual(poisoned.stderr, Buffer.alloc(0));
 });
 
-test("unknown workers fail through the current raw error surface without launching a provider", async (t) => {
+test("unknown workers use the manager envelope without launching a provider", async (t) => {
   const harness = await createCliHarness(t);
   const commands = [
     ["status", absentWorkerId],
     ["wait", absentWorkerId],
     ["resume", absentWorkerId, "--", "do not launch"],
     ["cancel", absentWorkerId],
+    ["stop", absentWorkerId],
   ];
 
   for (const args of commands) {
     const result = await harness.invoke(args);
     assert.equal(result.code, 2);
     assert.equal(result.signal, null);
-    assert.deepEqual(result.stdout, Buffer.alloc(0));
-    assert.match(result.stderr.toString("utf8"), new RegExp(`Unknown worker: ${absentWorkerId}`));
+    const value = result.json();
+    assert.equal(value.schemaVersion, 2);
+    assert.equal(value.ok, false);
+    assert.equal(value.command, args[0]);
+    assert.equal(value.workerId, null);
+    assert.equal(value.error.code, "unknown_worker");
+    assert.match(value.error.message, new RegExp(`Unknown worker: ${absentWorkerId}`));
+    assert.deepEqual(result.stderr, Buffer.alloc(0));
     await harness.assertNoCapture(result);
   }
 });

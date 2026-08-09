@@ -264,10 +264,11 @@ test("help does not launch provider", async (t) => {
   const harness = await createCliHarness(t);
   const result = await harness.invoke(["--help"]);
 
-  assert.equal(result.code, 2);
+  assert.equal(result.code, 0);
   assert.equal(result.signal, null);
-  assert.deepEqual(result.stdout, Buffer.alloc(0));
-  assert.match(result.stderr.toString("utf8"), /Unknown option: --help/);
+  assert.match(result.stdout.toString("utf8"), /Commands: start, run, status, wait, resume, cancel, stop, list/);
+  assert.throws(() => result.json(), /was not exactly one JSON value/);
+  assert.deepEqual(result.stderr, Buffer.alloc(0));
   await harness.assertNoCapture(result);
 });
 
