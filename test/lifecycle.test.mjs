@@ -276,7 +276,7 @@ test("cancel after a killed runner becomes unknown, wait returns immediately, an
   });
   const workerId = await waitForCreatedWorker(harness);
   const receipt = await waitForManifest(harness, workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
-  await terminateOwnedPid(receipt.pid, { workerId: receipt.workerId });
+  await terminateOwnedPid(receipt.pid);
   await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
   await startPromise;
 
@@ -305,7 +305,7 @@ test("cancel fails closed for a dead runner and never signals a stored provider 
   const victimId = await waitForCreatedWorker(harness, new Set([sentinel.json().workerId]));
   const victimReceipt = { workerId: victimId };
   const victimManifest = await waitForManifest(harness, victimId, (worker) => Number.isSafeInteger(worker.runnerPid));
-  await terminateOwnedPid(victimManifest.runnerPid, { workerId: victimReceipt.workerId });
+  await terminateOwnedPid(victimManifest.runnerPid);
   await writeFile(join(harness.stateRoot, "2.start.barrier"), "release\n", "utf8");
   await victimPromise;
 

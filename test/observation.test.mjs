@@ -91,7 +91,7 @@ test("a definitely dead pre-readiness runner persists sealed unknown cleanup", a
   const beforeManifest = await waitForManifest(manifestPath, (worker) => Number.isSafeInteger(worker.runnerPid));
   const beforeTurn = beforeManifest.turns.at(-1);
   const runner = beforeManifest.runnerPid;
-  await terminateOwnedPid(runner, { workerId });
+  await terminateOwnedPid(runner);
   await started;
   const status = await harness.invoke(["status", workerId]);
   assert.equal(status.json().state, "unknown");

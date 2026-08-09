@@ -9,9 +9,6 @@ import test from "node:test";
 import {
   buildMinimalTestEnvironment,
   createCliHarness,
-  matchesExpectedProcessIdentity,
-  isWaitOnlyFixtureImage,
-  parseTasklistImage,
   parseExactlyOneJson,
   terminateSpawnedChild,
   waitForProcessGone,
@@ -20,25 +17,6 @@ import {
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const fakeCodexPath = join(repositoryRoot, "test", "fixtures", "fake-codex.mjs");
-const launcherPath = join(repositoryRoot, "skills", "luna-sidecar", "scripts", "luna-sidecar.mjs");
-
-test("owned Windows identity requires the exact launcher and worker tokens", () => {
-  const workerId = "11111111-1111-4111-8111-111111111111";
-  const expected = { commandTokens: [launcherPath, "_worker", workerId] };
-  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"${process.execPath}" "${launcherPath}" _worker ${workerId}` }, expected), true);
-  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"C:\\Users\\other\\codex.exe" exec --json ${workerId}` }, expected), false);
-  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"${launcherPath}" _worker` }, expected), false);
-  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: true, commandLine: `"${launcherPath}" _worker ${workerId}` }, expected), false);
-});
-
-test("wait-only tasklist observations classify only known fixture images", () => {
-  assert.equal(parseTasklistImage('"node.exe","1234","Console","1","1,000"'), "node.exe");
-  assert.equal(parseTasklistImage('INFO: No tasks are running which match the specified criteria.'), null);
-  assert.equal(isWaitOnlyFixtureImage("node.exe"), true);
-  assert.equal(isWaitOnlyFixtureImage("codex.exe"), true);
-  assert.equal(isWaitOnlyFixtureImage("cmd.exe"), true);
-  assert.equal(isWaitOnlyFixtureImage("chrome.exe"), false);
-});
 
 test("fake Codex captures exact bytes, authority inputs, PIDs, chunks, and explicit release", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-harness-"));
@@ -367,7 +345,7 @@ function registerCleanup(t, root) {
       if (!closed) await terminateSpawnedChild(run.child);
     }
 
-    for (const pid of pids) await waitForProcessGone(pid);
+    await Promise.all([...pids, ...[...runs].map((run) => run.child.pid)].map((pid) => waitForProcessGone(pid)));
 
     await rm(root, { recursive: true, force: true });
   });
