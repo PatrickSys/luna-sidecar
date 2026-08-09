@@ -296,7 +296,8 @@ function execArgs(task, json = false) {
     model,
     "-c",
     `model_reasoning_effort=${task.effort}`,
-    ...(task.bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", task.sandbox]),
+    ...(task.bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["--sandbox", codexSandbox(task.sandbox)]),
+    "--skip-git-repo-check",
     "-C",
     task.cwd,
     "-",
@@ -312,10 +313,15 @@ function resumeArgs(threadId, task) {
     model,
     "-c",
     `model_reasoning_effort=${task.effort}`,
-    ...(task.bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", `sandbox_mode=\"${task.sandbox}\"`]),
+    ...(task.bypass ? ["--dangerously-bypass-approvals-and-sandbox"] : ["-c", `sandbox_mode=\"${codexSandbox(task.sandbox)}\"`]),
+    "--skip-git-repo-check",
     threadId,
     "-",
   ];
+}
+
+function codexSandbox(sandbox) {
+  return sandbox === "full-access" ? "danger-full-access" : sandbox;
 }
 
 function spawnCodex(args, options) {

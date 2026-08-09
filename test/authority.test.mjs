@@ -45,7 +45,7 @@ test("start records schema v2, exact initial authority, prompt hash, and request
   const capture = await harness.waitForCapture(result);
   assert.deepEqual(capture.argv, [
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=xhigh",
-    "--sandbox", "read-only", "-C", harness.requestedCwd, "-",
+    "--sandbox", "read-only", "--skip-git-repo-check", "-C", harness.requestedCwd, "-",
   ]);
   assert.equal(capture.cwd, harness.requestedCwd);
   assert.equal(capture.stdinBase64, Buffer.from("authority prompt").toString("base64"));
@@ -83,7 +83,7 @@ test("resume preserves worker identity, creates a unique turn, and captures inhe
   const capture = await harness.waitForCapture(resumed);
   assert.deepEqual(capture.argv, [
     "exec", "resume", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high",
-    "-c", "sandbox_mode=\"read-only\"", "fixture-thread", "-",
+    "-c", "sandbox_mode=\"read-only\"", "--skip-git-repo-check", "fixture-thread", "-",
   ]);
   assert.equal(capture.cwd, harness.requestedCwd);
   const worker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${first.workerId}.json`), "utf8"));
@@ -103,7 +103,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   const defaultCapture = await harness.waitForCapture(defaultStart);
   assert.deepEqual(defaultCapture.argv, [
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
-    "--sandbox", "workspace-write", "-C", defaultStart.json().cwd, "-",
+    "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", defaultStart.json().cwd, "-",
   ]);
   await harness.invoke(["wait", defaultStart.json().workerId]);
 
@@ -131,7 +131,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   assert.equal(broadened.json().cwd, overrideCwd);
   assert.deepEqual(broadenedCapture.argv, [
     "exec", "resume", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max",
-    "-c", "sandbox_mode=\"full-access\"", "override-thread", "-",
+    "-c", "sandbox_mode=\"danger-full-access\"", "--skip-git-repo-check", "override-thread", "-",
   ]);
   assert.equal(broadenedCapture.cwd, overrideCwd);
   const broadenedWorker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${workerId}.json`), "utf8"));
@@ -149,7 +149,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   assert.equal(narrowed.json().cwd, overrideCwd);
   assert.deepEqual(narrowedCapture.argv, [
     "exec", "resume", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max",
-    "-c", "sandbox_mode=\"read-only\"", "broadened-thread", "-",
+    "-c", "sandbox_mode=\"read-only\"", "--skip-git-repo-check", "broadened-thread", "-",
   ]);
   assert.equal(narrowedCapture.cwd, overrideCwd);
   await harness.invoke(["wait", workerId]);
@@ -170,7 +170,7 @@ test("bypass is explicit and contradictory authority is rejected", async (t) => 
   const capture = await harness.waitForCapture(result);
   assert.deepEqual(capture.argv, [
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
-    "--sandbox", "full-access", "-C", receipt.cwd, "-",
+    "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", receipt.cwd, "-",
   ]);
   await harness.release(result);
   await harness.invoke(["wait", receipt.workerId]);

@@ -46,6 +46,8 @@ All commands below completed successfully unless noted:
 - The omitted 05-02 test ripple was recovered across `test/authority.test.mjs`, `test/concurrency.test.mjs`, `test/contract.test.mjs`, `test/harness.test.mjs`, `test/observation.test.mjs`, `test/release-smoke.test.mjs`, and `test/safety.test.mjs`, plus the readiness fixture/explicit-start consumers in `test/fixtures/fake-codex.mjs`, `test/lifecycle.test.mjs`, and `test/resources.test.mjs`.
 - The final observation migration asserts persisted pre-readiness `unknown`/`runner_died` cleanup with sealed stdout/stderr metadata marked missing, rather than asserting the old non-persistence behavior.
 - No 05-03 runtime redesign, host-specific Claude syntax, push, remote-CI claim, or later-phase work was added.
+- Verification-gap repair: Codex argv now maps public `full-access` to installed `danger-full-access`, explicit start/resume invocations carry `--skip-git-repo-check`, and receipts/state retain the public `full-access` value.
+- TDD evidence for this repair was RED on the prior argv, then GREEN after the minimal boundary mapping: authority, contract, and harness tests cover all public sandbox values, start/resume skip-flag presence, receipt preservation, and rejection of legacy aliases.
 
 <checks>
   <executor_check>Manual self-check passed: the planned local tests, syntax checks, evidence JSON validation, staged-name inspections, and diff checks passed; final worktree cleanliness is checked after this handoff commit.</executor_check>

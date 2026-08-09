@@ -236,6 +236,7 @@ test("real launcher transports exact prompt and output bytes through the PATH sh
     "model_reasoning_effort=high",
     "--sandbox",
     "workspace-write",
+    "--skip-git-repo-check",
     "-C",
     harness.requestedCwd,
     "-",

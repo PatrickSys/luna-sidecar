@@ -105,6 +105,7 @@ test("background start preserves manager shape and transports exact prompt bytes
     "model_reasoning_effort=xhigh",
     "--sandbox",
     "read-only",
+    "--skip-git-repo-check",
     "-C",
     harness.requestedCwd,
     "-",
@@ -135,6 +136,11 @@ test("explicit sandbox and effort spellings persist without hidden defaults", as
       assert.equal(receipt.sandbox, sandbox);
       assert.equal(receipt.effort, effort);
       assert.equal(receipt.bypass, false);
+      const capture = await harness.waitForCapture(started);
+      const sandboxIndex = capture.argv.indexOf("--sandbox");
+      assert.equal(capture.argv[sandboxIndex + 1], sandbox === "full-access" ? "danger-full-access" : sandbox);
+      assert.equal(capture.argv.includes("--skip-git-repo-check"), true);
+      assert.equal(capture.argv.includes("--dangerously-bypass-approvals-and-sandbox"), false);
       const completed = await harness.invoke(["wait", receipt.workerId]);
       assert.equal(completed.code, 0);
       assert.equal(completed.json().sandbox, sandbox);

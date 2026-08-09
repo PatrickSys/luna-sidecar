@@ -7,7 +7,7 @@
 **Canonical source:** `PatrickSys/luna-sidecar`
 **Delivery policy:** Small verified commits may go directly to `main`; never force-push and never overwrite unexpected remote movement.
 
-**Current State:** Phase 5 implementation and locally executable verification are complete through `c63913edf0e751dad1a85ebc6e1a68d06ae9c0c3`. The explicit six-command surface, control/readiness contract, copied-install parity, guidance, and evidence schema are locally green. Release closure remains open because the exact CI query returned no run for the tested commit and no real host observation was started; the recorded Phase 5 evidence therefore keeps both host claims ineligible and `releaseReady: false`. The historical `thread.started` readiness correction and the recovered stale-test ripple are recorded in the phase summary.
+**Current State:** Phase 5 implementation and locally executable verification are complete through the prior implementation commits plus this provider-contract repair. Public `full-access` remains persisted as `full-access` while Codex argv uses installed `danger-full-access`, and explicit start/resume cwd invocation includes `--skip-git-repo-check`. Release closure remains open because the exact CI query returned no run for the tested commit and no real host observation was started; the recorded Phase 5 evidence therefore keeps both host claims ineligible and `releaseReady: false`.
 
 ## Phase 5 final-shape amendment
 
