@@ -11,6 +11,7 @@ files-modified:
   - package.json
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
   - test/fixtures/fake-codex.mjs
+  - test/concurrency.test.mjs
   - test/observation.test.mjs
   - test/resources.test.mjs
   - test/safety.test.mjs
@@ -215,6 +216,7 @@ Execute `03-01 -> 03-02 -> 03-03`. First require Phase 2's verification file to 
   <files>
     - MODIFY: package.json
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
+    - MODIFY: test/concurrency.test.mjs
     - CREATE: test/safety.test.mjs
   </files>
   <action>
