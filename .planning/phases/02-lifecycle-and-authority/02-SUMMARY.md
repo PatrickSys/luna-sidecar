@@ -1,7 +1,7 @@
 ---
 phase: 02-lifecycle-and-authority
 status: implemented
-implementation_commit: ca6560c667316d380ed4c71c6e53caa88b35c5b9
+implementation_commit: 7acec18861fcac8ad53426739581166f02e3db35
 requirements:
   - COMPAT-01
   - AUTH-01
@@ -29,7 +29,7 @@ This summary is executor evidence only. It does not claim independent verificati
 | Requirement | Phase 2 evidence | Limit |
 |---|---|---|
 | COMPAT-01 | Existing command names and manager fields remain characterized; legacy status/list/wait reads preserve bytes and metadata; an explicit terminal cancel upgrades through an allowlist while stripping prompt/env/argv/raw-event fields; future schemas are rejected without rewrite. | Phase 1 supplied the baseline; Phase 2 supplies the explicit-mutation migration clause. Error/help normalization remains Phase 4. |
-| AUTH-01 | `test/authority.test.mjs` captures exact initial and resume argv plus provider cwd for default, inherited, explicitly broadened, and explicitly narrowed authority, including max effort, bypass, read-only, contradiction rejection, and a different caller cwd. | Installed Codex resume syntax was checked locally. No live provider was invoked. |
+| AUTH-01 | `test/authority.test.mjs` captures exact initial and resume argv plus provider cwd for default, inherited, explicitly broadened, and explicitly narrowed authority, including max effort, bypass, read-only, contradiction rejection, and a different caller cwd. Explicit bypass also asserts the persisted/returned normalized authority tuple, not just provider argv. | Installed Codex resume syntax was checked locally. No live provider was invoked. |
 | LINEAGE-01 | One `workerId` survives resumes, every turn has a unique UUID, history remains ordered, and concurrent duplicate resumes select one active turn. | Resume is intentionally non-idempotent after a prior turn has fully completed; hosts inspect status before issuing new work. |
 | LIFE-01 | Tests distinguish provider spawn failure, top-level provider failure, nonzero exit, missing completion, completion with a living process, process close, prompt claim, stdin callback, duplicate runner, dead runner, and startup failures outside the provider block. | Delegated task success is not inferred from agent prose. |
 | CANCEL-01 | Tests cover committed request fields, pre-signal acknowledgement, starting cancellation, one duplicate request ID, durable timeout with later completion, completion-before-ack `not_applied`, stale runner/provider PID refusal, Windows `/T /F`, root-close verification, and independently observed grandchild disappearance. | Guarantee is the specified normal tree/group only. Breakaway descendants, PID-reuse elimination, and absolute OS containment remain outside v1. |
@@ -69,6 +69,7 @@ Supplemental evidence:
 | Focused terminal-event matrix, starting cancellation, and concurrency suite repeated five times before closure | All iterations passed after the actual Windows manifest-rename race and stream-drain race were corrected. |
 | Max-reasoning adversarial review before final gates | Four local reviewers found ownerless starting cancellation, malformed locks, duplicate runners, unsafe schema migration, startup stranding, and missing deterministic evidence; accepted findings were fixed and covered. |
 | Fresh post-fix max closure panel | One reviewer reached the local checkout and found no additional ownership/lifecycle blocker. Two recommendations were correctly left to their locked boundaries: exact wait-deadline semantics is Phase 3, and native/runtime descendant enumeration exceeds Phase 2's explicit Windows contract. Two other reviewers could only see stale remote code and their findings were excluded. |
+| First independent verifier | All commands passed for `ca6560c...`, but the verifier correctly recorded `gaps_found`: explicit bypass after stored read-only launched unsandboxed while retaining `sandbox: read-only` in the receipt. Commit `7acec18...` normalizes that tuple to the existing bypass convention (`sandbox: workspace-write`, `bypass: true`), adds a schema invariant, strengthens persisted-turn assertions, and passed the full suite twice plus the focused matrix. The committed gap report remains the audit trail; fresh re-verification is still required. |
 | Anti-pattern scan over changed implementation/tests | No TODO/FIXME/HACK/XXX or `console.log` matches. |
 
 ## Deviations and recovery paths
@@ -89,4 +90,4 @@ Supplemental evidence:
 
 ## Next action
 
-A fresh Luna-max verifier must read `SPEC.md`, `ROADMAP.md`, the Phase 2 plan, this summary, and exact implementation commit `ca6560c667316d380ed4c71c6e53caa88b35c5b9`; rerun every Phase 2 closure command; trace every state write and signal path; and write `02-VERIFICATION.md`. Phase 3 remains blocked until that file records `status: passed` for this exact implementation commit.
+A fresh Luna-max verifier must read `SPEC.md`, `ROADMAP.md`, the Phase 2 plan, this summary, the prior `gaps_found` verification, and exact final implementation commit `7acec18861fcac8ad53426739581166f02e3db35`; rerun every Phase 2 closure command; confirm the AUTH-01 receipt gap is closed; trace every state write and signal path; and replace `02-VERIFICATION.md` with a re-verification verdict. Phase 3 remains blocked until that file records `status: passed` for this exact implementation commit.
