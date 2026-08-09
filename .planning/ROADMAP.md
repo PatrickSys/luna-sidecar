@@ -1,6 +1,6 @@
 # Roadmap: Luna Sidecar reliability
 
-**Status:** V1 verified; Phase 5 planned
+**Status:** V1 verified; Phase 5 in progress
 
 **Execution order:** `Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5`
 **Parallel phase execution:** Not allowed. All phases touch the launcher contract.
@@ -113,7 +113,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 - [-] **Phase 5: Simple subagent UX**
 
-**Status:** `[ ]`
+**Status:** `[-]`
 
 **Plan:** [`phases/05-simple-subagent-ux/05-PLAN.md`](phases/05-simple-subagent-ux/05-PLAN.md)
 
