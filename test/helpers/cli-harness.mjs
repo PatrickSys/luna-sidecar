@@ -14,7 +14,7 @@ const FILE_WAIT_MS = 10_000;
 const PROCESS_WAIT_MS = 5_000;
 const TERMINATION_WAIT_MS = 3_000;
 
-export async function createCliHarness(t) {
+export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
   const stateRoot = join(root, "state root");
   const requestedCwd = join(root, "requested cwd & spaces %literal% !bang!", "ユニコード");
@@ -46,7 +46,7 @@ export async function createCliHarness(t) {
     await collectManifestPids(stateRoot, ownedPids);
     await Promise.all([...ownedPids].map((pid) => waitForProcessGone(pid)));
 
-    await rm(root, { recursive: true, force: true });
+    await removeTestRoot(root);
   });
 
   async function invoke(args, { scenario = {}, stdin = "", cwd = root, extraEnv = {}, timeoutMs = WATCHDOG_MS } = {}) {
@@ -71,7 +71,7 @@ export async function createCliHarness(t) {
       await writeFile(providerStartBarrierPath, "release\n", "utf8");
     }
 
-    const child = spawn(process.execPath, [launcherPath, ...args], {
+    const child = spawn(process.execPath, [launcherPathOverride, ...args], {
       cwd,
       detached: process.platform !== "win32",
       env: buildMinimalTestEnvironment(shimPathValue(shimRoot), {
@@ -374,4 +374,8 @@ function isAlive(pid) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function removeTestRoot(root) {
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
