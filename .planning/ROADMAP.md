@@ -44,7 +44,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 ## Phase 2 — Lifecycle and authority
 
-**Status:** `[ ]`
+**Status:** `[x]`
 
 **Plan:** [`phases/02-lifecycle-and-authority/02-PLAN.md`](phases/02-lifecycle-and-authority/02-PLAN.md)
 
