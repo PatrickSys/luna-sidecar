@@ -40,10 +40,9 @@ test("skill metadata and guidance define the narrow host-facing activation bound
   assert.match(usage, /unknown.*terminal.*new `start`/s);
   assert.match(usage, /cancellation timeout or failure.*not.*cancelled/s);
   assert.match(usage, /taskOutcome: not_evaluated/);
-  for (const command of ["start", "status", "wait", "resume", "stop", "list"]) {
+  for (const command of ["start", "status", "wait", "resume", "cancel", "list"]) {
     assert.match(usage, new RegExp(`luna-sidecar\\.mjs\\" ${command}`));
   }
-  assert.match(usage, /stop.*alias for `cancel`/i);
   assert.doesNotMatch(usage, /--(research|inspection|audit|adversarial|planning|execution)\b/);
 
   assert.match(readme, /Agent Skill asset.*zero-dependency Node launcher/i);
@@ -54,14 +53,12 @@ test("skill metadata and guidance define the narrow host-facing activation bound
 
 test("global and public command help are plain, successful, and side-effect free", async (t) => {
   const invocations = [
-    { args: ["--help"], pattern: /Commands: start, run, status, wait, resume, cancel, stop, list/ },
+    { args: ["--help"], pattern: /Commands: start, status, wait, resume, cancel, list/ },
     { args: ["start", "--help"], pattern: /Usage: luna-sidecar start/ },
-    { args: ["run", "--help"], pattern: /Usage: luna-sidecar run/ },
     { args: ["status", "--help"], pattern: /Usage: luna-sidecar status/ },
     { args: ["wait", "--help"], pattern: /Usage: luna-sidecar wait/ },
     { args: ["resume", "--help"], pattern: /Usage: luna-sidecar resume/ },
     { args: ["cancel", "--help"], pattern: /Usage: luna-sidecar cancel/ },
-    { args: ["stop", "--help"], pattern: /Usage: luna-sidecar stop/ },
     { args: ["list", "--help"], pattern: /Usage: luna-sidecar list/ },
   ];
   const roots = [];
@@ -82,11 +79,11 @@ test("global and public command help are plain, successful, and side-effect free
   }
 });
 
-test("stop is documented and dispatched through the cancel lifecycle", async () => {
+test("removed lifecycle commands are not public launcher commands", async () => {
   const source = await readFile(launcherPath, "utf8");
-  assert.match(source, /command === "cancel" \|\| command === "stop"\) return cancelWorker/);
-  assert.match(source, /\["start", "run", "resume", "cancel", "stop", "_worker"\]/);
-  assert.match(source, /stop <worker-id> \(same lifecycle operation as cancel\)/);
+  assert.doesNotMatch(source, /command === "cancel" \|\| command === "stop"/);
+  assert.match(source, /removedCommands/);
+  assert.match(source, /removed_command/);
 });
 
 function invoke(args, stateRoot) {

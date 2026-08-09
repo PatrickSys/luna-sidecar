@@ -22,6 +22,7 @@ import {
   isPathWithin,
   ownedProcessIdentityMatches,
   orchestrateReleaseSmoke,
+  parseReleaseSmokeArgs,
   redactEvidence,
   renderEvidenceMarkdown,
   runCapturedCommand,
@@ -35,6 +36,18 @@ import {
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const installerPath = join(repositoryRoot, "node_modules", "skills", "bin", "cli.mjs");
+
+test("release smoke parser keeps its exact internal control contract", () => {
+  assert.deepEqual(parseReleaseSmokeArgs(["--live", "--tested-commit", "A".repeat(40), "--ci-run-id", "run-42"]), {
+    live: true,
+    testedCommit: "a".repeat(40),
+    ciRunId: "run-42",
+  });
+  assert.throws(() => parseReleaseSmokeArgs(["--live", "--tested-commit", "a".repeat(40), "--legacy-stop"]), /argument_invalid/);
+  const evidence = redactEvidence({ commands: [{ name: "manager-stop", exitCode: 0 }, { name: "manager-cancel", exitCode: 0 }] });
+  assert.equal(evidence.commands[0].name, "unknown");
+  assert.equal(evidence.commands[1].name, "manager-cancel");
+});
 
 test("release smoke refuses missing live mode before any command spawn", async () => {
   let spawned = 0;

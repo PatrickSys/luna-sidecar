@@ -61,7 +61,7 @@ test("background start preserves manager shape and transports exact prompt bytes
   await mkdir(callerCwd, { recursive: true });
   const prompt = "background line one\r\nquotes: \" ' `\r\nmeta: & | < > ^ % !\r\n終わり";
   const result = await harness.invoke(
-    ["start", "--effort", "xhigh", "--read-only", "--cwd", harness.requestedCwd, "--", prompt],
+    ["start", "--effort", "xhigh", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", prompt],
     {
       cwd: callerCwd,
       scenario: {
@@ -120,19 +120,82 @@ test("background start preserves manager shape and transports exact prompt bytes
   await harness.verifyCaptureProcessesGone();
 });
 
-test("manager validation errors use one schema-v2 value and foreground run keeps passthrough errors", async (t) => {
+test("explicit sandbox and effort spellings persist without hidden defaults", async (t) => {
   const harness = await createCliHarness(t);
+  const cwd = join(harness.root, "space & unicode ^", "é");
+  await mkdir(cwd, { recursive: true });
+  for (const sandbox of ["read-only", "workspace-write", "full-access"]) {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const started = await harness.invoke(["start", "--cwd", cwd, "--sandbox", sandbox, "--effort", effort, "--", `${sandbox} ${effort}`], {
+        scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"] },
+      });
+      assert.equal(started.code, 0);
+      const receipt = started.json();
+      assert.equal(receipt.cwd, cwd);
+      assert.equal(receipt.sandbox, sandbox);
+      assert.equal(receipt.effort, effort);
+      assert.equal(receipt.bypass, false);
+      const completed = await harness.invoke(["wait", receipt.workerId]);
+      assert.equal(completed.code, 0);
+      assert.equal(completed.json().sandbox, sandbox);
+      assert.equal(completed.json().effort, effort);
+    }
+  }
+});
+
+test("resume inherits stored controls and accepts visible overrides", async (t) => {
+  const harness = await createCliHarness(t);
+  const initialCwd = join(harness.root, "initial cwd");
+  const overrideCwd = join(harness.root, "override cwd ^", "é");
+  await mkdir(initialCwd, { recursive: true });
+  await mkdir(overrideCwd, { recursive: true });
+  const start = await harness.invoke(["start", "--cwd", initialCwd, "--sandbox", "read-only", "--effort", "high", "--", "initial"], {
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n", "{\"type\":\"turn.completed\"}\n"] },
+  });
+  const workerId = start.json().workerId;
+  await harness.invoke(["wait", workerId]);
+
+  const inheritedStart = await harness.invoke(["resume", workerId, "--", "inherit"], {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"] },
+  });
+  assert.equal(inheritedStart.json().workerId, workerId);
+  assert.equal(inheritedStart.json().cwd, initialCwd);
+  assert.equal(inheritedStart.json().sandbox, "read-only");
+  assert.equal(inheritedStart.json().effort, "high");
+  await harness.invoke(["wait", workerId]);
+
+  const overrideStart = await harness.invoke(["resume", workerId, "--cwd", overrideCwd, "--sandbox", "workspace-write", "--effort", "max", "--", "override"], {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"] },
+  });
+  assert.equal(overrideStart.json().workerId, workerId);
+  assert.equal(overrideStart.json().cwd, overrideCwd);
+  assert.equal(overrideStart.json().sandbox, "workspace-write");
+  assert.equal(overrideStart.json().effort, "max");
+  await harness.invoke(["wait", workerId]);
+});
+
+test("manager validation errors use one schema-v2 value and removed commands stay structured", async (t) => {
+  const harness = await createCliHarness(t);
+  const notDirectory = join(harness.root, "not a directory.txt");
+  await writeFile(notDirectory, "file", "utf8");
   const failures = [
-    { args: ["start"], message: /Pass one task/ },
+    { args: ["start"], message: /--cwd is required for start/ },
     { args: ["status"], message: /A worker id is required/ },
     { args: ["wait"], message: /A worker id is required/ },
     { args: ["resume"], message: /A worker id is required/ },
     { args: ["cancel"], message: /A worker id is required/ },
-    { args: ["stop"], message: /A worker id is required/ },
-    { args: ["start", "--effort", "impossible", "--", "task"], message: /--effort must be one of/ },
+    { args: ["start", "--cwd", harness.requestedCwd, "--sandbox", "read-only", "--effort", "impossible", "--", "task"], message: /--effort must be one of/ },
     { args: ["start", "--cwd"], message: /--cwd needs a folder/ },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--cwd", ".", "--", "task"], message: /absolute existing directory/ },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--cwd", join(harness.root, "missing directory"), "--", "task"], message: /absolute existing directory/ },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--cwd", notDirectory, "--", "task"], message: /absolute existing directory/ },
+    { args: ["start", "--sandbox", "invalid", "--effort", "low", "--cwd", harness.requestedCwd, "--", "task"], message: /--sandbox must be one of/ },
+    { args: ["start", "--sandbox", "read-only", "--sandbox", "workspace-write", "--effort", "low", "--cwd", harness.requestedCwd, "--", "task"], message: /Contradictory --sandbox/ },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--effort", "max", "--cwd", harness.requestedCwd, "--", "task"], message: /Contradictory --effort/ },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--cwd", harness.requestedCwd, "--read-only", "--", "task"], message: /legacy authority flag.*--read-only.*--sandbox/i },
+    { args: ["start", "--sandbox", "read-only", "--effort", "low", "--cwd", harness.requestedCwd, "--bypass", "--", "task"], message: /legacy authority flag.*--bypass.*--sandbox/i },
     { args: ["start", "--unknown", "--", "task"], message: /Unknown option: --unknown/ },
-    { args: ["start", "--", "   "], message: /Pass one task/ },
+    { args: ["start", "--", "   "], message: /--cwd is required for start/ },
     { args: ["wait", absentWorkerId, "--timeout", "later"], message: /--timeout must be a non-negative whole number/ },
     { args: ["status", "../../outside"], message: /Invalid worker id/ },
     { args: ["status", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"], message: /Invalid worker id/ },
@@ -154,11 +217,16 @@ test("manager validation errors use one schema-v2 value and foreground run keeps
     await harness.assertNoCapture(result);
   }
 
-  const run = await harness.invoke(["run"]);
-  assert.equal(run.code, 2);
-  assert.deepEqual(run.stdout, Buffer.alloc(0));
-  assert.match(run.stderr.toString("utf8"), /Pass one task/);
-  await harness.assertNoCapture(run);
+  for (const removed of ["run", "stop"]) {
+    const result = await harness.invoke([removed, "--help"]);
+    assert.equal(result.code, 2);
+    assert.deepEqual(result.stderr, Buffer.alloc(0));
+    const value = result.json();
+    assert.equal(value.command, removed);
+    assert.equal(value.error.code, "removed_command");
+    assert.match(value.error.message, /removed.*use (start|cancel)/i);
+    await harness.assertNoCapture(result);
+  }
 
   const list = await harness.invoke(["list"]);
   assert.equal(list.code, 0);
@@ -188,7 +256,7 @@ test("future schemas and poisoned v2 paths fail closed without rewriting state",
   assert.deepEqual(future.stderr, Buffer.alloc(0));
   assert.deepEqual(await fingerprint(futurePath), before);
 
-  const started = await harness.invoke(["start", "--", "path integrity"], {
+  const started = await harness.invoke(["start", "--cwd", harness.requestedCwd, "--sandbox", "read-only", "--effort", "low", "--", "path integrity"], {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = started.json().workerId;
@@ -214,7 +282,6 @@ test("unknown workers use the manager envelope without launching a provider", as
     ["wait", absentWorkerId],
     ["resume", absentWorkerId, "--", "do not launch"],
     ["cancel", absentWorkerId],
-    ["stop", absentWorkerId],
   ];
 
   for (const args of commands) {

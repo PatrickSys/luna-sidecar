@@ -63,7 +63,6 @@ const controlledCommandNames = new Set([
   "manager-status-cancellation",
   "manager-cancel",
   "manager-wait-cancellation",
-  "manager-stop",
   "process-inspect",
   "process-kill",
   "ci-run",
@@ -858,7 +857,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
   const parentStopAt = Math.min(deadline.at, Date.now() + CEILINGS_MS.parent);
   let parentStart;
   try {
-    parentStart = await runManager(run, "manager-start-parent", launcher, ["start", "--effort", "max", "--read-only", "--cwd", roots.project, "--", parentPrompt], roots.parentCaller, env, deadline, commandLog, `${parentPrompt}\n`, remainingPhaseTime(deadline, parentStopAt));
+    parentStart = await runManager(run, "manager-start-parent", launcher, ["start", "--effort", "max", "--sandbox", "read-only", "--cwd", roots.project, "--", parentPrompt], roots.parentCaller, env, deadline, commandLog, `${parentPrompt}\n`, remainingPhaseTime(deadline, parentStopAt));
     const started = await parseManagerResult(parentStart);
     remember(started);
     parentTurnId = started.turnId;
@@ -888,7 +887,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
   try {
     const workerId = launchedWorkerIds[0];
     if (!workerId) throw new ReleaseSmokeError("resume_incomplete", "provider");
-    const resumeResult = await runManager(run, "manager-resume", launcher, ["resume", workerId, "--effort", "max", "--read-only", "--cwd", roots.project, "--", resumePrompt], roots.resumeCaller, env, deadline, commandLog, `${resumePrompt}\n`, remainingPhaseTime(deadline, resumeStopAt));
+    const resumeResult = await runManager(run, "manager-resume", launcher, ["resume", workerId, "--effort", "max", "--sandbox", "read-only", "--cwd", roots.project, "--", resumePrompt], roots.resumeCaller, env, deadline, commandLog, `${resumePrompt}\n`, remainingPhaseTime(deadline, resumeStopAt));
     resumeStarted = await parseManagerResult(resumeResult);
     remember(resumeStarted);
     if (typeof resumeStarted?.turnId !== "string" || !resumeStarted.turnId) throw new ReleaseSmokeError("resume_incomplete", "provider");
@@ -914,7 +913,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
   try {
     const cancelPrompt = "Wait until the host requests cancellation. Remain read-only.";
     const observeStopAt = Math.min(deadline.at, Date.now() + CEILINGS_MS.observeCancellationRunning);
-    const startResult = await runManager(run, "manager-start-cancellation", launcher, ["start", "--effort", "low", "--read-only", "--cwd", roots.project, "--", cancelPrompt], roots.cancellationCaller, env, deadline, commandLog, `${cancelPrompt}\n`, remainingPhaseTime(deadline, observeStopAt, "cancellation_incomplete"));
+    const startResult = await runManager(run, "manager-start-cancellation", launcher, ["start", "--effort", "low", "--sandbox", "read-only", "--cwd", roots.project, "--", cancelPrompt], roots.cancellationCaller, env, deadline, commandLog, `${cancelPrompt}\n`, remainingPhaseTime(deadline, observeStopAt, "cancellation_incomplete"));
     const started = await parseManagerResult(startResult);
     remember(started);
     if (typeof started.workerId !== "string" || !started.workerId || typeof started.turnId !== "string" || !started.turnId) throw new ReleaseSmokeError("cancellation_incomplete", "provider");
@@ -1027,7 +1026,7 @@ export async function cleanupRun({ launcher, roots, env, run, deadline, commandL
   const workerIds = [...new Set(workers.map((worker) => worker.workerId).filter((id) => typeof id === "string"))];
   for (const workerId of workerIds) {
     try {
-      const result = await runManager(run, "manager-stop", launcher, ["stop", workerId], roots.cancellationCaller, env, deadline, commandLog, "", Math.max(1, Math.min(CEILINGS_MS.cancellation, deadline.at - Date.now())));
+      const result = await runManager(run, "manager-cancel", launcher, ["cancel", workerId], roots.cancellationCaller, env, deadline, commandLog, "", Math.max(1, Math.min(CEILINGS_MS.cancellation, deadline.at - Date.now())));
       if (result.timedOut || result.code !== 0 || result.signal) facts.stopFailures += 1;
     } catch { facts.stopFailures += 1; }
   }

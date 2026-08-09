@@ -22,10 +22,13 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 const model = "gpt-5.6-luna";
 const schemaVersion = 2;
 const efforts = new Set(["low", "medium", "high", "xhigh", "max"]);
+const sandboxModes = new Set(["read-only", "workspace-write", "full-access"]);
 const workerStates = new Set(["starting", "running", "cancelling", "completed", "failed", "cancelled", "unknown"]);
 const providerStates = new Set(["not_started", "running", "completed", "failed", "unknown"]);
-const commands = new Set(["start", "status", "wait", "resume", "cancel", "stop", "list", "run", "_worker"]);
-const managerCommands = new Set(["start", "status", "wait", "resume", "cancel", "stop", "list"]);
+const publicCommands = new Set(["start", "status", "wait", "resume", "cancel", "list"]);
+const removedCommands = new Set(["run", "stop"]);
+const commands = new Set([...publicCommands, ...removedCommands, "_worker"]);
+const managerCommands = new Set([...publicCommands, ...removedCommands]);
 const nestedMarkerEnv = "LUNA_SIDECAR_WORKER_MARKER";
 const nestedMarkerVersion = 1;
 const stdoutCapBytes = 32 * 1024 * 1024;
@@ -36,7 +39,7 @@ const maxFinalMessageBytes = 1024 * 1024;
 const completeLineCapBytes = maxFinalMessageBytes + 64 * 1024;
 const rawArgs = process.argv.slice(2);
 const invokedToken = rawArgs[0];
-const command = commands.has(invokedToken) ? rawArgs.shift() : "run";
+const command = commands.has(invokedToken) ? rawArgs.shift() : (invokedToken === "--help" ? "start" : (invokedToken ?? "start"));
 const stateRoot = resolve(process.env.LUNA_SIDECAR_HOME ?? defaultStateRoot());
 const workersRoot = join(stateRoot, "workers");
 const logsRoot = join(stateRoot, "logs");
@@ -64,51 +67,54 @@ async function main() {
     printHelp(command);
     return;
   }
+  if (removedCommands.has(command)) {
+    fail(`Command \`${command}\` was removed; use ${command === "run" ? "start" : "cancel"} instead`, "removed_command");
+  }
+  if (command !== "_worker" && !publicCommands.has(command)) {
+    fail(`Unknown command: ${command}`, "unknown_command");
+  }
   assertExecutionAllowed(command);
-  if (command === "run") return runForeground(parseTask(rawArgs));
-  if (command === "start") return startWorker(parseTask(rawArgs));
+  if (command === "start") return startWorker(await parseTask(rawArgs, { requireExplicitControls: true }));
   if (command === "status") return showStatus(requireWorkerId(rawArgs));
   if (command === "wait") return waitForWorker(requireWorkerId(rawArgs), parseWait(rawArgs.slice(1)));
-  if (command === "resume") return resumeWorker(requireWorkerId(rawArgs), parseTask(rawArgs.slice(1)));
-  if (command === "cancel" || command === "stop") return cancelWorker(requireWorkerId(rawArgs));
+  if (command === "resume") return resumeWorker(requireWorkerId(rawArgs), await parseTask(rawArgs.slice(1)));
+  if (command === "cancel") return cancelWorker(requireWorkerId(rawArgs));
   if (command === "list") return listWorkers();
   if (command === "_worker") return runWorker(requireWorkerId(rawArgs));
 }
 
 function isHelpInvocation(args) {
   if (globalHelpRequested) return true;
-  if (!commands.has(invokedToken) || command === "_worker") return false;
+  if (!publicCommands.has(invokedToken)) return false;
   const separator = args.indexOf("--");
   return args.slice(0, separator === -1 ? args.length : separator).includes("--help");
 }
 
 function printHelp(commandName) {
   const usage = {
-    run: "Usage: luna-sidecar run [options] -- <task>",
     start: "Usage: luna-sidecar start [options] -- <task>",
     status: "Usage: luna-sidecar status <worker-id>",
     wait: "Usage: luna-sidecar wait <worker-id> [--timeout <milliseconds>]",
     resume: "Usage: luna-sidecar resume <worker-id> [options] -- <follow-up>",
     cancel: "Usage: luna-sidecar cancel <worker-id>",
-    stop: "Usage: luna-sidecar stop <worker-id> (same lifecycle operation as cancel)",
     list: "Usage: luna-sidecar list",
   };
-  if (commandName === "run" && globalHelpRequested) {
+  if (globalHelpRequested) {
     process.stdout.write([
       "luna-sidecar — host-managed Luna workers",
       "",
-      "Commands: start, run, status, wait, resume, cancel, stop, list",
+      "Commands: start, status, wait, resume, cancel, list",
       "Use <command> --help for command-specific usage.",
       "",
-      "Options: --effort <low|medium|high|xhigh|max>, --read-only, --bypass, --cwd <folder>",
+      "Options: --cwd <absolute-existing-directory>, --sandbox <read-only|workspace-write|full-access>, --effort <low|medium|high|xhigh|max>",
     ].join("\n") + "\n");
     return;
   }
-  process.stdout.write(`${usage[commandName] ?? usage.run}\n`);
+  process.stdout.write(`${usage[commandName] ?? usage.start}\n`);
 }
 
 function assertExecutionAllowed(commandName) {
-  if (!["start", "run", "resume", "cancel", "stop", "_worker"].includes(commandName)) return;
+  if (!["start", "resume", "cancel", "_worker"].includes(commandName)) return;
   const raw = process.env[nestedMarkerEnv];
   if (raw === undefined) return;
   let marker;
@@ -147,8 +153,8 @@ function defaultStateRoot() {
   return join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "luna-sidecar");
 }
 
-function parseTask(args) {
-  const task = { effort: null, sandbox: null, bypass: null, cwd: null, prompt: "" };
+async function parseTask(args, { requireExplicitControls = false } = {}) {
+  const task = { effort: null, sandbox: null, bypass: false, cwd: null, prompt: "" };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--") {
@@ -156,21 +162,26 @@ function parseTask(args) {
       break;
     }
     if (arg === "--effort") {
-      task.effort = args[++index] ?? "";
+      const value = args[++index] ?? "";
+      if (task.effort !== null && task.effort !== value) fail("Contradictory --effort values are not allowed");
+      task.effort = value;
       continue;
     }
-    if (arg === "--read-only") {
-      task.sandbox = "read-only";
+    if (arg === "--sandbox") {
+      const value = args[++index] ?? "";
+      if (task.sandbox !== null && task.sandbox !== value) fail("Contradictory --sandbox values are not allowed");
+      task.sandbox = value;
       continue;
     }
-    if (arg === "--bypass") {
-      task.bypass = true;
-      continue;
+    if (arg === "--read-only" || arg === "--bypass" || arg === "--dangerously-bypass-approvals-and-sandbox") {
+      fail(`Legacy authority flag \`${arg}\` was removed; use --sandbox <read-only|workspace-write|full-access>`, "legacy_authority_flag");
     }
     if (arg === "--cwd") {
       const value = args[++index];
       if (!value) fail("--cwd needs a folder");
-      task.cwd = validateCwd(value);
+      const validated = await validateCwd(value);
+      if (task.cwd !== null && task.cwd !== validated) fail("Contradictory --cwd values are not allowed");
+      task.cwd = validated;
       continue;
     }
     fail(`Unknown option: ${arg}`);
@@ -178,8 +189,13 @@ function parseTask(args) {
   if (task.effort !== null && !efforts.has(task.effort)) {
     fail(`--effort must be one of: ${[...efforts].join(", ")}`);
   }
-  if (task.sandbox === "read-only" && task.bypass === true) {
-    fail("--read-only and --bypass cannot be combined");
+  if (task.sandbox !== null && !sandboxModes.has(task.sandbox)) {
+    fail(`--sandbox must be one of: ${[...sandboxModes].join(", ")}`);
+  }
+  if (requireExplicitControls) {
+    if (task.cwd === null) fail("--cwd is required for start; provide an absolute existing directory");
+    if (task.sandbox === null) fail("--sandbox is required for start");
+    if (task.effort === null) fail("--effort is required for start");
   }
   if (!task.prompt.trim()) fail('Pass one task after `--`, for example: -- "Review src/auth"');
   return task;
@@ -211,38 +227,43 @@ function validateUuid(value, label) {
   return value;
 }
 
-function validateCwd(value) {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) fail("--cwd needs a valid folder");
+async function validateCwd(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0") || !isAbsolute(value)) {
+    fail("--cwd must be an absolute existing directory");
+  }
   const cwd = resolve(value);
-  if (!isAbsolute(cwd)) fail("--cwd needs an absolute folder");
+  let details;
+  try { details = await stat(cwd); }
+  catch { fail("--cwd must be an absolute existing directory"); }
+  if (!details.isDirectory()) fail("--cwd must be an absolute existing directory");
   return cwd;
 }
 
-function resolvedTask(task, previous = {}) {
-  const explicitReadOnly = task.sandbox === "read-only";
+async function resolvedTask(task, previous = {}) {
   const result = {
-    effort: task.effort ?? previous.effort ?? "medium",
-    sandbox: task.bypass === true ? "workspace-write" : (task.sandbox ?? previous.sandbox ?? "workspace-write"),
-    bypass: explicitReadOnly ? false : (task.bypass ?? previous.bypass ?? false),
-    cwd: task.cwd ?? previous.cwd ?? resolve(process.cwd()),
+    effort: task.effort ?? previous.effort ?? null,
+    sandbox: task.sandbox ?? previous.sandbox ?? null,
+    bypass: false,
+    cwd: task.cwd ?? previous.cwd ?? null,
     prompt: task.prompt,
   };
   if (!efforts.has(result.effort)) fail(`Stored effort is not supported: ${result.effort}`);
-  result.cwd = validateCwd(result.cwd);
-  if (result.sandbox !== "read-only" && result.sandbox !== "workspace-write") {
+  if (result.cwd === null) fail("Stored cwd is missing or invalid; pass --cwd explicitly");
+  result.cwd = await validateCwd(result.cwd);
+  if (!sandboxModes.has(result.sandbox)) {
     fail(`Stored sandbox is not supported: ${result.sandbox}`);
   }
-  if (result.bypass && explicitReadOnly) fail("--read-only and --bypass cannot be combined");
   return result;
 }
 
-function resolvedResumeTask(task, previous) {
+async function resolvedResumeTask(task, previous) {
   const storedEffort = efforts.has(previous.effort) ? previous.effort : null;
   const storedCwd = typeof previous.cwd === "string" && isAbsolute(previous.cwd) ? previous.cwd : null;
-  const storedSandbox = previous.sandbox === "read-only" || previous.sandbox === "workspace-write"
+  const storedSandbox = sandboxModes.has(previous.sandbox)
     ? previous.sandbox
+    : previous.bypass === true
+      ? "full-access"
     : null;
-  const storedBypass = typeof previous.bypass === "boolean" ? previous.bypass : null;
 
   if (task.effort === null && storedEffort === null) {
     throw new SidecarError("Stored effort is missing or invalid; pass --effort explicitly", "stored_authority", 2);
@@ -250,15 +271,14 @@ function resolvedResumeTask(task, previous) {
   if (task.cwd === null && storedCwd === null) {
     throw new SidecarError("Stored cwd is missing or invalid; pass --cwd explicitly", "stored_authority", 2);
   }
-  if (task.sandbox === null && task.bypass === null && (storedSandbox === null || storedBypass === null)) {
-    throw new SidecarError("Stored authority is missing or invalid; pass --read-only or --bypass explicitly", "stored_authority", 2);
+  if (task.sandbox === null && storedSandbox === null) {
+    throw new SidecarError("Stored sandbox is missing or invalid; pass --sandbox explicitly", "stored_authority", 2);
   }
 
   return resolvedTask(task, {
     effort: storedEffort,
     cwd: storedCwd,
-    sandbox: storedSandbox ?? (task.bypass === true ? "workspace-write" : null),
-    bypass: storedBypass,
+    sandbox: storedSandbox,
   });
 }
 
@@ -300,7 +320,7 @@ function spawnCodex(args, options) {
 }
 
 async function runForeground(taskInput) {
-  const task = resolvedTask(taskInput);
+  const task = await resolvedTask(taskInput);
   const child = spawnCodex(execArgs(task), {
     cwd: task.cwd,
     env: providerEnvironment(randomUUID(), randomUUID()),
@@ -317,7 +337,7 @@ async function runForeground(taskInput) {
 }
 
 async function startWorker(taskInput, parentWorkerId = null, threadId = null) {
-  const task = resolvedTask(taskInput);
+  const task = await resolvedTask(taskInput);
   let worker;
   let workerId;
   await withRetentionLock(async () => {
@@ -1131,7 +1151,7 @@ async function persistRunnerFailure(workerId, errorCode, error, providerState = 
 async function resumeWorker(workerId, taskInput) {
   const stored = await readWorker(workerId);
   if (stored.state === "unknown") return workerUnknown(workerId, stored);
-  const task = resolvedResumeTask(taskInput, stored);
+  const task = await resolvedResumeTask(taskInput, stored);
   let becameUnknown = false;
   let publishedTurn = null;
   let result;
@@ -2238,7 +2258,7 @@ function validateNativeTurn(turn) {
   if (typeof turn.cwd !== "string" || !isAbsolute(turn.cwd) || turn.cwd.includes("\0")) fail("Malformed turn cwd");
   if (turn.cwdRealpath !== null && (typeof turn.cwdRealpath !== "string" || !isAbsolute(turn.cwdRealpath))) fail("Malformed turn cwd realpath");
   if (!efforts.has(turn.effort)) fail("Malformed turn effort");
-  if (turn.sandbox !== "read-only" && turn.sandbox !== "workspace-write") fail("Malformed turn sandbox");
+  if (!sandboxModes.has(turn.sandbox)) fail("Malformed turn sandbox");
   if (typeof turn.bypass !== "boolean") fail("Malformed turn bypass");
   if (turn.bypass && turn.sandbox !== "workspace-write") fail("Malformed bypass authority receipt");
   if (turn.sessionId !== null && typeof turn.sessionId !== "string") fail("Malformed provider session id");

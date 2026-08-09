@@ -69,7 +69,7 @@ test("project copied installs are byte-identical and run the copied launcher", a
   assert.equal(await readFile(copiedLauncher, "utf8"), await readFile(join(sourceSkillRoot, "scripts", "luna-sidecar.mjs"), "utf8"));
 
   const harness = await createCliHarness(t, copiedLauncher);
-  const start = await harness.invoke(["start", "--effort", "low", "--read-only", "--", "copied install verification"], {
+  const start = await harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.root, "--", "copied install verification"], {
     stdin: "copied install verification\n",
     scenario: { stdoutChunks: [`{"type":"turn.completed"}\n`] },
   });
@@ -85,7 +85,7 @@ test("project copied installs are byte-identical and run the copied launcher", a
   assert.notEqual(claudeLauncher, join(sourceSkillRoot, "scripts", "luna-sidecar.mjs"));
   assert.equal(await readFile(claudeLauncher, "utf8"), await readFile(join(sourceSkillRoot, "scripts", "luna-sidecar.mjs"), "utf8"));
   const claudeHarness = await createCliHarness(t, claudeLauncher);
-  const claudeStart = await claudeHarness.invoke(["start", "--effort", "low", "--read-only", "--", "claude-code copied install verification"], {
+  const claudeStart = await claudeHarness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", claudeHarness.root, "--", "claude-code copied install verification"], {
     stdin: "claude-code copied install verification\n",
     scenario: { stdoutChunks: ['{"type":"turn.completed"}\n'] },
   });

@@ -111,7 +111,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 **Stop/replan when:** Installed bytes differ; the pinned installer contract changed; deterministic CI is red; live work cannot be isolated to scratch/read-only boundaries; a process remains; or evidence cannot support the proposed README claim.
 
-- [ ] **Phase 5: Simple subagent UX**
+- [-] **Phase 5: Simple subagent UX**
 
 **Status:** `[ ]`
 
