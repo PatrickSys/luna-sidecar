@@ -14,6 +14,7 @@ const FILE_WAIT_MS = 10_000;
 const PROCESS_WAIT_MS = 5_000;
 const TERMINATION_WAIT_MS = 3_000;
 const knownProcessIdentities = new Map();
+const fixtureCommandTokens = [fakeCodexPath, join(repositoryRoot, "test", "fixtures", "fake-grandchild.mjs"), launcherPath];
 
 export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
@@ -107,6 +108,7 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
     runs.add(run);
     child.stdin.end(stdin);
     const result = await run.closed;
+    rememberReceiptIdentity(result.stdout, launcherPathOverride);
     return {
       ...result,
       args,
@@ -265,7 +267,7 @@ async function waitForFile(filePath) {
 export async function waitForProcessGone(pid) {
   if (!pid) return;
   const deadline = Date.now() + PROCESS_WAIT_MS;
-  const expected = knownProcessIdentities.get(pid) ?? { commandTokens: ["fake-codex.mjs", "fake-grandchild.mjs", "luna-sidecar.mjs"] };
+  const expected = knownProcessIdentities.get(pid) ?? { commandTokens: fixtureCommandTokens };
   let nextIdentityCheck = 0;
   while (Date.now() < deadline) {
     if (!isAlive(pid)) return;
@@ -273,8 +275,7 @@ export async function waitForProcessGone(pid) {
       const actual = await inspectWindowsProcess(pid);
       if (!actual.exists) return;
       if (actual.uncertain) throw new Error(`Owned fixture process ${pid} identity could not be verified`);
-      const commandTokens = expected.commandTokens ?? [expected.commandToken];
-      if (!commandTokens.some((token) => actual.commandLine.toLowerCase().includes(token.toLowerCase()))) return;
+      if (!matchesExpectedProcessIdentity(actual, expected, { anyCommandToken: !knownProcessIdentities.has(pid) })) return;
       nextIdentityCheck = Date.now() + 100;
     }
     await delay(10);
@@ -309,9 +310,11 @@ export async function terminateSpawnedChild(child) {
   await waitForProcessGone(pid);
 }
 
-export async function terminateOwnedPid(pid) {
+export async function terminateOwnedPid(pid, expected = null) {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("An owned PID is required");
-  rememberProcessIdentity(pid, "luna-sidecar.mjs");
+  if (typeof expected?.workerId === "string") {
+    rememberProcessIdentity(pid, { commandTokens: [launcherPath, "_worker", expected.workerId] });
+  }
   if (process.platform === "win32") {
     const ownership = await verifyExpectedProcess(pid);
     if (ownership === "gone") return;
@@ -357,25 +360,38 @@ function shimPathValue(shimRoot) {
 }
 
 function registerCapturePids(capture, target) {
-  rememberOwnedPid(target, capture?.pid, "fake-codex.mjs");
-  rememberOwnedPid(target, capture?.grandchildPid, "fake-grandchild.mjs");
-  rememberOwnedPid(target, capture?.grandchild?.pid, "fake-grandchild.mjs");
+  const providerExpected = {
+    commandTokens: [fakeCodexPath, ...(Array.isArray(capture?.argv) ? capture.argv : [])],
+    ...(Number.isSafeInteger(capture?.parentPid) && capture.parentPid > 0 ? { parentPid: capture.parentPid } : {}),
+  };
+  rememberOwnedPid(target, capture?.pid, providerExpected);
+  rememberOwnedPid(target, capture?.grandchildPid, {
+    commandTokens: [join(repositoryRoot, "test", "fixtures", "fake-grandchild.mjs")],
+    ...(Number.isSafeInteger(capture?.pid) && capture.pid > 0 ? { parentPid: capture.pid } : {}),
+  });
+  rememberOwnedPid(target, capture?.grandchild?.pid, {
+    commandTokens: [join(repositoryRoot, "test", "fixtures", "fake-grandchild.mjs")],
+    ...(Number.isSafeInteger(capture?.pid) && capture.pid > 0 ? { parentPid: capture.pid } : {}),
+  });
 }
 
 function rememberSpawnedChildIdentity(child) {
   const pid = child?.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
-  const script = child.spawnargs?.find((value) => typeof value === "string" && /(?:^|[\\/])[^\\/]+\.mjs$/i.test(value));
-  rememberProcessIdentity(pid, script ? basename(script) : basename(child.spawnfile ?? process.execPath));
+  const args = Array.isArray(child.spawnargs) ? child.spawnargs : [];
+  const scriptIndex = args.findIndex((value) => typeof value === "string" && /(?:^|[\\/])[^\\/]+\.mjs$/i.test(value));
+  const script = scriptIndex >= 0 ? args[scriptIndex] : basename(child.spawnfile ?? process.execPath);
+  rememberProcessIdentity(pid, { commandTokens: [script, ...args.slice(scriptIndex + 1)] });
 }
 
 async function verifyExpectedProcess(pid) {
   const expected = knownProcessIdentities.get(pid);
-  if (!expected || process.platform !== "win32") return "owned";
+  if (process.platform !== "win32") return "owned";
+  if (!expected) throw new Error(`Owned fixture process ${pid} identity is unavailable`);
   const actual = await inspectWindowsProcess(pid);
   if (!actual.exists) return "gone";
   if (actual.uncertain) throw new Error(`Owned fixture process ${pid} identity could not be verified`);
-  if (!actual.commandLine.toLowerCase().includes(expected.commandToken.toLowerCase())) return "gone";
+  if (!matchesExpectedProcessIdentity(actual, expected)) return "gone";
   return "owned";
 }
 
@@ -390,27 +406,53 @@ async function collectManifestPids(stateRoot, target) {
   }
   for (const file of files.filter((value) => value.endsWith(".json"))) {
     const worker = await readJsonIfPresent(join(workersRoot, file));
-    rememberOwnedPid(target, worker?.pid, "luna-sidecar.mjs");
-    rememberOwnedPid(target, worker?.runnerPid, "luna-sidecar.mjs");
-    rememberOwnedPid(target, worker?.providerPid, "codex");
+    const runnerExpected = typeof worker?.workerId === "string"
+      ? { commandTokens: [launcherPath, "_worker", worker.workerId] }
+      : null;
+    rememberOwnedPid(target, worker?.pid, runnerExpected);
+    rememberOwnedPid(target, worker?.runnerPid, runnerExpected);
+    rememberOwnedPid(target, worker?.providerPid, {
+      commandTokens: ["codex"],
+      ...(Number.isSafeInteger(worker?.runnerPid) && worker.runnerPid > 0 ? { parentPid: worker.runnerPid } : {}),
+    });
   }
 }
 
-function rememberOwnedPid(target, pid, commandToken) {
+function rememberOwnedPid(target, pid, expected) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
   target.add(pid);
-  rememberProcessIdentity(pid, commandToken);
+  if (expected) rememberProcessIdentity(pid, expected);
 }
 
-function rememberProcessIdentity(pid, commandToken) {
-  if (Number.isSafeInteger(pid) && pid > 0 && typeof commandToken === "string" && commandToken.length > 0) {
-    knownProcessIdentities.set(pid, { commandToken });
+function rememberProcessIdentity(pid, expected) {
+  if (Number.isSafeInteger(pid) && pid > 0 && Array.isArray(expected?.commandTokens) && expected.commandTokens.every((token) => typeof token === "string" && token.length > 0)) {
+    knownProcessIdentities.set(pid, { commandTokens: expected.commandTokens, ...(expected.parentPid ? { parentPid: expected.parentPid } : {}) });
   }
+}
+
+export function matchesExpectedProcessIdentity(actual, expected, { anyCommandToken = false } = {}) {
+  if (actual?.exists !== true || actual.uncertain === true || typeof actual.commandLine !== "string") return false;
+  const commandLine = normalizeCommandText(actual.commandLine);
+  const tokens = (expected?.commandTokens ?? []).map(normalizeCommandText).filter(Boolean);
+  const commandMatch = anyCommandToken ? tokens.some((token) => commandLine.includes(token)) : tokens.length > 0 && tokens.every((token) => commandLine.includes(token));
+  return commandMatch && (expected.parentPid === undefined || Number(actual.parentPid) === Number(expected.parentPid));
+}
+
+function normalizeCommandText(value) {
+  return String(value).replaceAll("/", "\\").toLowerCase();
+}
+
+function rememberReceiptIdentity(stdout, runnerPath) {
+  try {
+    const receipt = JSON.parse(Buffer.from(stdout).toString("utf8"));
+    if (!Number.isSafeInteger(receipt?.pid) || receipt.pid <= 0 || typeof receipt.workerId !== "string") return;
+    rememberProcessIdentity(receipt.pid, { commandTokens: [runnerPath, "_worker", receipt.workerId] });
+  } catch {}
 }
 
 function inspectWindowsProcess(pid) {
   return new Promise((resolve) => {
-    const query = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -eq $p) { Write-Output '{"exists":false}' } else { $p | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress }`;
+    const query = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -eq $p) { Write-Output '{"exists":false}' } else { $p | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress }`;
     let stdout = "";
     let settled = false;
     const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", query], {
@@ -434,7 +476,12 @@ function inspectWindowsProcess(pid) {
       try {
         const parsed = JSON.parse(stdout.trim());
         if (parsed?.exists === false) resolve({ exists: false });
-        else resolve({ exists: true, uncertain: typeof parsed?.CommandLine !== "string", commandLine: parsed?.CommandLine ?? "" });
+        else resolve({
+          exists: true,
+          uncertain: typeof parsed?.CommandLine !== "string",
+          commandLine: parsed?.CommandLine ?? "",
+          parentPid: Number(parsed?.ParentProcessId),
+        });
       } catch {
         resolve({ exists: true, uncertain: true });
       }

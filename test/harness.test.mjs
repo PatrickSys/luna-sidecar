@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   buildMinimalTestEnvironment,
   createCliHarness,
+  matchesExpectedProcessIdentity,
   parseExactlyOneJson,
   terminateSpawnedChild,
   waitForProcessGone,
@@ -17,6 +18,16 @@ import {
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const fakeCodexPath = join(repositoryRoot, "test", "fixtures", "fake-codex.mjs");
+const launcherPath = join(repositoryRoot, "skills", "luna-sidecar", "scripts", "luna-sidecar.mjs");
+
+test("owned Windows identity requires the exact launcher and worker tokens", () => {
+  const workerId = "11111111-1111-4111-8111-111111111111";
+  const expected = { commandTokens: [launcherPath, "_worker", workerId] };
+  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"${process.execPath}" "${launcherPath}" _worker ${workerId}` }, expected), true);
+  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"C:\\Users\\other\\codex.exe" exec --json ${workerId}` }, expected), false);
+  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: false, commandLine: `"${launcherPath}" _worker` }, expected), false);
+  assert.equal(matchesExpectedProcessIdentity({ exists: true, uncertain: true, commandLine: `"${launcherPath}" _worker ${workerId}` }, expected), false);
+});
 
 test("fake Codex captures exact bytes, authority inputs, PIDs, chunks, and explicit release", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-harness-"));
