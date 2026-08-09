@@ -862,10 +862,16 @@ const hostObservationSchema = Object.freeze({
 });
 const hostCommands = Object.freeze({ codex_cli: "codex", claude_code: "claude" });
 
-export function hostObservationPrompt() {
+export function hostObservationPrompt(host) {
+  const activation = host === "codex_cli"
+    ? "Use the installed project Agent Skill named luna-sidecar through Codex's native Agent Skills mechanism; do not use Claude slash-command syntax."
+    : host === "claude_code"
+      ? "Activate the installed project skill with /luna-sidecar."
+      : null;
+  if (!activation) throw new ReleaseSmokeError("argument_invalid");
   return [
     "The human explicitly requested the Luna Sidecar skill.",
-    "Activate the installed project skill with /luna-sidecar and use it as the host skill/subagent workflow.",
+    activation,
     "Do not invoke the launcher from the canonical source or substitute a direct manager call outside the skill workflow.",
     "Delegate exactly one bounded read-only task: inspect the installed luna-sidecar skill files and report only their six public commands.",
     "Start one worker with explicit cwd, sandbox, and effort from the skill instructions, wait for it, and harvest the exact final v2 sidecar receipt.",
@@ -878,9 +884,9 @@ export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, 
   if (!isAbsolute(projectRoot) || !isAbsolute(skillRoot) || !isAbsolute(schemaPath)) throw new ReleaseSmokeError("scratch_invalid", "provider");
   if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
   const args = host === "codex_cli"
-    ? ["exec", "--json", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
+    ? ["exec", "--json", "--ephemeral", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
     : ["-p", "--bare", "--output-format", "stream-json", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", projectRoot];
-  return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(), cwd: projectRoot };
+  return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(host), cwd: projectRoot };
 }
 
 function wrapHostCommand(host, args, environment) {
@@ -1001,17 +1007,36 @@ function unavailableHostEvidence(host, failureCode) {
   };
 }
 
-async function cleanupObservedProcess(pid, { deadline, inspect, terminate }) {
+function hostProcessIdentityMatches(actual, { pid, expectedCwd, command }) {
+  return actual?.exists === true
+    && actual.uncertain !== true
+    && Number(actual.pid) === Number(pid)
+    && typeof actual.cwd === "string"
+    && pathsEqual(actual.cwd, expectedCwd)
+    && typeof actual.commandLine === "string"
+    && actual.commandLine.toLowerCase().includes(command.toLowerCase());
+}
+
+async function cleanupObservedProcess(pid, { result, host, expectedCwd, deadline, inspect, terminate, waitGone = waitPidsGone }) {
+  if (result && result.timedOut !== true && !result.spawnError) return { gone: true, result: "verified", ownedPidResult: "all_gone" };
   if (!Number.isSafeInteger(pid) || pid <= 0) return { gone: false, result: "uncertain", ownedPidResult: "uncertain" };
   let actual;
   try { actual = await inspect(pid); }
   catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  if (actual?.exists !== true) return { gone: true, result: "verified", ownedPidResult: "all_gone" };
   if (actual?.exists === true && actual.uncertain === true) return { gone: false, result: "uncertain", ownedPidResult: "uncertain" };
-  if (actual?.exists === true) {
-    try { await terminate(pid); }
-    catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  const expected = { pid, expectedCwd, command: hostCommands[host] };
+  if (!hostProcessIdentityMatches(actual, expected)) return { gone: true, result: "verified", ownedPidResult: "all_gone" };
+  let rechecked;
+  try { rechecked = await inspect(pid); }
+  catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  if (rechecked?.exists !== true || !hostProcessIdentityMatches(rechecked, expected)) {
+    if (rechecked?.exists === true && rechecked.uncertain === true) return { gone: false, result: "uncertain", ownedPidResult: "uncertain" };
+    return { gone: true, result: "verified", ownedPidResult: "all_gone" };
   }
-  const gone = await waitPidsGone([pid], CEILINGS_MS.knownPidAbsence, deadline);
+  try { await terminate(pid); }
+  catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  const gone = await waitGone([pid], CEILINGS_MS.knownPidAbsence, deadline);
   return { gone, result: gone ? "verified" : "uncertain", ownedPidResult: gone ? "all_gone" : "lingering" };
 }
 
@@ -1029,6 +1054,7 @@ export async function runHostObservation({
   commandLog = [],
   inspect = inspectProcessIdentity,
   terminate = terminateExactPid,
+  waitGone = waitPidsGone,
 }) {
   if (!hostVersion) {
     const failureCode = host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable";
@@ -1056,7 +1082,7 @@ export async function runHostObservation({
   }
 
   const receiptPids = parsed ? [parsed.receipt.pid, parsed.receipt.runnerPid, parsed.receipt.providerPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
-  const hostCleanup = await cleanupObservedProcess(result?.pid, { deadline, inspect, terminate });
+  const hostCleanup = await cleanupObservedProcess(result?.pid, { result, host, expectedCwd: projectRoot, deadline, inspect, terminate, waitGone });
   let sidecarCleanup;
   try {
     sidecarCleanup = await cleanupRun({
@@ -1527,8 +1553,8 @@ export async function orchestrateReleaseSmoke(options = {}) {
     roots.parentCaller = await createFreshRoot(scratch, "parent-caller");
     roots.resumeCaller = await createFreshRoot(scratch, "resume-caller");
     roots.cancellationCaller = await createFreshRoot(scratch, "cancellation-caller");
-    roots.hostCodexState = await createFreshRoot(scratch, "host-codex-state");
-    roots.hostClaudeState = await createFreshRoot(scratch, "host-claude-state");
+    roots.hostCodexState = await createFreshRoot(roots.project, ".luna-host-state-codex");
+    roots.hostClaudeState = await createFreshRoot(roots.project, ".luna-host-state-claude");
     roots.temp = await createFreshRoot(scratch, "temp");
     const hostSchemaPath = join(roots.temp, "luna-host-observation-schema.json");
     await writeFile(hostSchemaPath, JSON.stringify(hostObservationSchema), "utf8");

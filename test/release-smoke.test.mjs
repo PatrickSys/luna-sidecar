@@ -79,11 +79,13 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
   const codexArgs = codex.args.join(" ");
   assert.match(codexArgs, /codex exec/);
   assert.match(codexArgs, /--json/);
+  assert.match(codexArgs, /--ephemeral/);
   assert.match(codexArgs, /--output-schema/);
   assert.match(codexArgs, /--sandbox workspace-write/);
   assert.match(codexArgs, /--cd/);
   assert.match(codexArgs, /--skip-git-repo-check/);
-  assert.match(codex.input, /\/luna-sidecar/);
+  assert.doesNotMatch(codex.input, /\/luna-sidecar/);
+  assert.match(codex.input, /Agent Skill named luna-sidecar/);
 
   const claude = buildHostInvocation("claude_code", { projectRoot, skillRoot: join(projectRoot, ".claude", "skills", "luna-sidecar"), schemaPath, environment: { ComSpec: "cmd.exe" } });
   const claudeArgs = claude.args.join(" ");
@@ -132,6 +134,7 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
   assert.equal(unavailable.hosts.claude_code.failureCode, "claude_code_unavailable");
   assert.deepEqual(new Set(unavailable.gaps), new Set(["codex_cli_unavailable", "claude_code_unavailable"]));
 
+  let failureInspectCalls = 0;
   const failed = await runHostObservation({
     host: "codex_cli",
     hostVersion: "0.147.0",
@@ -143,8 +146,9 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
     environment: {},
     run: async () => ({ code: 1, signal: null, timedOut: false, pid: 12345, stdout: "", stderr: "" }),
     deadline: { at: Date.now() + 10_000, timedOut: false },
-    inspect: async (pid) => ({ exists: false, pid }),
+    inspect: async (pid) => { failureInspectCalls += 1; return { exists: false, pid }; },
   });
+  assert.equal(failureInspectCalls, 0);
   assert.equal(failed.evidence.failureCode, "codex_cli_host_failed");
   assert.equal(failed.evidence.claimEligible, false);
 
@@ -169,6 +173,51 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
   });
   assert.equal(cleanupUncertain.evidence.claimEligible, false);
   assert.equal(cleanupUncertain.evidence.failureCode, "cleanup_identity_uncertain");
+});
+
+test("host cleanup treats reused, matching, and uncertain PIDs distinctly", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna host pid identity-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const stateRoot = join(root, "state");
+  const callerRoot = join(root, "caller");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  await Promise.all([projectRoot, join(stateRoot, "workers"), callerRoot, skillRoot].map((path) => mkdir(path, { recursive: true })));
+  const base = { host: "codex_cli", hostVersion: "0.147.0", projectRoot, skillRoot, stateRoot, cancellationCaller: callerRoot, schemaPath: join(root, "schema.json"), environment: {}, deadline: { at: Date.now() + 10_000, timedOut: false } };
+  const timeoutRun = async () => ({ code: null, signal: null, timedOut: true, pid: 7001, stdout: "", stderr: "" });
+  let terminateCalls = 0;
+  const reused = await runHostObservation({
+    ...base,
+    run: timeoutRun,
+    inspect: async (pid) => ({ exists: true, uncertain: false, pid, cwd: join(root, "other"), commandLine: "chrome.exe --type=renderer" }),
+    terminate: async () => { terminateCalls += 1; },
+    waitGone: async () => true,
+  });
+  assert.equal(terminateCalls, 0);
+  assert.equal(reused.evidence.cleanup.ownedPidResult, "all_gone");
+  assert.equal(reused.evidence.failureCode, "host_observation_timeout");
+
+  let matchingInspectCalls = 0;
+  const matching = await runHostObservation({
+    ...base,
+    run: timeoutRun,
+    inspect: async (pid) => { matchingInspectCalls += 1; return { exists: true, uncertain: false, pid, cwd: projectRoot, commandLine: "cmd.exe /c codex exec" }; },
+    terminate: async (pid) => { terminateCalls += pid === 7001 ? 1 : 0; },
+    waitGone: async () => true,
+  });
+  assert.equal(matchingInspectCalls, 2);
+  assert.equal(terminateCalls, 1);
+  assert.equal(matching.evidence.cleanup.ownedPidResult, "all_gone");
+
+  const uncertain = await runHostObservation({
+    ...base,
+    run: timeoutRun,
+    inspect: async (pid) => ({ exists: true, uncertain: true, pid }),
+    terminate: async () => { terminateCalls += 1; },
+    waitGone: async () => true,
+  });
+  assert.equal(terminateCalls, 1);
+  assert.equal(uncertain.evidence.cleanup.ownedPidResult, "uncertain");
 });
 
 test("unsafe scope and source launcher fallback fail before provider spawn", async (t) => {
@@ -448,32 +497,36 @@ if (input.includes("exactly two")) {
         if (options.input?.trim()) capturedInputs.push({ name: options.commandName, input: options.input });
         return runCapturedCommand(file, args, options);
       },
-      observeHosts: async () => ({
-        hosts: {
-          codex_cli: {
-            available: true,
-            invocationRef: "evidence://codex-cli/observation-1",
-            procedureRef: "release-smoke.codex_cli.v1",
-            hostVersion: "9.8.7",
-            sidecarReceipt: { schemaVersion: 2, schemaResult: "valid" },
-            cleanup: { result: "verified", ownedPidResult: "all_gone", ownedPids: [], ownedPidsGone: true },
-            failureCode: null,
-            claimEligible: true,
+      observeHosts: async ({ roots }) => {
+        assert.equal(isPathWithin(roots.project, roots.hostCodexState), true);
+        assert.equal(isPathWithin(roots.project, roots.hostClaudeState), true);
+        return {
+          hosts: {
+            codex_cli: {
+              available: true,
+              invocationRef: "evidence://codex-cli/observation-1",
+              procedureRef: "release-smoke.codex_cli.v1",
+              hostVersion: "9.8.7",
+              sidecarReceipt: { schemaVersion: 2, schemaResult: "valid" },
+              cleanup: { result: "verified", ownedPidResult: "all_gone", ownedPids: [], ownedPidsGone: true },
+              failureCode: null,
+              claimEligible: true,
+            },
+            claude_code: {
+              available: false,
+              invocationRef: null,
+              procedureRef: null,
+              hostVersion: null,
+              sidecarReceipt: { schemaVersion: null, schemaResult: "not_run" },
+              cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
+              failureCode: "claude_code_unavailable",
+              claimEligible: false,
+            },
           },
-          claude_code: {
-            available: false,
-            invocationRef: null,
-            procedureRef: null,
-            hostVersion: null,
-            sidecarReceipt: { schemaVersion: null, schemaResult: "not_run" },
-            cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
-            failureCode: "claude_code_unavailable",
-            claimEligible: false,
-          },
-        },
-        gaps: ["claude_code_unavailable"],
-        ownedPids: [],
-      }),
+          gaps: ["claude_code_unavailable"],
+          ownedPids: [],
+        };
+      },
       evidenceDestination: { jsonPath: evidenceJson, markdownPath: evidenceMarkdown },
     });
   } finally {
