@@ -1,13 +1,64 @@
-# Luna Sidecar v1 reliability contract
+# Luna Sidecar reliability contract
 
-**Status:** Locked for implementation
+**Status:** V1 verified; Phase 5 final-shape amendment locked for implementation
 
-**Planning baseline:** `main` at `5dbbc5402dd221166521ebc70b6960a09c5cb9df`
+**Planning baseline:** `main` at `fef0a699bd78463244d5377fd6e6ced269bfa490`
 
 **Canonical source:** `PatrickSys/luna-sidecar`
 **Delivery policy:** Small verified commits may go directly to `main`; never force-push and never overwrite unexpected remote movement.
 
-## What we are building
+## Phase 5 final-shape amendment
+
+This amendment is the implementation target for Phase 5. The verified v1 contract remains below as historical evidence. Where this amendment conflicts with the v1 command or option surface, this amendment controls the next implementation; it does not claim that the current launcher already supports the new surface.
+
+### Product boundary
+
+Luna Sidecar is a thin adapter for one ordinary Luna subagent. The human talks to a coding agent; that host explicitly starts, observes, resumes, cancels, and evaluates Luna workers. Luna Sidecar owns reliable background process lifecycle and compact evidence. It does not own task decomposition, worker scheduling, file allocation, native-subagent policy, MCP configuration, or semantic task evaluation.
+
+```text
+human -> host coding agent -> Agent Skill -> Luna Sidecar -> Codex CLI/Luna -> optional native Codex subagents
+```
+
+The host may start more than one independent worker. Same-worktree coordination remains host-agent work: use disjoint write scopes when they are obvious and separate worktrees when overlap is possible. Do not add path ownership, locks, or scheduling to Luna Sidecar.
+
+### Final agent-facing contract
+
+- Public lifecycle commands are exactly `start`, `status`, `wait`, `resume`, `cancel`, and `list`. Remove `run`, the `stop` alias, and compatibility aliases for authority flags.
+- Every `start` explicitly supplies an absolute `--cwd`, `--sandbox read-only|workspace-write|full-access`, and `--effort low|medium|high|xhigh|max`. There is no hidden initial authority or effort default.
+- The skill normally chooses `high`; chooses `max` for research, review, adversarial analysis, or unusually difficult reasoning; and chooses `medium` for narrow bounded execution. Other supported effort values remain available only when the host selects them deliberately.
+- The host maps its current effective authority to `--sandbox`. Existing host full access is sufficient authority to select `full-access`; Luna Sidecar does not ask the human to re-authorize an already-authorized host mode. If the host cannot establish its mode, it selects `workspace-write` and reports that conservative choice.
+- An explicit `--cwd` authorizes the target location for Codex's Git-repository admission check, so the provider invocation skips that check. This never disables the selected sandbox or broadens filesystem authority.
+- Resume inherits the worker's stored cwd, sandbox, effort, and provider session unless the host supplies a visible explicit override. No omission broadens authority.
+- `start` performs one bounded readiness check under the exact cwd and sandbox before it reports the worker usable. A readiness failure returns a typed error, launches no expensive/fan-out work, and leaves no owned process alive. The normal human workflow has no separate `doctor` command.
+- Retries are zero by default. A provider-only single retry may be enabled later only for an exact source-observed transient child-spawn error code that is fixture-proven before any provider process, event, stdout, or stdin activity. The runner never retries; unknown/generic, `ENOENT`, authentication, configuration, sandbox, and task failures never retry.
+- Provider MCP configuration is inherited normally. Luna Sidecar has no MCP option, allowlist, discovery layer, isolated config home, or authentication manager. Nonfatal MCP startup failures collapse into one compact warning; a provider-fatal startup failure fails readiness.
+- Every command emits one compact structured JSON value to stdout. Raw logs remain referenced by path rather than replayed into host context.
+- Receipts expose lifecycle truth separately from task meaning. Luna Sidecar never decides that the delegated task succeeded from free-form model text; the host evaluates the final message and evidence.
+- Receipts include provider-reported input, cached-input, and output usage when available and the explicit value `unavailable` otherwise. Do not estimate prices, invent missing usage, or build budgets/accounting.
+- `list` defaults to every active worker plus the 20 newest terminal records, with active records first and each active/terminal bucket ordered newest-first deterministically. Active means the existing nonterminal lifecycle states `starting`, `running`, and `cancelling`; no new state machinery is introduced. `list --all` returns every retained record newest-first. Active evidence and compact receipts are retained; oldest terminal raw logs remain bounded by the existing disk cap.
+- The skill manages worker IDs and lifecycle steps for the human, but every launch, retry, wait, resume, and cancel remains an explicit host action visible in the task. No hidden worker creation or permission change is allowed.
+
+### Phase 5 requirements
+
+| ID | Requirement | Done when |
+|---|---|---|
+| SIMPLE-01 | Minimal public surface | Help, parser tests, skill guidance, and installed assets expose only `start`, `status`, `wait`, `resume`, `cancel`, and `list`; removed commands and aliases fail with an actionable structured error. |
+| EXPLICIT-01 | Explicit initial controls | `start` rejects omitted cwd, sandbox, or effort; valid values reach the provider exactly; resume inheritance and explicit overrides remain truthful. |
+| TRUST-01 | Explicit-cwd admission | Every accepted start validates the cwd and skips only Codex's Git-repository check; deterministic tests prove sandbox flags are unchanged and invalid/unreachable paths fail before provider task launch. |
+| READY-01 | Bounded readiness | `start` reports usable only after a bounded provider-side capability check under the selected cwd/sandbox; timeout, trust, sandbox, authentication, and provider-start failures are typed and leave no owned process alive. |
+| RETRY-01 | Narrow recovery | Retries are zero by default; only a later exact source-observed transient child-spawn code, fixture-proven before provider process/event/stdout/stdin activity, may enable one provider-only retry. The runner and all unknown/generic, `ENOENT`, authentication, configuration, sandbox, and task failures perform zero retries, with decisions visible in the receipt. |
+| MCP-01 | Provider-owned MCP | The launcher neither discovers nor rewrites MCP configuration; repeated nonfatal startup errors become one bounded warning, while fatal initialization evidence fails readiness. |
+| USAGE-01 | Honest usage passthrough | Receipts aggregate only provider-emitted input/cached-input/output usage and otherwise report `unavailable`; tests prevent double-counting reasoning fields or inventing prices. |
+| FINAL-UX-01 | Subagent-like host workflow | The skill teaches explicit, visible lifecycle control, effort selection, one-worker-first failure containment, result evaluation, and bounded history without modes, schedulers, or human-facing CLI work. |
+| FINAL-RELEASE-01 | Claim-matched proof | Deterministic Windows/Linux tests, copied Agent Skill parity, and successful real host observations from both Codex CLI and Claude Code support only the final documented claim and leave no owned process behind. Missing, unavailable, timeout, schema-drift, or uncertain-cleanup evidence may leave the implementation present but keeps FINAL-RELEASE-01 false and blocks release closure. |
+
+### Explicit non-goals for Phase 5
+
+Do not add an MCP manager, provider adapter registry, daemon, queue, scheduler, concurrency budget, path-ownership system, automatic worktrees, task modes, semantic result judge, cost engine, or global configuration mutation. Do not rewrite the historical audits or `.planning/V1-VERIFICATION.md`.
+
+## V1 verified baseline (preserved)
+
+### What v1 built
 
 Luna Sidecar is a small Agent Skill that lets a coding agent start and manage one or more real Luna background workers while the human keeps talking naturally to the host agent.
 
@@ -17,7 +68,7 @@ human -> coding agent -> Agent Skill -> luna-sidecar CLI -> Codex CLI/Luna -> na
 
 The human-facing UX is conversation. The CLI and its JSON are an agent-facing protocol and a debugging surface. The current backend is Codex CLI with `gpt-5.6-luna`; the skill boundary remains host-neutral.
 
-## Fixed product decisions
+### V1 fixed product decisions
 
 - Activate only when the human explicitly mentions **“Luna subagent,” “Luna sidecar,” or “sidecar.”** Never invoke it silently because a task merely looks delegable.
 - The host agent owns worker IDs, starting, waiting, resuming, cancelling, and reporting. A human should not need to run manager commands.
@@ -30,7 +81,7 @@ The human-facing UX is conversation. The CLI and its JSON are an agent-facing pr
 - Same-cwd writing workers produce a clear warning; they are not blocked. File/worktree ownership remains the host agent's responsibility.
 - Repair the existing Node launcher. Do not turn it into an orchestration platform.
 
-## Requirements
+### V1 requirements
 
 Each requirement has one acceptance statement. The roadmap and phase plans reference these IDs instead of rewriting their meaning.
 
@@ -170,7 +221,7 @@ Do not build:
 - power-loss durability, remote-filesystem coordination, or absolute containment of intentionally breakaway processes;
 - a native process-management dependency without an approved plan revision.
 
-## Current evidence and claim limits
+## V1 planning-time evidence and claim limits
 
 - Canonical source is one Node launcher plus `SKILL.md` and README; there is no deterministic test harness yet.
 - Historical audit evidence records resume authority loss, false completion with live process trees, recursive invocation, hidden launch failures, and substantial log/polling pressure. It is problem evidence, not current release proof.
@@ -178,6 +229,6 @@ Do not build:
 - The work-laptop audit found 43 pre-existing lineages and real Claude Code usage through the shared Agent Skill installation. Those counts must not be presented as current runtime verification.
 - Planning research used Luna-max workers and native subagents, but their repository fallbacks contained commit/source contradictions. Only conclusions independently checked against this checkout or primary documentation are accepted.
 
-## Implementation completion
+## V1 implementation completion gate
 
 Implementation is complete only when every requirement above is verified, all four roadmap phases have independent verification records, the working tree contains only planned changes, and the delivery evidence supports the exact compatibility claim being made. Passing tests alone does not prove a published/installable artifact; a `turn.completed` event does not prove process exit or task success.

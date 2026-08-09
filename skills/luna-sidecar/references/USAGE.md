@@ -4,7 +4,7 @@ These are prompt patterns for the host agent. They are not CLI modes or runtime 
 
 ## Before delegating
 
-Confirm that the human explicitly mentioned “Luna subagent”, “Luna sidecar”, or “sidecar”. Keep the task bounded, name the expected evidence, choose effort and authority, and preserve the existing cwd unless the human asks for a change. Do not pass secrets or assume that a provider final message proves task success.
+Confirm that the human explicitly mentioned “Luna subagent”, “Luna sidecar”, or “sidecar”. Keep the task bounded, name the expected evidence, choose effort and authority, and preserve the existing cwd unless the human asks for a change. Use `high` normally, `max` for research/review/adversarial reasoning, and `medium` for narrow bounded execution. Do not pass secrets or assume that a provider final message proves task success.
 
 ## Host command flow
 
@@ -15,11 +15,14 @@ node "<skill-folder>/scripts/luna-sidecar.mjs" start --effort high --read-only -
 node "<skill-folder>/scripts/luna-sidecar.mjs" status <worker-id>
 node "<skill-folder>/scripts/luna-sidecar.mjs" wait <worker-id> --timeout 600000
 node "<skill-folder>/scripts/luna-sidecar.mjs" resume <worker-id> -- "<bounded follow-up>"
+node "<skill-folder>/scripts/luna-sidecar.mjs" cancel <worker-id>
 node "<skill-folder>/scripts/luna-sidecar.mjs" stop <worker-id>
 node "<skill-folder>/scripts/luna-sidecar.mjs" list
 ```
 
-`resume` inherits cwd, effort, sandbox, and bypass when their flags are omitted. `stop` is an alias for `cancel`. Use `run` only for a blocking one-off provider passthrough. Start independent workers concurrently only when their ownership is disjoint, then harvest each compact receipt and evaluate its evidence.
+These commands describe the current verified v1 launcher. `resume` inherits cwd, effort, sandbox, and bypass when their flags are omitted. `stop` is a compatibility alias for `cancel` until Phase 5 removes aliases. Start one worker first; only after its environment is demonstrably usable should the host start independent parallel work. The host—not Luna Sidecar—owns file/worktree coordination. Harvest each compact receipt and evaluate its evidence.
+
+Current v1 `start` returns after runner spawn and does not prove provider readiness. Until Phase 5 implements bounded readiness, the host must inspect or wait for the first worker before fanout. Do not treat `starting` or `running` as evidence that sandboxed tools work.
 
 ## Prompt patterns
 
@@ -34,7 +37,9 @@ For multiple independent workers, give each a disjoint question and file/worktre
 
 ## Authority and results
 
-`workspace-write` is the compatibility default, not inferred approval. `--read-only` narrows access. A bypass or broader cwd/sandbox scope requires direct human intent through the host. Resume inherits stored cwd, effort, sandbox, and bypass when omitted; any explicit change is visible in the host report.
+`workspace-write` is the current v1 compatibility default, not inherited host authority. `--read-only` narrows access. `--bypass` maps an already-authorized full-access host mode; do not use it merely to recover from a sandbox failure. Resume inherits stored cwd, effort, sandbox, and bypass when omitted; any explicit change is visible in the host report.
+
+Current v1 inherits the Codex provider's configured MCP servers. Nonfatal OAuth or local-transport startup errors may be noisy without failing the worker. Surface them once as warnings and manage server authentication or enablement in Codex configuration, not through Luna Sidecar.
 
 The lifecycle describes operational evidence, not delegated-task success:
 

@@ -1,8 +1,8 @@
-# Roadmap: Luna Sidecar v1 reliability
+# Roadmap: Luna Sidecar reliability
 
-**Status:** In progress
+**Status:** V1 verified; Phase 5 planned
 
-**Execution order:** `Phase 1 -> Phase 2 -> Phase 3 -> Phase 4`
+**Execution order:** `Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5`
 **Parallel phase execution:** Not allowed. All phases touch the launcher contract.
 
 ## Execution rules
@@ -12,7 +12,7 @@
 3. Run the exact task commands and record exit codes. A command that cannot run is missing evidence, not a pass.
 4. Close each phase with the exact summary/verification files named by its plan. Do not mark the phase complete before an independent verifier records `status: passed` for the exact implementation commit.
 5. Direct-to-`main` work is authorized through small verified commits. At each phase start require `git branch --show-current` to equal `main`, verify `origin` identifies `PatrickSys/luna-sidecar`, run `git fetch origin main`, record the expected remote SHA, and reject dirty paths not named by the current/prior closure plans. Before every commit, stage only explicit plan paths and inspect `git diff --cached --name-only`. Before every push, fetch again, require `origin/main` still equals the recorded expected SHA and is an ancestor of local HEAD, then use ordinary `git push origin HEAD:main`; update the expected SHA after success. Stop on any mismatch and never force-push.
-6. Stop after planning in this packet. Implementation starts only in a later execution run.
+6. This packet changes planning and truthful current-use guidance only. Phase 5 runtime implementation starts in a later execution run.
 
 ### Phase closure contract
 
@@ -110,3 +110,28 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 **Out of scope:** Publishing a new npm runtime package, release/tag creation, host-specific code, performance promises about the model/provider, or “works everywhere” claims beyond the Agent Skills/runtime prerequisites.
 
 **Stop/replan when:** Installed bytes differ; the pinned installer contract changed; deterministic CI is red; live work cannot be isolated to scratch/read-only boundaries; a process remains; or evidence cannot support the proposed README claim.
+
+- [ ] **Phase 5: Simple subagent UX**
+
+**Status:** `[ ]`
+
+**Plan:** [`phases/05-simple-subagent-ux/05-PLAN.md`](phases/05-simple-subagent-ux/05-PLAN.md)
+
+**Requirements:** SIMPLE-01, EXPLICIT-01, TRUST-01, READY-01, RETRY-01, MCP-01, USAGE-01, FINAL-UX-01, FINAL-RELEASE-01
+**Depends on:** V1 cross-phase verification passed
+
+**Goal:** Make Luna Sidecar feel like one ordinary, controllable subagent while removing redundant commands and fixing the admission, authority-handoff, readiness, warning, usage, and history friction demonstrated by the audits.
+
+**Queued maintenance:** Migrate `.planning` to canonical `.work` later; this is explicitly out of Phase 5 scope.
+
+**Success criteria:**
+
+1. The only public lifecycle commands are `start`, `status`, `wait`, `resume`, `cancel`, and `list`; every start requires explicit cwd, sandbox, and effort, while resume inheritance remains visible and truthful.
+2. Explicit cwd skips only the provider Git-repository admission check, and a bounded same-authority readiness check prevents unusable workers from being reported ready or multiplied through fanout.
+3. Automatic retries are zero by default; at most one provider-only byte-identical retry is permitted only after an exact source-observed fixture-proven transient pre-activity child-spawn code, while runner and unknown/generic errors never retry; sandbox, trust, authentication, MCP, task, and authority failures do not trigger changed settings or hidden retries.
+4. Provider MCP configuration remains provider-owned; compact receipts summarize nonfatal MCP warnings and pass through provider usage without inventing cost or task success.
+5. Current-source and copied-install tests pass on Windows and Linux, followed by one bounded Codex-host smoke and one bounded Claude-Code-host invocation with no lingering owned process and claims no broader than the evidence.
+
+**Out of scope:** Provider adapters, MCP enable/disable management, global config edits, scheduler/queue/budgets, file ownership enforcement, automatic worktrees, task modes, task-success inference, and historical evidence rewrites.
+
+**Stop/replan when:** The installed Codex CLI cannot support explicit authority or cwd admission without unsafe global mutation; readiness requires a daemon or recurring synthetic model fleet; MCP suppression would require configuration discovery/rewriting; command simplification would make persisted workers unreadable; or live proof requires broad/non-scratch access.
