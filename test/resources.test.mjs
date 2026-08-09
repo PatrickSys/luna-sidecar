@@ -217,6 +217,33 @@ test("a valid retention lock with a definitely dead owner is recovered immediate
   await assert.rejects(stat(join(harness.stateRoot, "retention.lock")), { code: "ENOENT" });
 });
 
+test("a fresh valid worker lock with a definitely dead owner is recovered immediately", async (t) => {
+  const harness = await createCliHarness(t);
+  const started = await harness.invoke(["start", "--", "seed dead worker lock"], {
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"dead-lock-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+  });
+  const workerId = started.json().workerId;
+  await harness.invoke(["wait", workerId]);
+  const workerPath = join(harness.stateRoot, "workers", `${workerId}.json`);
+  const worker = JSON.parse(await readFile(workerPath, "utf8"));
+  const deadPid = await exitedPid();
+  const lockPath = join(harness.stateRoot, "workers", `${workerId}.lock`);
+  await writeFile(lockPath, `${JSON.stringify({
+    token: "dead-worker-owner-token",
+    pid: deadPid,
+    acquiredAt: new Date().toISOString(),
+    baseRevision: worker.revision,
+  })}\n`, "utf8");
+
+  const resumed = await harness.invoke(["resume", workerId, "--", "recover dead worker owner"], {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+  });
+  assert.equal(resumed.code, 0);
+  assert.equal(resumed.durationMs < 5_000, true);
+  await harness.invoke(["wait", workerId]);
+  await assert.rejects(stat(lockPath), { code: "ENOENT" });
+});
+
 test("a newline-free flood keeps parser tail bounded", async (t) => {
   const harness = await createCliHarness(t);
   const flood = Buffer.alloc(2 * 1024 * 1024, 0x7a);

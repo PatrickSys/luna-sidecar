@@ -61,10 +61,20 @@ test("nested sidecar execution rejects before any runner/provider spawn while ob
       assert.equal(allowed.code, 0, `${args[0]}:${marker === validMarker ? "valid" : "malformed"}`);
     }
   }
-  const source = await readFile(new URL("../skills/luna-sidecar/scripts/luna-sidecar.mjs", import.meta.url), "utf8");
-  const main = source.slice(source.indexOf("async function main"), source.indexOf("\n}\n", source.indexOf("async function main")) + 3);
-  assert.equal(main.indexOf("assertExecutionAllowed(command)") < main.indexOf("startWorker("), true);
-  assert.equal(main.indexOf("assertExecutionAllowed(command)") < main.indexOf("runForeground("), true);
+  const source = (await readFile(new URL("../skills/luna-sidecar/scripts/luna-sidecar.mjs", import.meta.url), "utf8")).replace(/\r\n?/g, "\n");
+  const mainStart = source.indexOf("async function main");
+  const mainEnd = source.indexOf("\n}\n", mainStart);
+  assert.notEqual(mainStart, -1, "main");
+  assert.notEqual(mainEnd, -1, "main boundary");
+  const main = source.slice(mainStart, mainEnd + 3);
+  const guardPosition = main.indexOf("assertExecutionAllowed(command)");
+  const startPosition = main.indexOf("startWorker(");
+  const foregroundPosition = main.indexOf("runForeground(");
+  assert.notEqual(guardPosition, -1, "execution guard");
+  assert.notEqual(startPosition, -1, "start dispatch");
+  assert.notEqual(foregroundPosition, -1, "foreground dispatch");
+  assert.equal(guardPosition < startPosition, true);
+  assert.equal(guardPosition < foregroundPosition, true);
 });
 
 test("the marker is provider-only and native subagent events do not recurse", async (t) => {

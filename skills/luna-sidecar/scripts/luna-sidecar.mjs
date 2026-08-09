@@ -2359,23 +2359,30 @@ async function withWorkerLock(workerId, callback) {
 }
 
 async function recoverStaleLock(lockPath) {
-  let lock = null;
-  let acquired = Number.NaN;
+  let raw;
+  let details;
   try {
-    lock = JSON.parse(await readFile(lockPath, "utf8"));
-    acquired = Date.parse(lock.acquiredAt);
+    raw = await readFile(lockPath, "utf8");
+    details = await stat(lockPath);
   } catch (error) {
     if (error.code === "ENOENT") return;
+    throw error;
   }
-  if (!Number.isFinite(acquired)) {
-    try { acquired = (await stat(lockPath)).mtimeMs; }
-    catch (error) { if (error.code === "ENOENT") return; throw error; }
-  }
-  if (Date.now() - acquired <= 30_000) return;
-  if (Number.isSafeInteger(lock?.pid) && lock.pid > 0) {
+
+  let lock = null;
+  try { lock = JSON.parse(raw); } catch {}
+  const valid = typeof lock?.token === "string"
+    && lock.token.length > 0
+    && Number.isSafeInteger(lock.pid)
+    && lock.pid > 0
+    && Number.isSafeInteger(lock.baseRevision)
+    && lock.baseRevision >= 0;
+  if (valid) {
     const live = await runnerLiveness(lock.pid);
     if (live !== false) return;
-  }
+    // A structurally valid lock with a definitely dead owner is safe to recover immediately.
+  } else if (Date.now() - details.mtimeMs <= 30_000) return;
+
   const stale = `${lockPath}.stale-${randomUUID()}`;
   try { await rename(lockPath, stale); }
   catch (error) { if (error.code === "ENOENT") return; throw error; }

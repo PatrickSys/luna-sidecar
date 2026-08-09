@@ -81,7 +81,7 @@ test("a paused stale writer cannot commit after a newer revision", async (t) => 
   assert.deepEqual(promptFiles, []);
 });
 
-test("an old malformed lock is recoverable but an old live-owner lock is not stolen", async (t) => {
+test("malformed and live-owner locks retain their fail-closed grace", async (t) => {
   const harness = await createCliHarness(t);
   const start = await harness.invoke(["start", "--", "seed"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
@@ -91,6 +91,12 @@ test("an old malformed lock is recoverable but an old live-owner lock is not sto
   const lockPath = join(harness.stateRoot, "workers", `${workerId}.lock`);
   await waitForAbsent(lockPath);
   const old = new Date(Date.now() - 60_000);
+
+  await writeFile(lockPath, "", "utf8");
+  const freshMalformed = await harness.invoke(["resume", workerId, "--", "must not steal fresh malformed lock"], { scenario: {} });
+  assert.equal(freshMalformed.code, 1);
+  assert.equal(freshMalformed.json().error.code, "lock_timeout");
+  await rm(lockPath, { force: true });
 
   await writeFile(lockPath, "", "utf8");
   await utimes(lockPath, old, old);

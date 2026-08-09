@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve, toNamespacedPath } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import {
   evaluateCleanupFacts,
   failedMarkerCommandPredicate,
   installCopiedSkills,
+  isPathWithin,
   ownedProcessIdentityMatches,
   orchestrateReleaseSmoke,
   redactEvidence,
@@ -55,6 +56,7 @@ test("release smoke refuses recursive sidecar execution before any command spawn
 test("unsafe scope and source launcher fallback fail before provider spawn", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna release scope-"));
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  assert.equal(isPathWithin(toNamespacedPath(resolve(root)), join(root, "inside")), true);
   assert.throws(() => assertPathWithin(root, join(root, "..", "outside")), /scratch_invalid/);
   let spawned = 0;
   await assert.rejects(runLiveScenarios({

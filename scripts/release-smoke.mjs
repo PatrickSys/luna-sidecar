@@ -20,6 +20,7 @@ import {
   relative,
   resolve,
   sep,
+  toNamespacedPath,
 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -135,15 +136,19 @@ export function parseReleaseSmokeArgs(argv) {
   return { live: true, testedCommit: testedCommit.toLowerCase(), ciRunId };
 }
 
+function comparablePath(value) {
+  const absolute = resolve(value);
+  const comparable = process.platform === "win32" ? toNamespacedPath(absolute) : absolute;
+  return process.platform === "win32" ? comparable.toLowerCase() : comparable;
+}
+
 function pathsEqual(left, right) {
-  const a = resolve(left);
-  const b = resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return comparablePath(left) === comparablePath(right);
 }
 
 export function isPathWithin(root, candidate) {
   if (!isAbsolute(root) || !isAbsolute(candidate)) return false;
-  const suffix = relative(resolve(root), resolve(candidate));
+  const suffix = relative(comparablePath(root), comparablePath(candidate));
   return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
 }
 
@@ -172,14 +177,15 @@ export async function createFreshRoot(parentRoot, role) {
 
 async function assertCanonicalAncestors(scopeRoot, target) {
   const scope = resolve(scopeRoot);
+  const canonicalScope = await realpath(scope);
   let current = resolve(target);
   while (true) {
+    if (!isPathWithin(scope, current)) throw new ReleaseSmokeError("install_scope_invalid");
     const info = await lstat(current);
     if (info.isSymbolicLink()) throw new ReleaseSmokeError("install_scope_invalid");
     const actual = await realpath(current);
-    if (!pathsEqual(actual, current)) throw new ReleaseSmokeError("install_scope_invalid");
+    if (!isPathWithin(canonicalScope, actual)) throw new ReleaseSmokeError("install_scope_invalid");
     if (pathsEqual(current, scope)) return;
-    if (!isPathWithin(scope, current)) throw new ReleaseSmokeError("install_scope_invalid");
     const parent = dirname(current);
     if (pathsEqual(parent, current)) throw new ReleaseSmokeError("install_scope_invalid");
     current = parent;
@@ -283,7 +289,7 @@ export async function installCopiedSkills({ projectRoot, sourceRoot = repository
   const metadata = JSON.parse(await readFile(join(dirname(installer), "..", "package.json"), "utf8"));
   if (metadata.version !== EXPECTED_SKILLS_VERSION || metadata.engines?.node !== EXPECTED_NODE_ENGINE || metadata.bin?.skills !== "./bin/cli.mjs") throw new ReleaseSmokeError("installer_invalid");
   const sourceRealpath = await realpath(sourceRoot);
-  assertPathWithin(repositoryRoot, sourceRealpath, "installer_invalid");
+  assertPathWithin(await realpath(repositoryRoot), sourceRealpath, "installer_invalid");
   const sourceSkillRoot = join(sourceRealpath, "skills", "luna-sidecar");
   const sourceManifest = await buildManifest(sourceSkillRoot, sourceRealpath);
   const result = await run(process.execPath, [installer, "add", sourceRealpath, "--skill", "luna-sidecar", "--copy", "-a", "codex", "-a", "claude-code", "-y"], { cwd: projectRoot, env, deadline, commandLog, commandName: "installer" });
@@ -301,7 +307,6 @@ export async function installCopiedSkills({ projectRoot, sourceRoot = repository
   const claudeLauncher = join(claudeRoot, "scripts", "luna-sidecar.mjs");
   for (const launcher of [codexLauncher, claudeLauncher]) {
     await assertCanonicalAncestors(projectRoot, launcher);
-    if (!pathsEqual(await realpath(launcher), launcher)) throw new ReleaseSmokeError("install_scope_invalid");
   }
   return {
     sourceSkillRoot,
@@ -327,7 +332,7 @@ export async function validateInstalledSnapshot(install, projectRoot) {
     if (!pathsEqual(dirname(dirname(launcher)), expectedRoot)) throw new ReleaseSmokeError("source_launcher_fallback", "preflight");
     await assertCanonicalAncestors(projectRoot, launcher);
     const info = await lstat(launcher);
-    if (!info.isFile() || info.isSymbolicLink() || !pathsEqual(await realpath(launcher), launcher)) throw new ReleaseSmokeError("install_scope_invalid", "preflight");
+    if (!info.isFile() || info.isSymbolicLink()) throw new ReleaseSmokeError("install_scope_invalid", "preflight");
   }
   return { canonical, codex, claude };
 }
@@ -432,7 +437,7 @@ export async function assertCopiedLauncherReady(launcher, projectRoot, source = 
   assertCopiedLauncher(launcher, projectRoot, source);
   await assertCanonicalAncestors(projectRoot, launcher);
   const info = await lstat(launcher);
-  if (!info.isFile() || info.isSymbolicLink() || !pathsEqual(await realpath(launcher), launcher)) throw new ReleaseSmokeError("source_launcher_fallback", "preflight");
+  if (!info.isFile() || info.isSymbolicLink()) throw new ReleaseSmokeError("source_launcher_fallback", "preflight");
   return launcher;
 }
 
@@ -455,7 +460,7 @@ async function validateContainedFile(pathValue, expectedPath, stateRoot) {
   const info = await lstat(pathValue);
   if (!info.isFile() || info.isSymbolicLink()) throw new ReleaseSmokeError("log_integrity_failed");
   const canonical = await realpath(pathValue);
-  if (!pathsEqual(canonical, pathValue) || !isPathWithin(stateRoot, canonical)) throw new ReleaseSmokeError("log_integrity_failed");
+  if (!isPathWithin(await realpath(stateRoot), canonical)) throw new ReleaseSmokeError("log_integrity_failed");
   return info.size;
 }
 
@@ -1128,8 +1133,9 @@ export async function orchestrateReleaseSmoke(options = {}) {
   let currentStage = "scratch";
   let failureStage = null;
   try {
-    const tempRoot = await realpath(tmpdir());
-    if (!pathsEqual(tempRoot, resolve(tmpdir()))) throw new ReleaseSmokeError("scratch_invalid", "scratch");
+    const tempRoot = await realpath(resolve(tmpdir()));
+    const tempInfo = await lstat(tempRoot);
+    if (!tempInfo.isDirectory() || tempInfo.isSymbolicLink()) throw new ReleaseSmokeError("scratch_invalid", "scratch");
     scratch = await mkdtemp(join(tempRoot, "luna-release-smoke-"));
     await assertCanonicalAncestors(tempRoot, scratch);
     roots.project = await createFreshRoot(scratch, "project");

@@ -143,7 +143,7 @@ All forms are read-only. Terminal states, including projected or persisted `unkn
 ## Reliability boundaries
 
 - v1 guarantees process-crash-safe atomic visibility on supported local filesystems. It does not claim power-loss durability or support for SMB/NFS/sync-backed state roots.
-- Use a short per-worker exclusive lock plus a manifest revision for mutating read-modify-write sections. Readers do not lock or write. Stale-lock recovery must still re-check the manifest revision before committing.
+- Use a short per-worker exclusive lock plus a manifest revision for mutating read-modify-write sections. Readers do not lock or write. A structurally valid lock whose recorded owner PID is definitely dead may be recovered immediately; live or uncertain owners remain fail-closed, and malformed/incomplete locks retain the 30-second stale grace. Recovery uses an atomic stale rename and must still re-check the manifest revision before committing.
 - The parent records `starting`, waits only for the detached runner's Node `spawn`/`error`, and returns the worker ID without a post-spawn manifest rewrite. The runner records its own PID before provider launch and alone owns later lifecycle transitions.
 - The parent publishes `<turnId>.prompt` by same-directory temp rename and records its SHA-256 in the initial turn. Under the worker lock, the runner renames it to `<turnId>.prompt.claimed` and records `promptClaimedAt` before reading; after the stdin callback it records `stdinAcceptedAt` and removes the claimed file. A crash after claim never auto-replays the prompt.
 - The runner consumes stdout/stderr, parses JSONL incrementally, and waits for `close`. `turn.completed` alone never changes the worker to terminal.

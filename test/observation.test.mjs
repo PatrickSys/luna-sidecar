@@ -131,18 +131,20 @@ test("wait uses an immediate read, zero means indefinite, and positive timeouts 
 });
 
 test("the observer call graph contains no raw-log reader or writer", async () => {
-  const source = await readFile(new URL("../skills/luna-sidecar/scripts/luna-sidecar.mjs", import.meta.url), "utf8");
-  const observer = source.slice(source.indexOf("async function observeWorker"), source.indexOf("async function cancelWorker"));
+  const source = (await readFile(new URL("../skills/luna-sidecar/scripts/luna-sidecar.mjs", import.meta.url), "utf8")).replace(/\r\n?/g, "\n");
+  const observerStart = source.indexOf("async function observeWorker");
+  const observerEnd = source.indexOf("async function cancelWorker");
+  assert.notEqual(observerStart, -1, "observeWorker");
+  assert.equal(observerEnd > observerStart, true, "cancelWorker boundary");
+  const observer = source.slice(observerStart, observerEnd);
   assert.doesNotMatch(observer, /stdoutPath|stderrPath|open\(|writeFile\(|rm\(|rawFileSize|CappedRawWriter/);
   assert.match(observer, /readWorker/);
   assert.match(observer, /runnerLiveness/);
   for (const name of ["showStatus", "waitForWorker", "listWorkers"]) {
-    const start = source.indexOf(`async function ${name}`);
-    assert.notEqual(start, -1, name);
-    const body = source.slice(start, source.indexOf("\n}\n", start) + 3);
+    const body = functionBody(source, name);
     assert.doesNotMatch(body, /mutateWorker|pruneTerminalLogs|rawFileSize|open\(|CappedRawWriter|withRetentionLock/);
   }
-  const waitBody = source.slice(source.indexOf("async function waitForWorker"), source.indexOf("\n}\n", source.indexOf("async function waitForWorker")) + 3);
+  const waitBody = functionBody(source, "waitForWorker");
   assert.match(waitBody, /const boundary = await observeWorker/);
   const reachable = reachableFunctions(source, ["showStatus", "waitForWorker", "listWorkers"]);
   for (const forbidden of ["mutateWorker", "writeWorker", "pruneTerminalLogsLocked", "rawFileSize", "withRetentionLock", "ensureState"]) {
