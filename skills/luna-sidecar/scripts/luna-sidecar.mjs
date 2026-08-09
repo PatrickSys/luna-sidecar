@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import {
+  link,
   mkdir,
   open,
   readFile,
@@ -1717,27 +1718,52 @@ async function withRetentionLock(callback) {
   assertWithin(target, stateRoot, "retention lock path");
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    let handle = null;
-    let created = false;
-    let tokenWritten = false;
     const token = randomUUID();
+    let acquired = false;
     try {
-      handle = await open(target, "wx");
-      created = true;
-      await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, token, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`, "utf8");
-      tokenWritten = true;
+      await publishExclusiveRecord(target, {
+        schemaVersion: 1,
+        token,
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+      }, "retention_lock_publish_failed");
+      acquired = true;
       return await callback();
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
       await recoverRetentionLock(target);
       await delay(10);
     } finally {
-      await handle?.close().catch(() => {});
-      if (created && !tokenWritten) await rm(target, { force: true }).catch(() => {});
-      else if (tokenWritten) await removeOwnedRetentionLock(target, token);
+      if (acquired) await removeOwnedRetentionLock(target, token);
     }
   }
   throw new SidecarError("Timed out acquiring retention lock", "retention_lock_timeout", 1);
+}
+
+async function publishExclusiveRecord(target, record, errorCode) {
+  const temporary = `${target}.publish-${randomUUID()}`;
+  assertWithin(temporary, dirname(target), "lock publication path");
+  let handle = null;
+  let created = false;
+  try {
+    try {
+      handle = await open(temporary, "wx", 0o600);
+      created = true;
+      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.close();
+      handle = null;
+    } catch {
+      throw new SidecarError("Atomic lock publication is unavailable", errorCode, 1);
+    }
+    try { await link(temporary, target); }
+    catch (error) {
+      if (error.code === "EEXIST") throw error;
+      throw new SidecarError("Atomic lock publication is unavailable", errorCode, 1);
+    }
+  } finally {
+    await handle?.close().catch(() => {});
+    if (created) await rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 async function recoverRetentionLock(target) {
@@ -2142,6 +2168,8 @@ function controlledErrorMessage(code) {
     runner_not_alive: "The recorded runner is no longer alive",
     cancel_failed: "Cancellation could not be verified",
     cancel_timeout: "Cancellation is still pending",
+    lock_publish_failed: "The worker lock could not be published atomically",
+    retention_lock_publish_failed: "The retention lock could not be published atomically",
     revision_conflict: "Worker changed while the mutation was in progress",
   };
   return code && messages[code] ? messages[code] : (code ? "Sidecar evidence is unavailable" : null);
@@ -2330,32 +2358,31 @@ async function withWorkerLock(workerId, callback) {
   await ensureState();
   const lockPath = safeWorkerPath(workerId, "lock");
   const started = Date.now();
-  let handle = null;
-  let token = null;
-  try {
-    while (Date.now() - started <= 2_000) {
-      token = randomUUID();
-      try {
-        handle = await open(lockPath, "wx");
-        const worker = await readWorker(workerId);
-        const body = { token, pid: process.pid, acquiredAt: new Date().toISOString(), baseRevision: worker.revision };
-        await handle.writeFile(`${JSON.stringify(body)}\n`, "utf8");
-        return await callback({ worker, token, baseRevision: worker.revision });
-      } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-        await recoverStaleLock(lockPath);
-        await delay(25);
-      } finally {
-        if (handle) {
-          await handle.close().catch(() => {});
-          handle = null;
-        }
-      }
+  while (Date.now() - started <= 2_000) {
+    const token = randomUUID();
+    let acquired = false;
+    try {
+      const prepared = await readWorker(workerId);
+      const baseRevision = prepared.revision;
+      await publishExclusiveRecord(lockPath, {
+        token,
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+        baseRevision,
+      }, "lock_publish_failed");
+      acquired = true;
+      const worker = await readWorker(workerId);
+      if (worker.revision !== baseRevision) continue;
+      return await callback({ worker, token, baseRevision });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      await recoverStaleLock(lockPath);
+      await delay(25);
+    } finally {
+      if (acquired) await releaseLock(lockPath, token);
     }
-    throw new SidecarError("Timed out acquiring the worker lock", "lock_timeout", 1);
-  } finally {
-    if (token) await releaseLock(lockPath, token);
   }
+  throw new SidecarError("Timed out acquiring the worker lock", "lock_timeout", 1);
 }
 
 async function recoverStaleLock(lockPath) {

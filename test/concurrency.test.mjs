@@ -60,7 +60,18 @@ test("a paused stale writer cannot commit after a newer revision", async (t) => 
     extraEnv: { LUNA_SIDECAR_TEST_BARRIER: barrier },
   });
   await waitForFile(`${barrier}.ready`);
-  await rm(join(harness.stateRoot, "workers", `${workerId}.lock`), { force: true });
+  const workerLockPath = join(harness.stateRoot, "workers", `${workerId}.lock`);
+  const workerLock = JSON.parse(await readFile(workerLockPath, "utf8"));
+  assert.equal(typeof workerLock.token, "string");
+  assert.equal(Number.isSafeInteger(workerLock.pid) && workerLock.pid > 0, true);
+  assert.equal(Number.isSafeInteger(workerLock.baseRevision) && workerLock.baseRevision >= 0, true);
+  const retentionLock = JSON.parse(await readFile(join(harness.stateRoot, "retention.lock"), "utf8"));
+  assert.equal(retentionLock.schemaVersion, 1);
+  assert.equal(typeof retentionLock.token, "string");
+  assert.equal(Number.isSafeInteger(retentionLock.pid) && retentionLock.pid > 0, true);
+  assert.deepEqual((await readdir(harness.stateRoot)).filter((name) => name.includes(".publish-")), []);
+  assert.deepEqual((await readdir(join(harness.stateRoot, "workers"))).filter((name) => name.includes(".publish-")), []);
+  await rm(workerLockPath, { force: true });
   await rm(join(harness.stateRoot, "retention.lock"), { force: true });
 
   const fresh = await harness.invoke(["resume", workerId, "--", "fresh"], {
