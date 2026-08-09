@@ -8,6 +8,7 @@ assurance: self_checked
 depends_on:
   - 02
 files-modified:
+  - package.json
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
   - test/fixtures/fake-codex.mjs
   - test/observation.test.mjs
@@ -166,7 +167,10 @@ Execute `03-01 -> 03-02 -> 03-03`. First require Phase 2's verification file to 
     call-graph assertion must fail if an observer reaches the raw-log reader or writer. Test omitted,
     zero, positive-before-deadline, exact-boundary-terminal, and positive-timeout cases. Keep
     `taskOutcome` fixed at `not_evaluated`; expose provider/process disagreement through fields and
-    warnings.
+    warnings. `list` must treat a missing state root as an empty result without creating it. Normalize
+    new receipt fields in memory so Phase 2-shaped v2 manifests remain readable, and retain the
+    existing `id`, `threadId`, `stdoutPath`, `stderrPath`, and `promptPath` top-level aliases alongside
+    compact turn history.
   </action>
   <verify>
     - Run `node --test test/observation.test.mjs`
@@ -190,8 +194,12 @@ Execute `03-01 -> 03-02 -> 03-03`. First require Phase 2's verification file to 
     lines and nonfatal item errors as warnings, and classify top-level error/turn.failed separately.
     Stream raw output into capped writers without blocking the provider. At 32 MiB stdout or 4 MiB
     stderr, stop persisting extra raw bytes while continuing to parse and record dropped-byte counts.
-    Before a new start, if terminal raw logs exceed 256 MiB, delete oldest terminal raw files only
-    until under cap; mark pruned turn metadata. Make pruning idempotent under simultaneous starts.
+    Bound incomplete-line memory and warning accumulation as well as raw-file bytes; a newline-free
+    flood must not create an unbounded tail or write queue. Before a new start, if terminal raw logs
+    exceed 256 MiB, delete oldest terminal raw files only until under cap; mark pruned turn metadata.
+    A turn is prune-eligible only after its raw writers are explicitly sealed, and deletion may target
+    only validated canonical paths under `logsRoot`. Make pruning idempotent and serialized under
+    simultaneous starts without adding a service or database.
   </action>
   <verify>
     - Run `node --test test/resources.test.mjs`
@@ -205,23 +213,32 @@ Execute `03-01 -> 03-02 -> 03-03`. First require Phase 2's verification file to 
 
 <task id="03-03" type="auto">
   <files>
+    - MODIFY: package.json
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
     - CREATE: test/safety.test.mjs
   </files>
   <action>
-    Add a runner-to-provider environment marker containing the current worker/turn identity.
+    Add a versioned runner-to-provider environment marker containing the current worker/turn identity.
+    Set it only on the provider environment, never on the detached runner environment.
     When the sidecar script sees that marker, reject nested `start`, `run`, or `resume` before any
-    runner/provider spawn; allow observation commands. Do not affect native Codex subagent tools.
+    runner/provider spawn; reject the internal `_worker` execution route too, and allow observation
+    commands. Malformed markers fail closed for those execution routes. Do not affect native Codex
+    subagent tools.
     Before a write-capable start or resume, resolve the effective inherited/overridden authority and
-    realpath cwd, inspect compact active manifests, and add a warning listing active same-cwd writer
+    realpath cwd, persist that resolved identity on new turns, inspect compact active manifests, and
+    add a warning listing active same-cwd writer
     IDs; never block. Define compact state as an allowlist: do not persist prompt bodies, process
     environments, argv, raw stderr, or raw event payloads; persist only controlled error
-    codes/messages, prompt SHA-256, selected fields, and the provider final message. Add sentinel
+    codes/messages, prompt SHA-256, selected fields, and the provider final message. `finalMessage`
+    and bounded raw logs remain the documented content-bearing exceptions; do not add a redaction
+    subsystem. Add sentinel
     secrets independently to env, prompt, stderr, and an unknown event, then assert they are absent
-    from every manifest and manager output (raw logs are intentionally outside this claim). Add
+    from every non-`finalMessage` compact field and manager output while the fixture emits a fixed
+    non-secret final message (raw logs are intentionally outside this claim). Add
     tests for nested script rejection, no spawn count increase, observation from a worker, multiple
     independent top-level workers, write-capable start/resume overlap warnings, read-only silence,
-    and a fake provider event representing native subagent use.
+    and a fake provider event representing native subagent use. Add all three Phase 3 suites to the
+    serial `npm test` script so the full-project gate cannot omit them.
   </action>
   <verify>
     - Run `node --test test/safety.test.mjs`
