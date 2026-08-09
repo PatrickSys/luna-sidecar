@@ -14,6 +14,7 @@ import {
   buildProviderEnvironment,
   buildCancellationPrompt,
   buildResumePrompt,
+  hostObservationSchema,
   cancellationPredicate,
   canonicalEvidenceJson,
   cleanupRun,
@@ -104,10 +105,47 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
   assert.equal(claudeArgs.includes("--bare"), true);
   assert.equal(claudeArgs.includes("--output-format"), true);
   assert.equal(claudeArgs.includes("stream-json"), true);
+  assert.equal(claudeArgs.includes("--verbose"), true);
   assert.equal(claudeArgs.includes("--permission-mode"), true);
   assert.equal(claudeArgs.includes("bypassPermissions"), true);
   assert.equal(claudeArgs.includes("--no-session-persistence"), true);
   assert.match(claude.input, /\/luna-sidecar/);
+});
+
+test("Codex output schema literals declare JSON Schema types", () => {
+  assert.deepEqual(hostObservationSchema.properties.schemaVersion, { type: "integer", const: 1 });
+  assert.deepEqual(hostObservationSchema.properties.skill, { type: "string", const: "luna-sidecar" });
+  assert.deepEqual(hostObservationSchema.properties.workflow, { type: "string", const: "subagent" });
+  assert.deepEqual(hostObservationSchema.properties.taskOutcome, { type: "string", const: "not_evaluated" });
+});
+
+test("structured Codex schema failures retain a bounded redacted diagnostic", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna host schema diagnostic-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const stateRoot = join(root, "state");
+  const callerRoot = join(root, "caller");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  await Promise.all([projectRoot, join(stateRoot, "workers"), callerRoot, skillRoot].map((path) => mkdir(path, { recursive: true })));
+  const error = JSON.stringify({ type: "error", error: { type: "invalid_request_error", code: "invalid_json_schema", message: "Invalid schema for response_format: prompt=SECRET_PROMPT at C:\\Users\\secret\\schema.json https://secret.invalid" } });
+  const result = await runHostObservation({
+    host: "codex_cli",
+    hostVersion: "0.147.0",
+    projectRoot,
+    skillRoot,
+    stateRoot,
+    cancellationCaller: callerRoot,
+    schemaPath: join(root, "schema.json"),
+    environment: {},
+    run: async () => ({ code: 1, signal: null, timedOut: false, pid: null, stdout: `${JSON.stringify({ type: "error", error })}\n${JSON.stringify({ type: "turn.failed", error })}`, stderr: "" }),
+    deadline: { at: Date.now() + 10_000, timedOut: false },
+  });
+  const diagnostic = result.evidence.failureDiagnostics;
+  assert.equal(diagnostic.kind, "output");
+  assert.match(diagnostic.stdout.summary, /invalid_json_schema/);
+  assert.match(diagnostic.stdout.summary, /Invalid schema/);
+  assert.ok(diagnostic.stdout.summary.length <= 240);
+  assert.doesNotMatch(diagnostic.stdout.summary, /SECRET_PROMPT|secret\.invalid|C:\\Users\\secret/);
 });
 
 test("host event parsing requires copied-skill execution, a v2 receipt, and no task-success claim", () => {
@@ -244,7 +282,7 @@ if (process.cwd() !== project || process.env.LUNA_SIDECAR_HOME !== state) fail("
 if (host === "codex_cli") {
   assert.deepEqual(args, ["exec", "--json", "--ephemeral", "--output-schema", schema, "--sandbox", "workspace-write", "--cd", project, "--skip-git-repo-check", "-"]);
 } else if (host === "claude_code") {
-  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", project]);
+  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", project]);
 } else fail("unknown host");
 const input = await new Promise((resolve) => { const chunks = []; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8"))); });
 if (host === "codex_cli" && input.includes("/luna-sidecar")) fail("codex used Claude activation syntax");

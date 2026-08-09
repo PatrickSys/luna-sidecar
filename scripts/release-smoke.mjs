@@ -723,11 +723,35 @@ function summarizeHostDiagnosticStream(value, stream) {
   const raw = typeof value === "string" ? value : "";
   if (!raw) return { present: false, summary: "", truncated: false };
   if (stream === "stdout") {
+    const structuredFailure = structuredHostFailureSummary(raw);
+    if (structuredFailure) {
+      const summary = redactHostDiagnosticText(structuredFailure);
+      return { present: true, summary: summary.text, truncated: summary.truncated };
+    }
     const structured = raw.split(/\r?\n/).some((line) => /^[\s]*[{[]/.test(line));
     return { present: true, summary: structured ? "structured output present" : "non-structured output present", truncated: raw.length > hostDiagnosticMaxChars };
   }
   const summary = redactHostDiagnosticText(raw);
   return { present: true, summary: summary.text, truncated: summary.truncated };
+}
+
+function structuredHostFailureSummary(value) {
+  for (const line of String(value).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    let event;
+    try { event = JSON.parse(line); }
+    catch { continue; }
+    if (event?.type !== "error" && event?.type !== "turn.failed") continue;
+    let payload = event;
+    for (let depth = 0; depth < 3 && typeof payload?.error === "string"; depth++) {
+      try { payload = JSON.parse(payload.error); }
+      catch { break; }
+    }
+    const details = payload?.error && typeof payload.error === "object" ? payload.error : payload;
+    const code = details?.code ?? details?.error_code ?? payload?.code ?? payload?.error_code;
+    const message = details?.message ?? payload?.message;
+    if (typeof code === "string" || typeof message === "string") return [code, message].filter((item) => typeof item === "string" && item.length > 0).join(": ");
+  }
+  return null;
 }
 
 function classifyHostFailure(result) {
@@ -736,8 +760,8 @@ function classifyHostFailure(result) {
   if (result?.signal) return "signal";
   const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}`.toLowerCase();
   if (/\b(?:authentication|unauthori[sz]ed|forbidden|api key|credential|login|sign in|bearer token)\b/.test(text)) return "auth";
+  if (/\b(?:invalid_json_schema|json|schema|parse|structured output|malformed|unexpected end)\b/.test(text)) return "output";
   if (/\b(?:unknown|unrecognized|invalid|unsupported|missing required|usage:|option|argument|command not found)\b/.test(text)) return "invocation";
-  if (/\b(?:json|schema|parse|structured output|malformed|unexpected end)\b/.test(text)) return "output";
   if (/\b(?:task|agent|worker|execution|provider)\b[^\n]{0,80}\b(?:failed|failure|error|timed out)\b/.test(text)) return "task";
   return "unknown";
 }
@@ -925,15 +949,15 @@ function runCodexCommand(run, name, args, cwd, env, deadline, commandLog, timeou
   return run("codex", args, { cwd, env, deadline, timeout, commandLog, commandName: name });
 }
 
-const hostObservationSchema = Object.freeze({
+export const hostObservationSchema = Object.freeze({
   type: "object",
   additionalProperties: false,
   required: ["schemaVersion", "skill", "workflow", "taskOutcome", "sidecarReceipt"],
   properties: {
-    schemaVersion: { const: 1 },
-    skill: { const: "luna-sidecar" },
-    workflow: { const: "subagent" },
-    taskOutcome: { const: "not_evaluated" },
+    schemaVersion: { type: "integer", const: 1 },
+    skill: { type: "string", const: "luna-sidecar" },
+    workflow: { type: "string", const: "subagent" },
+    taskOutcome: { type: "string", const: "not_evaluated" },
     sidecarReceipt: { type: "object" },
   },
 });
@@ -962,7 +986,7 @@ export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, 
   if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
   const args = host === "codex_cli"
     ? ["exec", "--json", "--ephemeral", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
-    : ["-p", "--bare", "--output-format", "stream-json", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", projectRoot];
+    : ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", projectRoot];
   return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(host), cwd: projectRoot };
 }
 
