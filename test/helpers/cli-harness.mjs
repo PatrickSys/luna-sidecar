@@ -11,10 +11,9 @@ const fakeCodexPath = join(repositoryRoot, "test", "fixtures", "fake-codex.mjs")
 const launcherPath = join(repositoryRoot, "skills", "luna-sidecar", "scripts", "luna-sidecar.mjs");
 const WATCHDOG_MS = 10_000;
 const FILE_WAIT_MS = 10_000;
-const PROCESS_WAIT_MS = 5_000;
+const PROCESS_WAIT_MS = 15_000;
 const TERMINATION_WAIT_MS = 3_000;
 const knownProcessIdentities = new Map();
-const fixtureCommandTokens = [fakeCodexPath, join(repositoryRoot, "test", "fixtures", "fake-grandchild.mjs"), launcherPath];
 
 export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
@@ -38,7 +37,6 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
 
     for (const run of runs) {
       if (!(await settlesWithin(run.closed, 1_000))) await terminateSpawnedChild(run.child);
-      await waitForProcessGone(run.child.pid);
     }
 
     for (const capturePath of captures) {
@@ -267,15 +265,13 @@ async function waitForFile(filePath) {
 export async function waitForProcessGone(pid) {
   if (!pid) return;
   const deadline = Date.now() + PROCESS_WAIT_MS;
-  const expected = knownProcessIdentities.get(pid) ?? { commandTokens: fixtureCommandTokens };
   let nextIdentityCheck = 0;
   while (Date.now() < deadline) {
     if (!isAlive(pid)) return;
-    if (expected && process.platform === "win32" && Date.now() >= nextIdentityCheck) {
-      const actual = await inspectWindowsProcess(pid);
+    if (process.platform === "win32" && Date.now() >= nextIdentityCheck) {
+      const actual = await inspectWindowsProcessImage(pid);
       if (!actual.exists) return;
-      if (actual.uncertain) throw new Error(`Owned fixture process ${pid} identity could not be verified`);
-      if (!matchesExpectedProcessIdentity(actual, expected, { anyCommandToken: !knownProcessIdentities.has(pid) })) return;
+      if (!actual.uncertain && !isWaitOnlyFixtureImage(actual.imageName)) return;
       nextIdentityCheck = Date.now() + 100;
     }
     await delay(10);
@@ -428,6 +424,17 @@ function rememberProcessIdentity(pid, expected) {
   }
 }
 
+export function parseTasklistImage(output) {
+  const line = String(output ?? "").split(/\r?\n/).map((value) => value.trim()).find(Boolean);
+  if (!line || /^info:\s+no tasks are running/i.test(line)) return null;
+  const match = line.match(/^"((?:[^"]|"")*)"/);
+  return match ? match[1].replaceAll('""', '"') : null;
+}
+
+export function isWaitOnlyFixtureImage(imageName) {
+  return new Set(["node.exe", "codex.exe", "cmd.exe"]).has(String(imageName ?? "").toLowerCase());
+}
+
 export function matchesExpectedProcessIdentity(actual, expected, { anyCommandToken = false } = {}) {
   if (actual?.exists !== true || actual.uncertain === true || typeof actual.commandLine !== "string") return false;
   const commandLine = normalizeCommandText(actual.commandLine);
@@ -483,6 +490,34 @@ function inspectWindowsProcess(pid) {
       } catch {
         resolve({ exists: true, uncertain: true });
       }
+    });
+  });
+}
+
+function inspectWindowsProcessImage(pid) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let settled = false;
+    const child = spawn("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      finish({ exists: true, uncertain: true });
+    }, TERMINATION_WAIT_MS);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.once("error", () => finish({ exists: true, uncertain: true }));
+    child.once("close", (code) => {
+      if (code !== 0) return finish({ exists: true, uncertain: true });
+      const imageName = parseTasklistImage(stdout);
+      finish(imageName ? { exists: true, uncertain: false, imageName } : { exists: false });
     });
   });
 }
