@@ -2474,11 +2474,28 @@ async function isProcessGroupGone(pid) {
   catch (error) { return error.code === "ESRCH"; }
 }
 
-function spawnAndWait(file, args) {
+function spawnAndWait(file, args, timeoutMs = 3_000) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(file, args, { stdio: "ignore", windowsHide: true });
-    child.once("error", reject);
-    child.once("close", (code, signal) => resolvePromise({ code, signal }));
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      reject(new Error(`${file} did not exit within ${timeoutMs} ms`));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise({ code, signal });
+    });
   });
 }
 
