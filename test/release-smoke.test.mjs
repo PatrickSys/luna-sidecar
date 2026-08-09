@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   CEILINGS_MS,
   EXPECTED_CI_JOB_NAMES,
+  HOST_SCHEMA_REASONS,
   assertPathWithin,
   assertCopiedLauncher,
   buildInstallerEnvironment,
@@ -209,7 +210,37 @@ test("host event parsing requires copied-skill execution, a v2 receipt, and no t
   ].join("\n") };
   const parsedClaude = parseHostObservationResult("claude_code", claudeResult, { projectRoot, skillRoot });
   assert.equal(parsedClaude.payload.taskOutcome, "not_evaluated");
-  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ ...payload, taskOutcome: "completed" }) } }) }, { projectRoot, skillRoot }), /host_schema_mismatch/);
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: [JSON.stringify({ type: "item.completed", item: { type: "command_execution", command } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ ...payload, taskOutcome: "completed" }) } })].join("\n") }, { projectRoot, skillRoot }), (error) => error.code === "host_schema_mismatch" && error.schemaReason === "payload_shape_invalid");
+});
+
+test("host schema failures report distinct bounded predicates", () => {
+  assert.deepEqual(HOST_SCHEMA_REASONS, [
+    "jsonl_invalid",
+    "copied_skill_command_missing",
+    "payload_shape_invalid",
+    "receipt_invalid",
+    "receipt_not_observed",
+    "receipt_mismatch",
+    "receipt_terminal_invalid",
+  ]);
+  const projectRoot = resolve(tmpdir(), "luna-host-project");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
+  const otherReceipt = { ...receipt, workerId: "33333333-3333-4333-8333-333333333333" };
+  const command = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
+  const event = (output = null) => ({ type: "item.completed", item: { type: "command_execution", command, ...(output === null ? {} : { aggregated_output: JSON.stringify(output) }) } });
+  const message = (value) => ({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(value) } });
+  const parse = (events) => parseHostObservationResult("codex_cli", { code: 0, stdout: typeof events === "string" ? events : events.map(JSON.stringify).join("\n") }, { projectRoot, skillRoot });
+  const assertReason = (events, reason) => assert.throws(() => parse(events), (error) => error.code === "host_schema_mismatch" && error.schemaReason === reason);
+
+  assertReason("not-json", "jsonl_invalid");
+  assertReason([message({})], "copied_skill_command_missing");
+  assertReason([event(), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "completed" })], "payload_shape_invalid");
+  assertReason([event(), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: { schemaVersion: 2 } })], "receipt_invalid");
+  assertReason([event(), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt })], "receipt_not_observed");
+  assertReason([event(otherReceipt), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt })], "receipt_mismatch");
+  const terminalInvalid = { ...receipt, state: "failed" };
+  assertReason([event(terminalInvalid), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: terminalInvalid })], "receipt_terminal_invalid");
 });
 
 test("host availability, command failure, and cleanup uncertainty fail closed", async (t) => {
@@ -243,6 +274,21 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
   assert.equal(reached.hosts.claude_code.failureCode, "claude_code_host_failed");
   assert.equal(reached.hosts.codex_cli.failureCode === "codex_cli_unavailable", false);
   assert.equal(reached.hosts.claude_code.failureCode === "claude_code_unavailable", false);
+
+  const invalidOutput = await runHostObservation({
+    host: "codex_cli",
+    hostVersion: "0.147.0",
+    projectRoot,
+    skillRoot,
+    stateRoot,
+    cancellationCaller: callerRoot,
+    schemaPath: join(root, "schema.json"),
+    environment: {},
+    run: async () => ({ code: 0, signal: null, timedOut: false, pid: null, stdout: "not-json", stderr: "" }),
+    deadline: { at: Date.now() + 10_000, timedOut: false },
+  });
+  const normalizedInvalidOutput = redactEvidence({ hosts: { codex_cli: invalidOutput.evidence } });
+  assert.equal(normalizedInvalidOutput.hosts.codex_cli.sidecarReceipt.schemaReason, "jsonl_invalid");
 
   let failureInspectCalls = 0;
   const failed = await runHostObservation({

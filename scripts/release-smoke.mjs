@@ -117,13 +117,24 @@ const fixedClaim = "Agent Skills copied-install portability plus bounded Codex C
 const releaseMarkerBasenamePattern = /^luna-release-marker-[0-9a-f-]+\.txt$/;
 const hostDiagnosticKinds = new Set(["spawn", "timeout", "signal", "invocation", "auth", "task", "output", "unknown"]);
 const hostDiagnosticMaxChars = 240;
+export const HOST_SCHEMA_REASONS = Object.freeze([
+  "jsonl_invalid",
+  "copied_skill_command_missing",
+  "payload_shape_invalid",
+  "receipt_invalid",
+  "receipt_not_observed",
+  "receipt_mismatch",
+  "receipt_terminal_invalid",
+]);
+const hostSchemaReasons = new Set(HOST_SCHEMA_REASONS);
 
 export class ReleaseSmokeError extends Error {
-  constructor(code, stage = "validation") {
+  constructor(code, stage = "validation", schemaReason = null) {
     super(code);
     this.name = "ReleaseSmokeError";
     this.code = gapCodes.has(code) ? code : "argument_invalid";
     this.stage = stage;
+    this.schemaReason = hostSchemaReasons.has(schemaReason) ? schemaReason : null;
   }
 }
 
@@ -653,6 +664,7 @@ function normalizeHosts(value) {
     const cleanup = host.cleanup && typeof host.cleanup === "object" ? host.cleanup : {};
     const available = host.available === true;
     const schemaResult = ["valid", "missing", "invalid", "not_run"].includes(receipt.schemaResult) ? receipt.schemaResult : "not_run";
+    const schemaReason = schemaResult === "invalid" && hostSchemaReasons.has(receipt.schemaReason) ? receipt.schemaReason : null;
     const cleanupResult = ["verified", "uncertain", "not_run"].includes(cleanup.result) ? cleanup.result : "not_run";
     const ownedPidResult = ["all_gone", "uncertain", "lingering", "not_run"].includes(cleanup.ownedPidResult) ? cleanup.ownedPidResult : "not_run";
     const eligible = available
@@ -670,7 +682,7 @@ function normalizeHosts(value) {
       invocationRef: typeof host.invocationRef === "string" && host.invocationRef.length > 0 ? host.invocationRef : null,
       procedureRef: typeof host.procedureRef === "string" && host.procedureRef.length > 0 ? host.procedureRef : null,
       hostVersion: safeVersion(host.hostVersion),
-      sidecarReceipt: { schemaVersion: receipt.schemaVersion === 2 ? 2 : null, schemaResult },
+      sidecarReceipt: { schemaVersion: receipt.schemaVersion === 2 ? 2 : null, schemaResult, ...(schemaReason ? { schemaReason } : {}) },
       cleanup: {
         result: cleanupResult,
         ownedPidResult,
@@ -1092,22 +1104,25 @@ function finalHostPayload(events) {
 
 export function parseHostObservationResult(host, result, { projectRoot, skillRoot }) {
   const events = parseJsonLines(result.stdout);
-  if (!events || events.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  if (!events || events.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "jsonl_invalid");
   const commands = events.flatMap((event) => collectHostCommands(event));
   const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
   const copiedSkillCommand = commands.some((command) => {
     const normalized = command.replaceAll("\\", "/").toLowerCase();
     return normalized.includes(expectedSkillRoot) && normalized.includes("luna-sidecar.mjs") && /(?:^|\s)start(?:\s|$)/.test(normalized);
   });
-  if (!copiedSkillCommand) throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  if (!copiedSkillCommand) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "copied_skill_command_missing");
   const receipts = events.flatMap((event) => collectHostOutputStrings(event)).flatMap((text) => parseObjectCandidates(text)).filter(isSidecarReceipt);
   const payload = finalHostPayload(events);
-  if (!payload || payload.schemaVersion !== 1 || payload.skill !== "luna-sidecar" || payload.workflow !== "subagent" || payload.taskOutcome !== "not_evaluated" || !isSidecarReceipt(payload.sidecarReceipt)) {
-    throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  if (!payload || payload.schemaVersion !== 1 || payload.skill !== "luna-sidecar" || payload.workflow !== "subagent" || payload.taskOutcome !== "not_evaluated") {
+    throw new ReleaseSmokeError("host_schema_mismatch", "provider", "payload_shape_invalid");
   }
+  if (!isSidecarReceipt(payload.sidecarReceipt)) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_invalid");
+  if (receipts.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_not_observed");
   const observed = receipts.find((receipt) => receipt.workerId === payload.sidecarReceipt.workerId && receipt.turnId === payload.sidecarReceipt.turnId);
-  if (!observed || payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
-    throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  if (!observed) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_mismatch");
+  if (payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
+    throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_terminal_invalid");
   }
   return { events, payload, receipt: payload.sidecarReceipt, commands };
 }
@@ -1184,6 +1199,7 @@ export async function runHostObservation({
   let result = null;
   let parsed = null;
   let failureCode = null;
+  let schemaReason = null;
   try {
     result = await run(invocation.file, invocation.args, {
       cwd: invocation.cwd,
@@ -1199,6 +1215,7 @@ export async function runHostObservation({
     else parsed = parseHostObservationResult(host, result, { projectRoot, skillRoot });
   } catch (error) {
     failureCode = error instanceof ReleaseSmokeError ? error.code : "host_schema_mismatch";
+    schemaReason = error instanceof ReleaseSmokeError ? error.schemaReason : null;
   }
 
   const receiptPids = parsed ? [parsed.receipt.pid, parsed.receipt.runnerPid, parsed.receipt.providerPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
@@ -1240,6 +1257,7 @@ export async function runHostObservation({
     sidecarReceipt: {
       schemaVersion: 2,
       schemaResult: parsed ? "valid" : (result?.stdout ? "invalid" : "missing"),
+      ...(schemaReason ? { schemaReason } : {}),
     },
     cleanup,
     failureDiagnostics: result && (result.timedOut || result.spawnError || result.code !== 0 || result.signal) ? hostFailureDiagnostics(result) : null,
