@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -7,7 +7,7 @@ import { createCliHarness, terminateOwnedPid } from "./helpers/cli-harness.mjs";
 
 test("provider completion does not outrun process close, then close plus completion completes", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "delayed"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "delayed"), {
     scenario: {
       stdoutChunks: [
         "{\"type\":\"thread.started\",\"thread_id\":\"delayed-thread\"}\n",
@@ -30,6 +30,49 @@ test("provider completion does not outrun process close, then close plus complet
   assert.equal(done.json().providerState, "completed");
 });
 
+test("start does not acknowledge until the runner persists thread.started readiness", async (t) => {
+  const harness = await createCliHarness(t);
+  const startedAt = Date.now();
+  const pending = harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "handshake"], {
+    scenario: {
+      startBarrier: true,
+      stdoutChunks: [
+        "{\"type\":\"thread.started\",\"thread_id\":\"handshake-thread\"}\n",
+        "{\"type\":\"turn.completed\"}\n",
+      ],
+      linger: true,
+      exitCode: 0,
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await writeFile(`${harness.stateRoot}/1.start.barrier`, "release\n", "utf8");
+  const started = await pending;
+  assert.equal(Date.now() - startedAt >= 250, true);
+  assert.equal(started.code, 0);
+  const receipt = started.json();
+  assert.equal(receipt.sessionId, "handshake-thread");
+  assert.equal(receipt.threadId, "handshake-thread");
+  assert.equal(receipt.state, "running");
+  assert.equal(receipt.providerState, "running");
+  await harness.release(started);
+  assert.equal((await harness.invoke(["wait", receipt.workerId])).json().state, "completed");
+});
+
+test("readiness rejection and malformed thread.started are typed and nonzero", async (t) => {
+  const cases = [
+    { scenario: { suppressDefaultReadiness: true, stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, code: "provider_rejected" },
+    { scenario: { stdoutChunks: ["{\"type\":\"thread.started\"}\n"], exitCode: 0 }, code: "readiness_schema_mismatch" },
+  ];
+  for (const expected of cases) {
+    const harness = await createCliHarness(t);
+    const result = await harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "readiness failure"], {
+      scenario: expected.scenario,
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.json().error.code, expected.code);
+  }
+});
+
 test("nonzero close, provider failure, and missing completion are distinct terminal evidence", async (t) => {
   const cases = [
     { scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 7 }, state: "failed", code: "provider_exit_failed" },
@@ -38,9 +81,10 @@ test("nonzero close, provider failure, and missing completion are distinct termi
   ];
   for (const expected of cases) {
     const harness = await createCliHarness(t);
-    const start = await harness.invoke(["start", "--", "terminal matrix"], { scenario: expected.scenario });
+    const start = await harness.invoke(explicitStartArgs(harness, "terminal matrix"), { scenario: expected.scenario });
     const receipt = start.json();
-    const done = await harness.invoke(["wait", receipt.workerId]);
+    const workerId = receipt.workerId ?? await waitForCreatedWorker(harness);
+    const done = await harness.invoke(start.code === 0 ? ["wait", workerId] : ["status", workerId]);
     const value = done.json();
     assert.equal(value.state, expected.state);
     assert.equal(value.errorCode, expected.code);
@@ -50,7 +94,7 @@ test("nonzero close, provider failure, and missing completion are distinct termi
 
 test("nonfatal provider item errors remain warnings on successful close", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "warning"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "warning"), {
     scenario: {
       stdoutChunks: [
         "{\"type\":\"item.error\",\"error\":\"recoverable\"}\n",
@@ -67,7 +111,7 @@ test("nonfatal provider item errors remain warnings on successful close", async 
 
 test("prompt claim and stdin acknowledgement are durable without retaining prompt text", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "secret prompt body"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "secret prompt body"), {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
   });
   const receipt = start.json();
@@ -85,27 +129,29 @@ test("prompt claim and stdin acknowledgement are durable without retaining promp
 
 test("starting cancellation is acknowledged before provider spawn", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "must not launch"], {
+  const startPromise = harness.invoke(explicitStartArgs(harness, "must not launch"), {
     scenario: { startBarrier: true, stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
-  const receipt = start.json();
-  await waitForManifest(harness, receipt.workerId, (worker) => Boolean(worker.turns.at(-1).promptClaimedAt));
-  const cancelPromise = harness.invoke(["cancel", receipt.workerId], { scenario: {} });
-  await waitForCancelAcceptance(harness, receipt.workerId, receipt.turnId);
-  await harness.releaseStart(start);
+  const workerId = await waitForCreatedWorker(harness);
+  const receipt = await waitForManifest(harness, workerId, (worker) => Boolean(worker.turns.at(-1).promptClaimedAt));
+  const startBarrier = join(harness.stateRoot, "1.start.barrier");
+  const cancelPromise = harness.invoke(["cancel", workerId], { scenario: {} });
+  await waitForCancelAcceptance(harness, workerId, receipt.turnId);
+  await writeFile(startBarrier, "release\n", "utf8");
   const cancelled = (await cancelPromise).json();
+  const started = await startPromise;
   assert.equal(cancelled.state, "cancelled");
   assert.equal(typeof cancelled.cancel.acknowledgedAt, "string");
   assert.equal(cancelled.cancel.result, "cancelled");
   await assertFileMissing(join(harness.stateRoot, "requests", `${receipt.turnId}.cancel.json`));
   await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt`));
   await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt.claimed`));
-  await harness.assertNoCapture(start);
+  await harness.assertNoCapture(started);
 });
 
 test("cancel verifies the supported provider tree and never signals a stale PID", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "tree cancellation"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "tree cancellation"), {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, grandchild: { linger: true }, exitCode: 0 },
   });
   const receipt = start.json();
@@ -124,7 +170,7 @@ test("duplicate cancel requests join one acknowledged receipt and terminal cance
   const harness = await createCliHarness(t);
   const cancelBarrier = join(harness.stateRoot, "fixtures", "duplicate-cancel");
   await mkdir(join(harness.stateRoot, "fixtures"), { recursive: true });
-  const start = await harness.invoke(["start", "--", "duplicate cancel"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "duplicate cancel"), {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
     extraEnv: { LUNA_SIDECAR_TEST_CANCEL_BARRIER: cancelBarrier },
   });
@@ -161,7 +207,7 @@ test("cancel timeout is durable while the live runner can still finish cancellat
   const harness = await createCliHarness(t);
   const cancelBarrier = join(harness.stateRoot, "fixtures", "cancel-timeout");
   await mkdir(join(harness.stateRoot, "fixtures"), { recursive: true });
-  const start = await harness.invoke(["start", "--", "timeout then recover"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "timeout then recover"), {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
     extraEnv: { LUNA_SIDECAR_TEST_CANCEL_BARRIER: cancelBarrier },
   });
@@ -190,7 +236,7 @@ test("completion before runner acknowledgement wins as not_applied and blocks co
   const harness = await createCliHarness(t);
   const cancelBarrier = join(harness.stateRoot, "fixtures", "complete-before-ack");
   await mkdir(join(harness.stateRoot, "fixtures"), { recursive: true });
-  const start = await harness.invoke(["start", "--", "completion wins"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "completion wins"), {
     scenario: {
       stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"race-thread\"}\n", "{\"type\":\"turn.completed\"}\n"],
       linger: true,
@@ -225,13 +271,14 @@ test("completion before runner acknowledgement wins as not_applied and blocks co
 
 test("cancel after a killed runner becomes unknown, wait returns immediately, and start creates a new worker", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "runner crash"], {
+  const startPromise = harness.invoke(explicitStartArgs(harness, "runner crash"), {
     scenario: { startBarrier: true, exitCode: 0 },
   });
-  const receipt = start.json();
-  await waitForManifest(harness, receipt.workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
+  const workerId = await waitForCreatedWorker(harness);
+  const receipt = await waitForManifest(harness, workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
   await terminateOwnedPid(receipt.pid);
-  await harness.releaseStart(start);
+  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
+  await startPromise;
 
   const resumed = await harness.invoke(["resume", receipt.workerId, "--", "do not continue"], { scenario: {} });
   assert.equal(resumed.code, 1);
@@ -239,7 +286,7 @@ test("cancel after a killed runner becomes unknown, wait returns immediately, an
   const waited = await harness.invoke(["wait", receipt.workerId]);
   assert.equal(waited.json().state, "unknown");
 
-  const replacement = await harness.invoke(["start", "--", "replacement"], { scenario: { exitCode: 0 } });
+  const replacement = await harness.invoke(explicitStartArgs(harness, "replacement"), { scenario: { exitCode: 0 } });
   const replacementId = replacement.json().workerId;
   assert.notEqual(replacementId, receipt.workerId);
   await harness.invoke(["wait", replacementId]);
@@ -247,17 +294,20 @@ test("cancel after a killed runner becomes unknown, wait returns immediately, an
 
 test("cancel fails closed for a dead runner and never signals a stored provider PID", async (t) => {
   const harness = await createCliHarness(t);
-  const sentinel = await harness.invoke(["start", "--", "owned sentinel"], {
+  const sentinel = await harness.invoke(explicitStartArgs(harness, "owned sentinel"), {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
   });
   const sentinelCapture = await harness.waitForCapture(sentinel);
 
-  const victim = await harness.invoke(["start", "--", "stale runner"], {
+  const victimPromise = harness.invoke(explicitStartArgs(harness, "stale runner"), {
     scenario: { startBarrier: true, exitCode: 0 },
   });
-  const victimReceipt = victim.json();
-  const victimManifest = await waitForManifest(harness, victimReceipt.workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
+  const victimId = await waitForCreatedWorker(harness, new Set([sentinel.json().workerId]));
+  const victimReceipt = { workerId: victimId };
+  const victimManifest = await waitForManifest(harness, victimId, (worker) => Number.isSafeInteger(worker.runnerPid));
   await terminateOwnedPid(victimManifest.runnerPid);
+  await writeFile(join(harness.stateRoot, "2.start.barrier"), "release\n", "utf8");
+  await victimPromise;
 
   const turn = victimManifest.turns.at(-1);
   turn.state = "running";
@@ -282,15 +332,16 @@ test("cancel fails closed for a dead runner and never signals a stored provider 
 
 test("a second internal runner cannot claim or launch the same turn", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "single owner"], {
+  const startPromise = harness.invoke(explicitStartArgs(harness, "single owner"), {
     scenario: { startBarrier: true, stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
-  const receipt = start.json();
-  await waitForManifest(harness, receipt.workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
+  const workerId = await waitForCreatedWorker(harness);
+  const receipt = await waitForManifest(harness, workerId, (worker) => Number.isSafeInteger(worker.runnerPid));
   const duplicate = await harness.invoke(["_worker", receipt.workerId], { scenario: { exitCode: 0 } });
   assert.equal(duplicate.code, 0);
   await harness.assertNoCapture(duplicate);
-  await harness.releaseStart(start);
+  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
+  await startPromise;
   const done = await harness.invoke(["wait", receipt.workerId]);
   assert.equal(done.json().state, "completed");
   const worker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${receipt.workerId}.json`), "utf8"));
@@ -303,19 +354,21 @@ test("provider spawn errors and top-level provider errors persist distinct failu
   const launchEnv = process.platform === "win32"
     ? { ComSpec: missingExecutable }
     : { PATH: join(harness.root, "missing-path") };
-  const spawnFailure = await harness.invoke(["start", "--", "spawn failure"], {
+  const spawnFailure = await harness.invoke(explicitStartArgs(harness, "spawn failure"), {
     scenario: { exitCode: 0 },
     extraEnv: launchEnv,
   });
-  const spawnDone = await harness.invoke(["wait", spawnFailure.json().workerId]);
+  const spawnWorkerId = await waitForCreatedWorker(harness);
+  const spawnDone = await harness.invoke(["status", spawnWorkerId]);
   assert.equal(spawnDone.json().state, "failed");
   assert.equal(spawnDone.json().providerState, "failed");
   assert.equal(spawnDone.json().errorCode, "provider_spawn_failed");
 
-  const providerFailure = await harness.invoke(["start", "--", "top level provider error"], {
+  const providerFailure = await harness.invoke(explicitStartArgs(harness, "top level provider error"), {
     scenario: { stdoutChunks: ["{\"type\":\"error\",\"message\":\"fatal\"}\n"], exitCode: 0 },
   });
-  const providerDone = await harness.invoke(["wait", providerFailure.json().workerId]);
+  const providerWorkerId = await waitForCreatedWorker(harness, new Set([spawnWorkerId]));
+  const providerDone = await harness.invoke(["status", providerWorkerId]);
   assert.equal(providerDone.json().state, "failed");
   assert.equal(providerDone.json().errorCode, "provider_failed");
 });
@@ -323,11 +376,12 @@ test("provider spawn errors and top-level provider errors persist distinct failu
 test("runner startup errors outside the provider block become terminal unknown", async (t) => {
   const harness = await createCliHarness(t);
   const outsideStateRoot = join(harness.root, "outside-state-root", "barrier");
-  const start = await harness.invoke(["start", "--", "invalid startup barrier"], {
+  const start = await harness.invoke(explicitStartArgs(harness, "invalid startup barrier"), {
     scenario: { exitCode: 0 },
     extraEnv: { FAKE_CODEX_START_BARRIER: outsideStateRoot },
   });
-  const done = await harness.invoke(["wait", start.json().workerId]);
+  const workerId = await waitForCreatedWorker(harness);
+  const done = await harness.invoke(["status", workerId]);
   assert.equal(done.json().state, "unknown");
   assert.equal(done.json().errorCode, "runner_startup_error");
   await harness.assertNoCapture(start);
@@ -338,6 +392,21 @@ async function waitForState(harness, workerId, expected) {
     const status = await harness.invoke(["status", workerId], { scenario: {} });
     return status.json();
   });
+}
+
+async function waitForCreatedWorker(harness, excluded = new Set()) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const files = (await readdir(join(harness.stateRoot, "workers"))).filter((file) => file.endsWith(".json"));
+      const worker = files.map((file) => file.slice(0, -5)).find((id) => !excluded.has(id));
+      if (worker) return worker;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for created worker");
 }
 
 async function waitForManifest(harness, workerId, predicate, read = async () => JSON.parse(await readFile(join(harness.stateRoot, "workers", `${workerId}.json`), "utf8"))) {
@@ -388,6 +457,10 @@ async function waitForProcessExit(pid) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for process exit: ${pid}`);
+}
+
+function explicitStartArgs(harness, prompt) {
+  return ["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", prompt];
 }
 
 function isAlive(pid) {

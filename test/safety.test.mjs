@@ -32,7 +32,7 @@ test("nested sidecar execution rejects before any runner/provider spawn while ob
   assert.equal(blockedWorker.code, 2);
   await harness.assertNoCapture(blockedWorker);
 
-  const normal = await harness.invoke(["start", "--", "observation source"], { scenario: { exitCode: 0 } });
+  const normal = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "observation source"], { scenario: { exitCode: 0 } });
   const observed = await harness.invoke(["status", normal.json().workerId], {
     extraEnv: { LUNA_SIDECAR_WORKER_MARKER: "malformed" },
   });
@@ -69,17 +69,14 @@ test("nested sidecar execution rejects before any runner/provider spawn while ob
   const main = source.slice(mainStart, mainEnd + 3);
   const guardPosition = main.indexOf("assertExecutionAllowed(command)");
   const startPosition = main.indexOf("startWorker(");
-  const foregroundPosition = main.indexOf("runForeground(");
   assert.notEqual(guardPosition, -1, "execution guard");
   assert.notEqual(startPosition, -1, "start dispatch");
-  assert.notEqual(foregroundPosition, -1, "foreground dispatch");
   assert.equal(guardPosition < startPosition, true);
-  assert.equal(guardPosition < foregroundPosition, true);
 });
 
 test("the marker is provider-only and native subagent events do not recurse", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "native subagent boundary"], {
+  const started = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "native subagent boundary"], {
     scenario: {
       stdoutChunks: [
         "{\"type\":\"item.completed\",\"item\":{\"type\":\"collab_tool_call\",\"tool\":\"spawn_agent\",\"status\":\"completed\",\"receiver_thread_ids\":[\"child\"]}}\n",
@@ -101,24 +98,26 @@ test("the marker is provider-only and native subagent events do not recurse", as
 
 test("independent top-level workers remain allowed and same-cwd warnings are advisory and sorted", async (t) => {
   const harness = await createCliHarness(t);
-  const blocker = await harness.invoke(["start", "--", "blocker"], {
-    scenario: { startBarrier: true, exitCode: 0 },
+  const blocker = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "blocker"], {
+    scenario: { linger: true, exitCode: 0 },
   });
-  const blockerTwo = await harness.invoke(["start", "--", "blocker two"], {
-    scenario: { startBarrier: true, exitCode: 0 },
+  const blockerTwo = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "blocker two"], {
+    scenario: { linger: true, exitCode: 0 },
   });
   const blockerId = blocker.json().workerId;
   const blockerTwoId = blockerTwo.json().workerId;
   await waitForRunner(harness, blockerId);
   await waitForRunner(harness, blockerTwoId);
 
-  const writer = await harness.invoke(["start", "--", "writer"], { scenario: { exitCode: 0 } });
+  const writer = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "writer"], { scenario: { linger: true, exitCode: 0 } });
   assert.deepEqual(writer.json().warnings, [`active_same_cwd_writers:${[blockerId, blockerTwoId].sort().join(",")}`]);
-  const readOnly = await harness.invoke(["start", "--read-only", "--", "reader"], { scenario: { exitCode: 0 } });
+  const readOnly = await harness.invoke(["start", "--effort", "medium", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "reader"], { scenario: { linger: true, exitCode: 0 } });
   assert.equal(readOnly.json().warnings.some((value) => value.startsWith("active_same_cwd_writers:")), false);
 
-  await harness.releaseStart(blocker);
-  await harness.releaseStart(blockerTwo);
+  await harness.release(blocker);
+  await harness.release(blockerTwo);
+  await harness.release(writer);
+  await harness.release(readOnly);
   await harness.invoke(["wait", blockerId]);
   await harness.invoke(["wait", blockerTwoId]);
   await harness.invoke(["wait", writer.json().workerId]);
@@ -127,9 +126,9 @@ test("independent top-level workers remain allowed and same-cwd warnings are adv
 
 test("resume reports active write-capable same-cwd workers without blocking", async (t) => {
   const harness = await createCliHarness(t);
-  const base = await harness.invoke(["start", "--", "base"], { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"base-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 } });
+  const base = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "base"], { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"base-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 } });
   await harness.invoke(["wait", base.json().workerId]);
-  const blocker = await harness.invoke(["start", "--", "active blocker"], { scenario: { startBarrier: true, exitCode: 0 } });
+  const blocker = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "active blocker"], { scenario: { linger: true, exitCode: 0 } });
   await waitForRunner(harness, blocker.json().workerId, (worker) => typeof worker.turns.at(-1)?.promptClaimedAt === "string");
   const blockerPath = join(harness.stateRoot, "workers", `${blocker.json().workerId}.json`);
   const phaseTwoShape = JSON.parse(await readFile(blockerPath, "utf8"));
@@ -139,20 +138,20 @@ test("resume reports active write-capable same-cwd workers without blocking", as
   const resumed = await harness.invoke(["resume", base.json().workerId, "--", "resume overlap"], { scenario: { exitCode: 0 } });
   assert.equal(resumed.code, 0);
   assert.deepEqual(resumed.json().warnings, [`active_same_cwd_writers:${blocker.json().workerId}`]);
-  await harness.releaseStart(blocker);
+  await harness.release(blocker);
   await harness.invoke(["wait", blocker.json().workerId]);
   await harness.invoke(["wait", base.json().workerId]);
 });
 
 test("simultaneous write-capable start and resume serialize their advisory reservations", async (t) => {
   const harness = await createCliHarness(t);
-  const base = await harness.invoke(["start", "--", "reservation base"], {
+  const base = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "reservation base"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"reservation-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   await harness.invoke(["wait", base.json().workerId]);
   const [started, resumed] = await Promise.all([
-    harness.invoke(["start", "--", "parallel start"], { scenario: { startBarrier: true, exitCode: 0 } }),
-    harness.invoke(["resume", base.json().workerId, "--", "parallel resume"], { scenario: { startBarrier: true, exitCode: 0 } }),
+    harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "parallel start"], { scenario: { linger: true, exitCode: 0 } }),
+    harness.invoke(["resume", base.json().workerId, "--", "parallel resume"], { scenario: { linger: true, exitCode: 0 } }),
   ]);
   assert.equal(started.code, 0);
   assert.equal(resumed.code, 0);
@@ -163,8 +162,8 @@ test("simultaneous write-capable start and resume serialize their advisory reser
       || resumeWarnings.includes(`active_same_cwd_writers:${started.json().workerId}`),
     true,
   );
-  await harness.releaseStart(started);
-  await harness.releaseStart(resumed);
+  await harness.release(started);
+  await harness.release(resumed);
   await harness.invoke(["wait", started.json().workerId]);
   await harness.invoke(["wait", base.json().workerId]);
 });
@@ -177,7 +176,7 @@ test("compact state and manager output exclude env, prompt, stderr, and unknown-
     stderr: "stderr-secret-sentinel",
     event: "event-secret-sentinel",
   };
-  const started = await harness.invoke(["start", "--", sentinels.prompt], {
+  const started = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", sentinels.prompt], {
     scenario: {
       stdoutChunks: [
         `{\"type\":\"unknown.event\",\"payload\":\"${sentinels.event}\"}\n`,
@@ -201,7 +200,7 @@ test("compact state and manager output exclude env, prompt, stderr, and unknown-
 
 test("poisoned persisted error codes normalize across observation projections", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "poison"], { scenario: { exitCode: 0 } });
+  const started = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "poison"], { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", started.json().workerId]);
   const manifestPath = join(harness.stateRoot, "workers", `${started.json().workerId}.json`);
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));

@@ -89,8 +89,8 @@ test("background start preserves manager shape and transports exact prompt bytes
   const workerPath = join(harness.stateRoot, "workers", `${receipt.workerId}.json`);
   const worker = JSON.parse(await readFile(workerPath, "utf8"));
   assert.equal(worker.id, receipt.workerId);
-  assert.equal(worker.state, "starting");
-  assert.equal(worker.pid, null);
+  assert.equal(worker.state, "running");
+  assert.equal(Number.isSafeInteger(worker.pid) && worker.pid > 0, true);
   assert.equal(worker.sandbox, "read-only");
   assert.equal(pathKey(worker.cwd), pathKey(harness.requestedCwd));
   harness.observePid(receipt.pid);

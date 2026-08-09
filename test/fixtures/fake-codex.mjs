@@ -9,7 +9,14 @@ const scenarioPath = requiredEnv("FAKE_CODEX_SCENARIO");
 const capturePath = requiredEnv("FAKE_CODEX_CAPTURE");
 const scenario = JSON.parse(await readFile(scenarioPath, "utf8"));
 const stdin = await readStdin();
-const stdoutChunks = (scenario.stdoutChunks ?? []).map(decodeChunk);
+const scriptedStdoutChunks = (scenario.stdoutChunks ?? [
+  "{\"type\":\"turn.completed\"}\n",
+]).map(decodeChunk);
+const hasReadinessEvent = scriptedStdoutChunks.some((chunk) => chunk.toString("utf8").includes("\"type\":\"thread.started\""));
+const stdoutChunks = [
+  ...(scenario.suppressDefaultReadiness || hasReadinessEvent ? [] : [Buffer.from("{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n")]),
+  ...scriptedStdoutChunks,
+];
 const stderrChunks = (scenario.stderrChunks ?? []).map(decodeChunk);
 const grandchildSpec = scenario.grandchild === true ? {} : scenario.grandchild;
 let grandchild = null;

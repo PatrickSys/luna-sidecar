@@ -34,7 +34,7 @@ test("list on a missing state root is an empty read with no creation", async (t)
 
 test("status, list, and wait are compact read-only projections", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "observe"], {
+  const started = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "observe"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"observe-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = started.json().workerId;
@@ -54,7 +54,7 @@ test("status, list, and wait are compact read-only projections", async (t) => {
 
 test("observers do not depend on missing, directory, or 32 MiB raw logs", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "raw fixture"], {
+  const started = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "raw fixture"], {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = started.json().workerId;
@@ -81,50 +81,70 @@ test("observers do not depend on missing, directory, or 32 MiB raw logs", async 
   assert.equal(done.json().logs.stdoutPath, stdoutPath);
 });
 
-test("a definitely dead active runner is projected unknown without persistence", async (t) => {
+test("a definitely dead pre-readiness runner persists sealed unknown cleanup", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "dead runner"], {
+  const started = harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "dead runner"], {
     scenario: { startBarrier: true, exitCode: 0 },
   });
-  const workerId = started.json().workerId;
+  const workerId = await waitForCreatedWorker(harness);
   const manifestPath = join(harness.stateRoot, "workers", `${workerId}.json`);
   const beforeManifest = await waitForManifest(manifestPath, (worker) => Number.isSafeInteger(worker.runnerPid));
   const beforeTurn = beforeManifest.turns.at(-1);
   const runner = beforeManifest.runnerPid;
   await terminateOwnedPid(runner);
-  const before = await stateSnapshot(harness.stateRoot);
   const status = await harness.invoke(["status", workerId]);
   assert.equal(status.json().state, "unknown");
-  assert.equal(status.json().errorCode, "runner_not_alive");
+  assert.equal(status.json().errorCode, "runner_died");
   const projected = status.json();
   for (const field of ["providerState", "taskOutcome", "exitCode", "signal", "finalMessage", "logs", "completedAt"]) {
-    assert.deepEqual(projected[field], beforeTurn[field], field);
+    if (field === "logs") {
+      assert.equal(projected.logs.sealed, true);
+      assert.equal(typeof projected.logs.sealedAt, "string");
+      assert.equal(projected.logs.stdoutMissing, true);
+      assert.equal(projected.logs.stderrMissing, true);
+      assert.equal(projected.logs.pruning, false);
+      assert.equal(projected.logs.pruned, false);
+    } else if (field === "completedAt") {
+      assert.equal(typeof projected.completedAt, "string");
+    } else {
+      assert.deepEqual(projected[field], field === "providerState" ? "unknown" : beforeTurn[field], field);
+    }
   }
-  assert.equal(projected.warnings.includes("runner_not_alive"), true);
-  assert.equal((await harness.invoke(["list"])).json()[0].warnings.includes("runner_not_alive"), true);
+  const listed = (await harness.invoke(["list"])).json()[0];
+  assert.equal(listed.state, "unknown");
+  assert.equal(listed.errorCode, "runner_died");
   const waited = await harness.invoke(["wait", workerId, "--timeout", "10"]);
   assert.equal(waited.json().state, "unknown");
   assert.equal(waited.json().timedOut, false);
-  assert.deepEqual(await stateSnapshot(harness.stateRoot), before);
-  await harness.releaseStart(started);
+  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
+  await started;
   const resumed = await harness.invoke(["resume", workerId, "--", "must reject"], { scenario: {} });
   assert.equal(resumed.code, 1);
   assert.equal(resumed.json().error.code, "worker_unknown");
+  const persisted = JSON.parse(await readFile(manifestPath, "utf8"));
+  const persistedTurn = persisted.turns.at(-1);
+  assert.equal(persisted.state, "unknown");
+  assert.equal(persistedTurn.state, "unknown");
+  assert.equal(persistedTurn.errorCode, "runner_died");
+  assert.equal(persistedTurn.logs.sealed, true);
+  assert.equal(persistedTurn.logs.stdoutMissing, true);
+  assert.equal(persistedTurn.logs.stderrMissing, true);
 });
 
 test("wait uses an immediate read, zero means indefinite, and positive timeouts are bounded", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "wait"], {
+  const started = harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "wait"], {
     scenario: { startBarrier: true, exitCode: 0 },
   });
-  const workerId = started.json().workerId;
+  const workerId = await waitForCreatedWorker(harness);
   const timedOut = await harness.invoke(["wait", workerId, "--timeout", "30"]);
   assert.equal(timedOut.json().timedOut, true);
   const zero = harness.invoke(["wait", workerId, "--timeout", "0"]);
   const positive = harness.invoke(["wait", workerId, "--timeout", "1000"]);
   const indefinite = harness.invoke(["wait", workerId]);
   await new Promise((resolve) => setTimeout(resolve, 30));
-  await harness.releaseStart(started);
+  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
+  await started;
   assert.equal((await zero).json().timedOut, false);
   assert.equal((await positive).json().timedOut, false);
   assert.equal((await indefinite).json().timedOut, false);
@@ -157,7 +177,7 @@ test("the observer call graph contains no raw-log reader or writer", async () =>
 
 test("list returns the latest-turn summary while status and wait retain history", async (t) => {
   const harness = await createCliHarness(t);
-  const first = await harness.invoke(["start", "--", "first turn"], {
+  const first = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "first turn"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"history-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   await harness.invoke(["wait", first.json().workerId]);
@@ -192,8 +212,22 @@ async function collect(root, output) {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const file = join(root, entry.name);
     if (entry.isDirectory()) await collect(file, output);
-    else if (!entry.name.endsWith(".lock") && !entry.name.endsWith(".start.barrier")) output.push(file);
+    else if (!entry.name.endsWith(".lock") && !entry.name.endsWith(".start.barrier") && !entry.name.includes(".lock.publish-")) output.push(file);
   }
+}
+
+async function waitForCreatedWorker(harness) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const files = (await readdir(join(harness.stateRoot, "workers"))).filter((file) => file.endsWith(".json"));
+      if (files.length > 0) return files[0].slice(0, -5);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for created worker");
 }
 
 async function waitForManifest(path, predicate) {

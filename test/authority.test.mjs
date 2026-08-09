@@ -11,7 +11,7 @@ const legacyWorkerId = "11111111-1111-4111-8111-111111111111";
 test("start records schema v2, exact initial authority, prompt hash, and requested provider cwd", async (t) => {
   const harness = await createCliHarness(t);
   const result = await harness.invoke(
-    ["start", "--effort", "xhigh", "--read-only", "--cwd", harness.requestedCwd, "--", "authority prompt"],
+    ["start", "--effort", "xhigh", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "authority prompt"],
     {
       scenario: {
         stdoutChunks: [
@@ -26,7 +26,7 @@ test("start records schema v2, exact initial authority, prompt hash, and request
   const receipt = result.json();
   assert.equal(result.code, 0);
   assert.equal(receipt.schemaVersion, 2);
-  assert.equal(receipt.state, "starting");
+  assert.equal(receipt.state, "running");
   assert.equal(receipt.effort, "xhigh");
   assert.equal(receipt.sandbox, "read-only");
   assert.equal(receipt.bypass, false);
@@ -36,8 +36,8 @@ test("start records schema v2, exact initial authority, prompt hash, and request
 
   const workerPath = join(harness.stateRoot, "workers", `${receipt.workerId}.json`);
   const worker = JSON.parse(await readFile(workerPath, "utf8"));
-  assert.equal(worker.revision, 0);
-  assert.equal(worker.state, "starting");
+  assert.equal(worker.revision >= 1, true);
+  assert.equal(worker.state, "running");
   assert.equal(worker.turns.length, 1);
   assert.equal(worker.turns[0].promptSha256, createHash("sha256").update("authority prompt").digest("hex"));
   assert.equal(JSON.stringify(worker).includes("authority prompt"), false);
@@ -56,7 +56,7 @@ test("start records schema v2, exact initial authority, prompt hash, and request
 
 test("resume preserves worker identity, creates a unique turn, and captures inherited authority", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--effort", "high", "--read-only", "--cwd", harness.requestedCwd, "--", "first"], {
+  const start = await harness.invoke(["start", "--effort", "high", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "first"], {
     scenario: {
       stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n", "{\"type\":\"turn.completed\"}\n"],
       exitCode: 0,
@@ -94,7 +94,7 @@ test("resume preserves worker identity, creates a unique turn, and captures inhe
 
 test("default authority and explicit resume broadening then narrowing use exact provider contracts", async (t) => {
   const harness = await createCliHarness(t);
-  const defaultStart = await harness.invoke(["start", "--", "default authority"], {
+  const defaultStart = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "default authority"], {
     scenario: {
       stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"authority-thread\"}\n", "{\"type\":\"turn.completed\"}\n"],
       exitCode: 0,
@@ -107,7 +107,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   ]);
   await harness.invoke(["wait", defaultStart.json().workerId]);
 
-  const seeded = await harness.invoke(["start", "--effort", "high", "--read-only", "--cwd", harness.requestedCwd, "--", "seed"], {
+  const seeded = await harness.invoke(["start", "--effort", "high", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "seed"], {
     scenario: {
       stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"override-thread\"}\n", "{\"type\":\"turn.completed\"}\n"],
       exitCode: 0,
@@ -119,29 +119,29 @@ test("default authority and explicit resume broadening then narrowing use exact 
   await mkdir(overrideCwd, { recursive: true });
 
   const broadened = await harness.invoke([
-    "resume", workerId, "--effort", "max", "--bypass", "--cwd", overrideCwd, "--", "broaden explicitly",
+    "resume", workerId, "--effort", "max", "--sandbox", "full-access", "--cwd", overrideCwd, "--", "broaden explicitly",
   ], {
     cwd: harness.root,
-    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"broadened-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const broadenedCapture = await harness.waitForCapture(broadened);
-  assert.equal(broadened.json().bypass, true);
-  assert.equal(broadened.json().sandbox, "workspace-write");
+  assert.equal(broadened.json().bypass, false);
+  assert.equal(broadened.json().sandbox, "full-access");
   assert.equal(broadened.json().effort, "max");
   assert.equal(broadened.json().cwd, overrideCwd);
   assert.deepEqual(broadenedCapture.argv, [
     "exec", "resume", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max",
-    "--dangerously-bypass-approvals-and-sandbox", "override-thread", "-",
+    "-c", "sandbox_mode=\"full-access\"", "override-thread", "-",
   ]);
   assert.equal(broadenedCapture.cwd, overrideCwd);
   const broadenedWorker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${workerId}.json`), "utf8"));
-  assert.equal(broadenedWorker.turns.at(-1).sandbox, "workspace-write");
-  assert.equal(broadenedWorker.turns.at(-1).bypass, true);
+  assert.equal(broadenedWorker.turns.at(-1).sandbox, "full-access");
+  assert.equal(broadenedWorker.turns.at(-1).bypass, false);
   await harness.invoke(["wait", workerId]);
 
-  const narrowed = await harness.invoke(["resume", workerId, "--read-only", "--", "narrow explicitly"], {
+  const narrowed = await harness.invoke(["resume", workerId, "--sandbox", "read-only", "--", "narrow explicitly"], {
     cwd: harness.root,
-    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"narrowed-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const narrowedCapture = await harness.waitForCapture(narrowed);
   assert.equal(narrowed.json().bypass, false);
@@ -149,7 +149,7 @@ test("default authority and explicit resume broadening then narrowing use exact 
   assert.equal(narrowed.json().cwd, overrideCwd);
   assert.deepEqual(narrowedCapture.argv, [
     "exec", "resume", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=max",
-    "-c", "sandbox_mode=\"read-only\"", "override-thread", "-",
+    "-c", "sandbox_mode=\"read-only\"", "broadened-thread", "-",
   ]);
   assert.equal(narrowedCapture.cwd, overrideCwd);
   await harness.invoke(["wait", workerId]);
@@ -158,19 +158,19 @@ test("default authority and explicit resume broadening then narrowing use exact 
 
 test("bypass is explicit and contradictory authority is rejected", async (t) => {
   const harness = await createCliHarness(t);
-  const invalid = await harness.invoke(["run", "--read-only", "--bypass", "--", "invalid"]);
+  const invalid = await harness.invoke(["start", "--effort", "medium", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--read-only", "--bypass", "--", "invalid"]);
   assert.equal(invalid.code, 2);
-  assert.match(invalid.stderr.toString(), /cannot be combined/);
+  assert.match(invalid.json().error.message, /legacy authority flag.*--read-only.*--sandbox/i);
   await harness.assertNoCapture(invalid);
 
-  const result = await harness.invoke(["start", "--bypass", "--", "bypass"], {
+  const result = await harness.invoke(["start", "--effort", "medium", "--sandbox", "full-access", "--cwd", harness.requestedCwd, "--", "bypass"], {
     scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
   });
   const receipt = result.json();
   const capture = await harness.waitForCapture(result);
   assert.deepEqual(capture.argv, [
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
-    "--dangerously-bypass-approvals-and-sandbox", "-C", receipt.cwd, "-",
+    "--sandbox", "full-access", "-C", receipt.cwd, "-",
   ]);
   await harness.release(result);
   await harness.invoke(["wait", receipt.workerId]);

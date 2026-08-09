@@ -31,6 +31,7 @@ test("fake Codex captures exact bytes, authority inputs, PIDs, chunks, and expli
   const grandchildReadyPath = join(root, "grandchild.ready");
 
   const scenario = {
+    suppressDefaultReadiness: true,
     stdoutChunks: [{ base64: Buffer.from([0xe2, 0x82]).toString("base64") }, { base64: Buffer.from([0xac, 0x00, 0xff]).toString("base64") }],
     stderrChunks: ["stderr α\r\n", { hex: "00c328" }],
     linger: true,
@@ -144,6 +145,7 @@ test("fake Codex emits one JSONL record across byte and UTF-8 chunk boundaries",
     jsonl.subarray(jsonl.length - 1),
   ];
   const { run, result } = await runScenario(cleanup, root, "partial-jsonl", {
+    suppressDefaultReadiness: true,
     stdoutChunks: chunks.map((chunk) => ({ base64: chunk.toString("base64") })),
     exitCode: 0,
   });
@@ -202,25 +204,32 @@ test("real launcher transports exact prompt and output bytes through the PATH sh
   await mkdir(callerCwd, { recursive: true });
   const prompt = "first line\r\nquotes: \" ' `\r\nmeta: & | < > ^ % !\r\n最後の行";
   const result = await harness.invoke(
-    ["run", "--effort", "high", "--cwd", harness.requestedCwd, "--", prompt],
+    ["start", "--effort", "high", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", prompt],
     {
       cwd: callerCwd,
       scenario: {
         stdoutChunks: ["raw stdout α\r\n", { hex: "00ff" }],
         stderrChunks: ["raw stderr β\n", { hex: "c328" }],
+        linger: true,
         exitCode: 7,
       },
     },
   );
 
-  assert.equal(result.code, 7);
+  assert.equal(result.code, 0);
   assert.equal(result.signal, null);
-  assert.deepEqual(result.stdout, Buffer.concat([Buffer.from("raw stdout α\r\n"), Buffer.from("00ff", "hex")]));
-  assert.deepEqual(result.stderr, Buffer.concat([Buffer.from("raw stderr β\n"), Buffer.from("c328", "hex")]));
+  const receipt = result.json();
+  await harness.release(result);
+  const done = await harness.invoke(["wait", receipt.workerId]);
+  assert.equal(done.json().state, "failed");
+  assert.equal(done.json().exitCode, 7);
+  assert.deepEqual(await readFile(done.json().logs.stdoutPath), Buffer.concat([Buffer.from("{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n"), Buffer.from("raw stdout α\r\n"), Buffer.from("00ff", "hex")]));
+  assert.deepEqual(await readFile(done.json().logs.stderrPath), Buffer.concat([Buffer.from("raw stderr β\n"), Buffer.from("c328", "hex")]));
 
   const capture = await harness.readCapture(result);
   assert.deepEqual(capture.argv, [
     "exec",
+    "--json",
     "--model",
     "gpt-5.6-luna",
     "-c",
@@ -266,7 +275,7 @@ test("help does not launch provider", async (t) => {
 
   assert.equal(result.code, 0);
   assert.equal(result.signal, null);
-  assert.match(result.stdout.toString("utf8"), /Commands: start, run, status, wait, resume, cancel, stop, list/);
+  assert.match(result.stdout.toString("utf8"), /Commands: start, status, wait, resume, cancel, list/);
   assert.throws(() => result.json(), /was not exactly one JSON value/);
   assert.deepEqual(result.stderr, Buffer.alloc(0));
   await harness.assertNoCapture(result);

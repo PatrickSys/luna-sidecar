@@ -312,12 +312,14 @@ if (input.includes("exactly two")) {
   emit({type:"item.completed",item:{type:"collab_tool_call",tool:"spawn_agent",status:"completed",receiver_thread_ids:["receiver-a"]}});
   emit({type:"item.completed",item:{type:"collab_tool_call",tool:"spawn_agent",status:"completed",receiver_thread_ids:["receiver-b"]}});
   emit({type:"turn.completed"});
-} else if (marker) {
-  if (input.trim() !== expectedResumePrompt) { emit({type:"turn.completed",error:"resume prompt contract mismatch"}); process.exit(1); }
-  emit({type:"item.completed",item:{type:"command_execution",command:"write "+marker,status:"failed",exit_code:1}});
+ } else if (marker) {
+   if (input.trim() !== expectedResumePrompt) { emit({type:"turn.completed",error:"resume prompt contract mismatch"}); process.exit(1); }
+   emit({type:"thread.started",thread_id:"fake-resume-session"});
+   emit({type:"item.completed",item:{type:"command_execution",command:"write "+marker,status:"failed",exit_code:1}});
   emit({type:"turn.completed"});
 } else {
-  setInterval(()=>{},1000);
+   emit({type:"thread.started",thread_id:"fake-cancel-session"});
+   setInterval(()=>{},1000);
 }`;
   await writeFile(fakePath, fakeSource, "utf8");
   await writeFakeShim(shimRoot, fakePath);

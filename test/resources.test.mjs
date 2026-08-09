@@ -19,7 +19,7 @@ test("incremental parsing keeps split UTF-8, CRLF, no-final-newline, malformed, 
   const bytes = Buffer.from(records.join(""), "utf8");
   const split = [];
   for (let offset = 0; offset < bytes.length; offset += 1) split.push({ base64: bytes.subarray(offset, offset + 1).toString("base64") });
-  const started = await harness.invoke(["start", "--", "incremental"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "incremental"), {
     scenario: { stdoutChunks: split, stderrChunks: ["stderr-secret"], exitCode: 0 },
   });
   const result = (await harness.invoke(["wait", started.json().workerId])).json();
@@ -34,13 +34,41 @@ test("incremental parsing keeps split UTF-8, CRLF, no-final-newline, malformed, 
   assert.equal(raw.includes("unknown-event-sentinel"), true);
 });
 
+test("list returns active workers plus 20 newest terminal records, while --all retains every record", async (t) => {
+  const harness = await createCliHarness(t);
+  const active = await harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "active"], {
+    scenario: { linger: true, exitCode: 0 },
+  });
+  const terminalIds = [];
+  for (let index = 0; index < 21; index += 1) {
+    const started = await harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", `terminal ${index}`], {
+      scenario: { exitCode: 0 },
+    });
+    const terminalId = started.json().workerId;
+    terminalIds.push(terminalId);
+    await harness.invoke(["wait", terminalId]);
+  }
+  const listed = (await harness.invoke(["list"])).json();
+  assert.equal(listed.length, 21);
+  assert.equal(listed[0].workerId, active.json().workerId);
+  assert.equal(listed.filter((worker) => worker.state === "running").length, 1);
+  assert.equal(listed.slice(1).every((worker) => worker.state === "completed"), true);
+
+  const all = (await harness.invoke(["list", "--all"])).json();
+  assert.equal(all.length, 22);
+  assert.equal(all[0].workerId, active.json().workerId);
+  assert.deepEqual(new Set(all.map((worker) => worker.workerId)), new Set([active.json().workerId, ...terminalIds]));
+  await harness.release(active);
+  await harness.invoke(["wait", active.json().workerId]);
+});
+
 test("final messages are UTF-8 byte bounded before manifest and receipt persistence", async (t) => {
   const harness = await createCliHarness(t);
   const finalText = "🙂".repeat(270_000);
   const payload = Buffer.from(`{"type":"item.completed","item":{"type":"agent_message","text":${JSON.stringify(finalText)}}}\n{"type":"turn.completed"}\n`, "utf8");
   const chunks = [];
   for (let offset = 0; offset < payload.length; offset += 97) chunks.push({ base64: payload.subarray(offset, offset + 97).toString("base64") });
-  const started = await harness.invoke(["start", "--", "bounded final"], { scenario: { stdoutChunks: chunks, exitCode: 0 } });
+  const started = await harness.invoke(explicitStartArgs(harness, "bounded final"), { scenario: { stdoutChunks: chunks, exitCode: 0 } });
   const result = (await harness.invoke(["wait", started.json().workerId])).json();
   const manifest = await readFile(join(harness.stateRoot, "workers", `${started.json().workerId}.json`), "utf8");
   assert.equal(result.state, "completed");
@@ -57,7 +85,7 @@ test("raw output is capped while parsing continues and byte accounting is truthf
     Buffer.from("\n{\"type\":\"turn.completed\"}"),
   ]);
   const stderrFlood = Buffer.alloc(4 * 1024 * 1024 + 17, 0x65);
-  const started = await harness.invoke(["start", "--", "caps"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "caps"), {
     scenario: {
       stdoutChunks: [{ base64: stdoutFlood.toString("base64") }],
       stderrChunks: [{ base64: stderrFlood.toString("base64") }],
@@ -83,7 +111,7 @@ test("raw output is capped while parsing continues and byte accounting is truthf
 
 test("cancellation publishes terminal state only after sealed raw metadata", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "cancelled output"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "cancelled output"), {
     scenario: { stdoutChunks: ["cancelled evidence\n"], linger: true, exitCode: 0 },
   });
   await harness.waitForCapture(started);
@@ -99,15 +127,17 @@ test("cancellation publishes terminal state only after sealed raw metadata", asy
 
 test("a second raw-writer open failure seals and leaves the first handle removable", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "stderr open failure"], {
+  const startedPromise = harness.invoke(explicitStartArgs(harness, "stderr open failure"), {
     scenario: { startBarrier: true, stdoutChunks: ["stdout evidence\n"], exitCode: 0 },
   });
-  const manifestPath = join(harness.stateRoot, "workers", `${started.json().workerId}.json`);
+  const workerId = await waitForCreatedWorker(harness);
+  const manifestPath = join(harness.stateRoot, "workers", `${workerId}.json`);
   const initial = JSON.parse(await readFile(manifestPath, "utf8"));
   const turn = initial.turns.at(-1);
   await mkdir(turn.stderrPath);
-  await harness.releaseStart(started);
-  const result = await harness.invoke(["wait", started.json().workerId]);
+  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
+  await startedPromise;
+  const result = await harness.invoke(["wait", workerId]);
   assert.equal(result.code, 0);
   const final = JSON.parse(await readFile(manifestPath, "utf8"));
   const finalTurn = final.turns.at(-1);
@@ -121,9 +151,9 @@ test("a second raw-writer open failure seals and leaves the first handle removab
 
 test("only sealed canonical terminal raw logs are pruned, with compact evidence retained", async (t) => {
   const harness = await createCliHarness(t);
-  const first = await harness.invoke(["start", "--", "oldest"], { scenario: { exitCode: 0 } });
+  const first = await harness.invoke(explicitStartArgs(harness, "oldest"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", first.json().workerId]);
-  const second = await harness.invoke(["start", "--", "newer"], { scenario: { exitCode: 0 } });
+  const second = await harness.invoke(explicitStartArgs(harness, "newer"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", second.json().workerId]);
 
   const firstPath = join(harness.stateRoot, "workers", `${first.json().workerId}.json`);
@@ -136,8 +166,8 @@ test("only sealed canonical terminal raw logs are pruned, with compact evidence 
   await sparse(secondWorker.turns[0].stderrPath, 1 * 1024 * 1024);
 
   const [active, activeTwo] = await Promise.all([
-    harness.invoke(["start", "--", "trigger pruning one"], { scenario: { stdoutChunks: ["active one\n"], linger: true, exitCode: 0 } }),
-    harness.invoke(["start", "--", "trigger pruning two"], { scenario: { stdoutChunks: ["active two\n"], linger: true, exitCode: 0 } }),
+    harness.invoke(explicitStartArgs(harness, "trigger pruning one"), { scenario: { stdoutChunks: ["active one\n"], linger: true, exitCode: 0 } }),
+    harness.invoke(explicitStartArgs(harness, "trigger pruning two"), { scenario: { stdoutChunks: ["active two\n"], linger: true, exitCode: 0 } }),
   ]);
   await Promise.all([harness.waitForCapture(active), harness.waitForCapture(activeTwo)]);
   const activeWorker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${active.json().workerId}.json`), "utf8"));
@@ -156,7 +186,7 @@ test("only sealed canonical terminal raw logs are pruned, with compact evidence 
   for (const path of [activeStdout, activeStderr, activeTwoWorker.turns[0].stdoutPath, activeTwoWorker.turns[0].stderrPath]) {
     assert.equal(await isFile(path), true);
   }
-  const duringActive = await harness.invoke(["start", "--", "idempotent pruning"], { scenario: { exitCode: 0 } });
+  const duringActive = await harness.invoke(explicitStartArgs(harness, "idempotent pruning"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", duringActive.json().workerId]);
   const repeated = JSON.parse(await readFile(firstPath, "utf8"));
   assert.equal(repeated.turns[0].logs.prunedAt, prunedAt);
@@ -173,13 +203,13 @@ test("only sealed canonical terminal raw logs are pruned, with compact evidence 
 
 test("retention reconciles partial files and retries a persisted pruning intent", async (t) => {
   const harness = await createCliHarness(t);
-  const old = await harness.invoke(["start", "--", "partial retention"], { scenario: { exitCode: 0 } });
+  const old = await harness.invoke(explicitStartArgs(harness, "partial retention"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", old.json().workerId]);
   const oldPath = join(harness.stateRoot, "workers", `${old.json().workerId}.json`);
   const initial = JSON.parse(await readFile(oldPath, "utf8"));
   const turn = initial.turns.at(-1);
   await rm(turn.stdoutPath, { force: true });
-  const reconcile = await harness.invoke(["start", "--", "reconcile retention"], { scenario: { exitCode: 0 } });
+  const reconcile = await harness.invoke(explicitStartArgs(harness, "reconcile retention"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", reconcile.json().workerId]);
   const partial = JSON.parse(await readFile(oldPath, "utf8")).turns.at(-1);
   assert.equal(partial.logs.stdoutMissing, true);
@@ -190,7 +220,7 @@ test("retention reconciles partial files and retries a persisted pruning intent"
   poisonedIntent.turns.at(-1).logs.pruning = true;
   poisonedIntent.turns.at(-1).logs.pruningAt = new Date().toISOString();
   await writeFile(oldPath, `${JSON.stringify(poisonedIntent)}\n`, "utf8");
-  const recover = await harness.invoke(["start", "--", "recover retention"], { scenario: { exitCode: 0 } });
+  const recover = await harness.invoke(explicitStartArgs(harness, "recover retention"), { scenario: { exitCode: 0 } });
   await harness.invoke(["wait", recover.json().workerId]);
   const finalTurn = JSON.parse(await readFile(oldPath, "utf8")).turns.at(-1);
   assert.equal(finalTurn.logs.stdoutMissing, true);
@@ -210,7 +240,7 @@ test("a valid retention lock with a definitely dead owner is recovered immediate
     pid: deadPid,
     acquiredAt: new Date().toISOString(),
   })}\n`, "utf8");
-  const started = await harness.invoke(["start", "--", "recover dead retention owner"], { scenario: { exitCode: 0 } });
+  const started = await harness.invoke(explicitStartArgs(harness, "recover dead retention owner"), { scenario: { exitCode: 0 } });
   assert.equal(started.code, 0);
   assert.equal(started.durationMs < 5_000, true);
   await harness.invoke(["wait", started.json().workerId]);
@@ -219,7 +249,7 @@ test("a valid retention lock with a definitely dead owner is recovered immediate
 
 test("a fresh valid worker lock with a definitely dead owner is recovered immediately", async (t) => {
   const harness = await createCliHarness(t);
-  const started = await harness.invoke(["start", "--", "seed dead worker lock"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "seed dead worker lock"), {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"dead-lock-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = started.json().workerId;
@@ -247,7 +277,7 @@ test("a fresh valid worker lock with a definitely dead owner is recovered immedi
 test("a newline-free flood keeps parser tail bounded", async (t) => {
   const harness = await createCliHarness(t);
   const flood = Buffer.alloc(2 * 1024 * 1024, 0x7a);
-  const started = await harness.invoke(["start", "--", "tail bound"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "tail bound"), {
     scenario: { stdoutChunks: [{ base64: flood.toString("base64") }, "\n{\"type\":\"turn.completed\"}"], exitCode: 0 },
   });
   const result = (await harness.invoke(["wait", started.json().workerId])).json();
@@ -258,10 +288,12 @@ test("a newline-free flood keeps parser tail bounded", async (t) => {
 test("a split oversized line discards its JSON-looking suffix", async (t) => {
   const harness = await createCliHarness(t);
   const flood = Buffer.alloc(1_200_000, 0x7a);
-  const started = await harness.invoke(["start", "--", "discard suffix"], {
+  const started = await harness.invoke(explicitStartArgs(harness, "discard suffix"), {
     scenario: { stdoutChunks: [{ base64: flood.toString("base64") }, "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
-  const result = (await harness.invoke(["wait", started.json().workerId])).json();
+  const receipt = started.json();
+  const workerId = receipt.workerId ?? await waitForCreatedWorker(harness);
+  const result = (await harness.invoke(started.code === 0 ? ["wait", workerId] : ["status", workerId])).json();
   assert.notEqual(result.state, "completed");
   assert.equal(result.warnings.includes("oversized_incomplete_line"), true);
 });
@@ -293,4 +325,22 @@ async function exitedPid() {
     child.once("close", resolve);
   });
   return pid;
+}
+
+function explicitStartArgs(harness, prompt) {
+  return ["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", prompt];
+}
+
+async function waitForCreatedWorker(harness) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const files = (await readdir(join(harness.stateRoot, "workers"))).filter((file) => file.endsWith(".json"));
+      if (files.length > 0) return files[0].slice(0, -5);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for created worker");
 }

@@ -79,7 +79,7 @@ async function main() {
   if (command === "wait") return waitForWorker(requireWorkerId(rawArgs), parseWait(rawArgs.slice(1)));
   if (command === "resume") return resumeWorker(requireWorkerId(rawArgs), await parseTask(rawArgs.slice(1)));
   if (command === "cancel") return cancelWorker(requireWorkerId(rawArgs));
-  if (command === "list") return listWorkers();
+  if (command === "list") return listWorkers(parseList(rawArgs));
   if (command === "_worker") return runWorker(requireWorkerId(rawArgs));
 }
 
@@ -211,6 +211,12 @@ function parseWait(args) {
     return { timeoutMs };
   }
   fail("Use wait <worker-id> [--timeout <milliseconds>]");
+}
+
+function parseList(args) {
+  if (args.length === 0) return { all: false };
+  if (args.length === 1 && args[0] === "--all") return { all: true };
+  fail("Use list [--all]");
 }
 
 function requireWorkerId(args) {
@@ -383,6 +389,7 @@ function makeTurn(task, sessionId = null, cwdRealpath = null, initialWarnings = 
     state: "starting",
     providerState: "not_started",
     taskOutcome: "not_evaluated",
+    usage: "unavailable",
     runnerPid: null,
     providerPid: null,
     pid: null,
@@ -495,12 +502,65 @@ async function launchRunner(workerId, worker, { printResult }) {
     if (lastError) throw lastError;
     throw new SidecarError(`Could not start sidecar runner: ${outcome.error.message}`, "runner_spawn_failed", 1);
   }
-  // The parent only records the detached runner identity. It never claims provider readiness.
-  const view = workerView(worker);
-  view.pid = runner.pid ?? null;
-  view.runnerPid = runner.pid ?? null;
   runner.unref();
-  if (printResult) print(view);
+  const ready = await waitForReadiness(workerId);
+  if (printResult) print(workerView(ready));
+}
+
+async function waitForReadiness(workerId) {
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    const current = await readWorker(workerId);
+    const turn = latestTurn(current);
+    if (turn?.sessionId && turn.providerPid && turn.providerState === "running") return current;
+    if (turn?.sessionId && turn.providerPid && turn.providerState === "completed" && !turn.errorCode) return current;
+    if (isTerminal(current.state)) {
+      const code = turn?.errorCode ?? "provider_rejected";
+      await persistReadinessFailure(workerId, code);
+      throw new SidecarError(controlledErrorMessage(code), code, 1);
+    }
+    if (turn?.runnerPid && await runnerLiveness(turn.runnerPid) === false) {
+      await persistReadinessFailure(workerId, "runner_died");
+      throw new SidecarError(controlledErrorMessage("runner_died"), "runner_died", 1);
+    }
+    await delay(50);
+  }
+  const current = await readWorker(workerId);
+  const turn = latestTurn(current);
+  if (turn?.sessionId && turn.providerPid && turn.providerState === "running") return current;
+  const cleanupCode = await cleanupReadinessProcesses(current);
+  const code = cleanupCode ?? "readiness_timeout";
+  await persistReadinessFailure(workerId, code);
+  throw new SidecarError(controlledErrorMessage(code), code, 1);
+}
+
+async function persistReadinessFailure(workerId, code) {
+  await persistUnknown(workerId, code, controlledErrorMessage(code)).catch(() => {});
+}
+
+async function cleanupReadinessProcesses(worker) {
+  const turn = latestTurn(worker);
+  if (!turn) return "cleanup_uncertain";
+  const pids = [...new Set([turn.providerPid, turn.runnerPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
+  try {
+    for (const pid of pids) await terminateOwnedProcess(pid);
+    for (const pid of pids) {
+      if (await runnerLiveness(pid) !== false) return "cleanup_uncertain";
+    }
+    return null;
+  } catch {
+    return "cleanup_uncertain";
+  }
+}
+
+async function terminateOwnedProcess(pid) {
+  if (platform() === "win32") {
+    const result = await spawnAndWait("taskkill", ["/PID", String(pid), "/T", "/F"]);
+    if (result.code !== 0 && await runnerLiveness(pid) !== false) throw new Error(`taskkill failed with exit ${result.code}`);
+    return;
+  }
+  try { process.kill(-pid, "SIGKILL"); }
+  catch (error) { if (error.code !== "ESRCH") throw error; }
 }
 
 async function runWorker(workerId) {
@@ -617,6 +677,10 @@ async function runWorkerLifecycle(workerId) {
   let stdinError = null;
   let spawnPersistPromise = Promise.resolve();
   let spawnPersistError = null;
+  let readinessPersistPromise = Promise.resolve();
+  let readinessPersistError = null;
+  let readinessObserved = false;
+  let readinessSchemaError = false;
   let parserFinished = false;
 
   const handleLine = (line, warningCollector) => {
@@ -624,7 +688,18 @@ async function runWorkerLifecycle(workerId) {
     let event;
     try { event = JSON.parse(line); }
     catch { warningCollector.add("malformed_provider_json"); return; }
-    if (event.type === "thread.started" && typeof event.thread_id === "string") sessionId = event.thread_id;
+    if (event.type === "thread.started") {
+      if (typeof event.thread_id !== "string" || event.thread_id.length === 0) {
+        readinessSchemaError = true;
+        warningCollector.add("readiness_schema_mismatch");
+      } else {
+        readinessObserved = true;
+        sessionId = event.thread_id;
+        readinessPersistPromise = readinessPersistPromise.then(() => persistProviderReadiness(workerId, event.thread_id)).catch((error) => {
+          readinessPersistError = error;
+        });
+      }
+    }
     if (event.type === "turn.completed") providerCompleted = true;
     if (event.type === "turn.failed" || event.type === "error") providerFailed = true;
     if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
@@ -722,6 +797,8 @@ async function runWorkerLifecycle(workerId) {
     if (cancelPromise) await cancelPromise;
     await spawnPersistPromise;
     if (spawnPersistError) warnings.add("provider_state_persist_failed");
+    await readinessPersistPromise;
+    if (readinessPersistError) warnings.add("readiness_state_persist_failed");
 
     if (stdinError && !launchError) {
       await persistRunnerFailure(workerId, "stdin_write_failed", stdinError, spawnSeen ? "failed" : "not_started", stdoutMeta, stderrMeta);
@@ -743,6 +820,8 @@ async function runWorkerLifecycle(workerId) {
       closeInfo,
       providerCompleted,
       providerFailed,
+      readinessObserved,
+      readinessSchemaError: readinessSchemaError || Boolean(readinessPersistError),
       sessionId,
       finalMessage,
       warnings: warnings.values(),
@@ -763,6 +842,8 @@ async function runWorkerLifecycle(workerId) {
         streamError ??= stdoutWriter?.error ?? stderrWriter?.error;
         await spawnPersistPromise;
         if (spawnPersistError) warnings.add("provider_state_persist_failed");
+        await readinessPersistPromise;
+        if (readinessPersistError) warnings.add("readiness_state_persist_failed");
         if (!streamError && !stdinError) {
           const recoveredCurrent = await readWorker(workerId);
           if (recoveredCurrent.state === "cancelling" && recoveredCurrent.cancel?.acknowledgedAt) {
@@ -774,6 +855,8 @@ async function runWorkerLifecycle(workerId) {
               closeInfo,
               providerCompleted,
               providerFailed,
+              readinessObserved,
+              readinessSchemaError: readinessSchemaError || Boolean(readinessPersistError),
               sessionId,
               finalMessage,
               warnings: warnings.values(),
@@ -1055,6 +1138,15 @@ async function persistProviderSpawn(workerId, providerPid, sessionId) {
   });
 }
 
+async function persistProviderReadiness(workerId, sessionId) {
+  await mutateWorker(workerId, (current) => {
+    const turn = latestTurn(current);
+    if (!turn || isTerminal(current.state)) return current;
+    turn.sessionId = sessionId;
+    return syncProjection(current);
+  });
+}
+
 async function finalizeProvider(workerId, facts) {
   const result = await mutateWorker(workerId, (current) => {
     const turn = latestTurn(current);
@@ -1073,7 +1165,17 @@ async function finalizeProvider(workerId, facts) {
       turn.errorCode = null;
       turn.warnings = (turn.warnings ?? []).filter((warning) => warning !== "cancel_timeout");
     }
-    if (facts.launchError || !facts.spawnSeen) {
+    if (facts.readinessSchemaError) {
+      turn.state = "failed";
+      turn.providerState = "failed";
+      turn.errorCode = "readiness_schema_mismatch";
+      turn.error = controlledErrorMessage("readiness_schema_mismatch");
+    } else if (!facts.readinessObserved && facts.spawnSeen) {
+      turn.state = "failed";
+      turn.providerState = "failed";
+      turn.errorCode = "provider_rejected";
+      turn.error = controlledErrorMessage("provider_rejected");
+    } else if (facts.launchError || !facts.spawnSeen) {
       turn.state = "failed";
       turn.providerState = "failed";
       turn.errorCode = "provider_spawn_failed";
@@ -1820,7 +1922,7 @@ async function removeOwnedRetentionLock(target, token) {
   } catch {}
 }
 
-async function listWorkers() {
+async function listWorkers({ all = false } = {}) {
   let files;
   try { files = (await readdir(workersRoot)).filter((file) => file.endsWith(".json")); }
   catch (error) {
@@ -1833,7 +1935,10 @@ async function listWorkers() {
     delete view.turns;
     workers.push(view);
   }
-  print(workers.sort((left, right) => right.createdAt.localeCompare(left.createdAt)));
+  const newest = (left, right) => right.createdAt.localeCompare(left.createdAt) || right.workerId.localeCompare(left.workerId);
+  const active = workers.filter((worker) => !isTerminal(worker.state)).sort(newest);
+  const terminal = workers.filter((worker) => isTerminal(worker.state)).sort(newest);
+  print(all ? [...active, ...terminal] : [...active, ...terminal.slice(0, 20)]);
 }
 
 function workerView(worker) {
@@ -1849,6 +1954,7 @@ function workerView(worker) {
     state: turn ? turn.state : (worker.state ?? "unknown"),
     providerState: turn ? turn.providerState : (worker.providerState ?? "unknown"),
     taskOutcome: turn ? turn.taskOutcome : (worker.taskOutcome ?? "not_evaluated"),
+    usage: turn ? turn.usage : (worker.usage ?? "unavailable"),
     sessionId: turn ? turn.sessionId : (worker.threadId ?? null),
     threadId: turn ? turn.sessionId : (worker.threadId ?? null),
     parentWorkerId: worker.parentWorkerId ?? null,
@@ -1885,6 +1991,7 @@ function compactTurnView(turn) {
     state: turn.state,
     providerState: turn.providerState,
     taskOutcome: "not_evaluated",
+    usage: turn.usage ?? "unavailable",
     runnerPid: turn.runnerPid ?? null,
     providerPid: turn.providerPid ?? null,
     pid: turn.pid ?? null,
@@ -1921,7 +2028,7 @@ function syncProjection(worker) {
   worker.turnId = turn.turnId;
   worker.turnCount = worker.turns.length;
   for (const key of [
-    "state", "providerState", "taskOutcome", "sessionId", "runnerPid", "providerPid", "pid", "cwd", "effort",
+    "state", "providerState", "taskOutcome", "usage", "sessionId", "runnerPid", "providerPid", "pid", "cwd", "effort",
     "sandbox", "bypass", "exitCode", "signal", "errorCode", "error", "startedAt", "completedAt", "finalMessage",
     "logs", "cancel", "cwdRealpath",
   ]) worker[key] = key === "sessionId" ? turn.sessionId : turn[key];
@@ -2008,6 +2115,7 @@ function normalizeWorker(raw, requestedId) {
     state: legacyState,
     providerState: legacyState === "completed" ? "completed" : (legacyState === "failed" ? "failed" : "unknown"),
     taskOutcome: "not_evaluated",
+    usage: "unavailable",
     runnerPid: raw.pid ?? null,
     providerPid: null,
     pid: raw.pid ?? null,
@@ -2075,6 +2183,7 @@ function normalizeTurnRecord(raw) {
     state: raw?.state ?? "unknown",
     providerState: raw?.providerState ?? "unknown",
     taskOutcome: "not_evaluated",
+    usage: typeof raw?.usage === "string" ? raw.usage : "unavailable",
     runnerPid: raw?.runnerPid ?? null,
     providerPid: raw?.providerPid ?? null,
     pid: raw?.pid ?? raw?.runnerPid ?? null,
@@ -2186,6 +2295,11 @@ function controlledErrorMessage(code) {
     prompt_missing_after_claim: "The claimed prompt was unavailable",
     stdin_write_failed: "The provider prompt could not be delivered",
     runner_not_alive: "The recorded runner is no longer alive",
+    provider_rejected: "Provider rejected or closed before readiness",
+    readiness_timeout: "Provider readiness was not observed before the deadline",
+    runner_died: "The runner exited before provider readiness",
+    readiness_schema_mismatch: "Provider readiness did not match the observed thread.started schema",
+    cleanup_uncertain: "Owned process cleanup could not be verified",
     cancel_failed: "Cancellation could not be verified",
     cancel_timeout: "Cancellation is still pending",
     lock_publish_failed: "The worker lock could not be published atomically",
@@ -2217,6 +2331,7 @@ function validateV2Worker(worker) {
     if (!workerStates.has(turn.state)) fail("Malformed worker state");
     if (!providerStates.has(turn.providerState)) fail("Malformed provider state");
     if (turn.taskOutcome !== "not_evaluated") fail("Malformed task outcome");
+    if (turn.usage !== "unavailable") fail("Malformed usage availability");
     if (turn.sourceSchemaVersion !== 0) validateNativeTurn(turn);
   }
   const turn = latestTurn(worker);
@@ -2226,6 +2341,7 @@ function validateV2Worker(worker) {
     state: turn.state,
     providerState: turn.providerState,
     taskOutcome: turn.taskOutcome,
+    usage: turn.usage,
     threadId: turn.sessionId,
     sessionId: turn.sessionId,
     runnerPid: turn.runnerPid,

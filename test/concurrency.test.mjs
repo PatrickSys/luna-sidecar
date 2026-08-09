@@ -7,7 +7,7 @@ import { createCliHarness, waitForProcessGone } from "./helpers/cli-harness.mjs"
 
 test("two resumes on one worker serialize and only one active turn launches", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "seed"], {
+  const start = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "seed"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = start.json().workerId;
@@ -20,17 +20,17 @@ test("two resumes on one worker serialize and only one active turn launches", as
   await mkdir(join(harness.stateRoot, "fixtures"), { recursive: true });
 
   const leftPromise = harness.invoke(["resume", workerId, "--", "left"], {
-    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"left-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
     extraEnv: { LUNA_SIDECAR_TEST_BARRIER: activeBarrier, FAKE_CODEX_START_BARRIER: providerBarrier },
   });
   await waitForFile(`${activeBarrier}.ready`);
   const rightPromise = harness.invoke(["resume", workerId, "--", "right"], {
-    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"right-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   await writeFile(`${activeBarrier}.release`, "release\n", "utf8");
+  await writeFile(providerBarrier, "release\n", "utf8");
   const leftReceipt = await leftPromise;
   const rightReceipt = await rightPromise;
-  await writeFile(providerBarrier, "release\n", "utf8");
   const [left, right] = [leftReceipt, rightReceipt];
   const successes = [left, right].filter((value) => value.code === 0);
   const failures = [left, right].filter((value) => value.code === 1);
@@ -46,7 +46,7 @@ test("two resumes on one worker serialize and only one active turn launches", as
 
 test("a paused stale writer cannot commit after a newer revision", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "seed"], {
+  const start = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "seed"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = start.json().workerId;
@@ -94,7 +94,7 @@ test("a paused stale writer cannot commit after a newer revision", async (t) => 
 
 test("malformed and live-owner locks retain their fail-closed grace", async (t) => {
   const harness = await createCliHarness(t);
-  const start = await harness.invoke(["start", "--", "seed"], {
+  const start = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "seed"], {
     scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
   });
   const workerId = start.json().workerId;
