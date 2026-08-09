@@ -12,11 +12,13 @@ import {
   buildInstallerEnvironment,
   buildHostInvocation,
   buildProviderEnvironment,
+  buildCancellationPrompt,
   buildResumePrompt,
   cancellationPredicate,
   canonicalEvidenceJson,
   cleanupRun,
   createRedactedRecord,
+  DEFAULT_EVIDENCE_DESTINATION,
   evaluateCleanupFacts,
   failedMarkerCommandPredicate,
   installCopiedSkills,
@@ -51,6 +53,13 @@ test("release smoke parser keeps its exact internal control contract", () => {
   const evidence = redactEvidence({ commands: [{ name: "manager-stop", exitCode: 0 }, { name: "manager-cancel", exitCode: 0 }] });
   assert.equal(evidence.commands[0].name, "unknown");
   assert.equal(evidence.commands[1].name, "manager-cancel");
+});
+
+test("live defaults write only the Phase 5 final-shape evidence paths", () => {
+  assert.deepEqual(DEFAULT_EVIDENCE_DESTINATION, {
+    jsonPath: join(repositoryRoot, "docs", "verification", "phase5-final-shape-evidence.json"),
+    markdownPath: join(repositoryRoot, "docs", "verification", "phase5-final-shape-evidence.md"),
+  });
 });
 
 test("release smoke refuses missing live mode before any command spawn", async () => {
@@ -136,6 +145,25 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
   assert.equal(unavailable.hosts.codex_cli.failureCode, "codex_cli_unavailable");
   assert.equal(unavailable.hosts.claude_code.failureCode, "claude_code_unavailable");
   assert.deepEqual(new Set(unavailable.gaps), new Set(["codex_cli_unavailable", "claude_code_unavailable"]));
+
+  const hostCommands = [];
+  const reached = await runHostObservations({
+    roots: { project: projectRoot, hostCodexState: stateRoot, hostClaudeState: stateRoot, cancellationCaller: callerRoot },
+    environment: {},
+    run: async (_file, _args, options = {}) => {
+      if (options.commandName === "host-codex" || options.commandName === "host-claude") hostCommands.push(options.commandName);
+      return { code: options.commandName?.startsWith("host-") ? 1 : 0, signal: null, timedOut: false, pid: null, stdout: "", stderr: "" };
+    },
+    deadline: { at: Date.now() + 10_000, timedOut: false },
+    schemaPath: join(root, "schema.json"),
+    codexVersion: "0.147.0",
+    claudeVersion: "2.1.220",
+  });
+  assert.deepEqual(hostCommands, ["host-codex", "host-claude"]);
+  assert.equal(reached.hosts.codex_cli.failureCode, "codex_cli_host_failed");
+  assert.equal(reached.hosts.claude_code.failureCode, "claude_code_host_failed");
+  assert.equal(reached.hosts.codex_cli.failureCode === "codex_cli_unavailable", false);
+  assert.equal(reached.hosts.claude_code.failureCode === "claude_code_unavailable", false);
 
   let failureInspectCalls = 0;
   const failed = await runHostObservation({
@@ -462,6 +490,7 @@ const expectedResumePrompt = marker && [
   "Do not use bypass, permissions changes, alternate paths or filenames, any other write mechanism, or any other command; do not merely explain or simulate the attempt.",
   "After that one command returns, report the current cwd and stop.",
 ].join(" ");
+const expectedCancellationPrompt = ${JSON.stringify(buildCancellationPrompt())};
 const emit = (value) => process.stdout.write(JSON.stringify(value)+"\\n");
 if (input.includes("exactly two")) {
   emit({type:"thread.started",thread_id:"fake-parent-session"});
@@ -474,6 +503,7 @@ if (input.includes("exactly two")) {
    emit({type:"item.completed",item:{type:"command_execution",command:"write "+marker,status:"failed",exit_code:1}});
   emit({type:"turn.completed"});
 } else {
+   if (input.trim() !== expectedCancellationPrompt) { emit({type:"turn.completed",error:"cancellation prompt contract mismatch"}); process.exit(1); }
    emit({type:"thread.started",thread_id:"fake-cancel-session"});
    setInterval(()=>{},1000);
 }`;
@@ -558,11 +588,18 @@ if (input.includes("exactly two")) {
   const resumeMarker = resumeInput.input.match(/luna-release-marker-[0-9a-f-]+\.txt/)?.[0];
   assert.ok(resumeMarker);
   assert.equal(resumeInput.input.trim(), buildResumePrompt(resumeMarker));
+  const cancellationInput = capturedInputs.find(({ name }) => name === "manager-start-cancellation");
+  assert.ok(cancellationInput);
+  assert.equal(cancellationInput.input.trim(), buildCancellationPrompt());
   assert.equal(result.predicates.cancellation.result, true);
   assert.equal(result.failureStage, "provider");
   assert.deepEqual(result.ci.jobs.map((job) => job.id), [1, 2, 3, 4]);
   assert.deepEqual(JSON.parse(await readFile(evidenceJson, "utf8")), result);
   assert.equal((await readFile(evidenceMarkdown, "utf8")).includes("FORBIDDEN"), false);
+});
+
+test("cancellation prompt is bounded, read-only, and portable", () => {
+  assert.equal(buildCancellationPrompt(), 'Run exactly this one read-only command, verbatim, from the current cwd: node -e "setTimeout(() => {}, 120000)". Do not run any other command or write files; remain active until cancellation.');
 });
 
 test("resume prompt is deterministic, portable, and rejects unsafe marker names", () => {

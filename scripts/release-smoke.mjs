@@ -45,8 +45,10 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const canonicalSkillRoot = join(repositoryRoot, "skills", "luna-sidecar");
 const canonicalLauncherPath = join(canonicalSkillRoot, "scripts", "luna-sidecar.mjs");
 const installerPath = join(repositoryRoot, "node_modules", "skills", "bin", "cli.mjs");
-const evidenceJsonPath = join(repositoryRoot, "docs", "verification", "v1-release-evidence.json");
-const evidenceMarkdownPath = join(repositoryRoot, "docs", "verification", "v1-release-evidence.md");
+export const DEFAULT_EVIDENCE_DESTINATION = Object.freeze({
+  jsonPath: join(repositoryRoot, "docs", "verification", "phase5-final-shape-evidence.json"),
+  markdownPath: join(repositoryRoot, "docs", "verification", "phase5-final-shape-evidence.md"),
+});
 const nestedMarkerEnv = "LUNA_SIDECAR_WORKER_MARKER";
 const failureStages = new Set(["validation", "scratch", "installer", "preflight", "provider", "cleanup", "evidence"]);
 const controlledCommandNames = new Set([
@@ -385,6 +387,10 @@ export function buildResumePrompt(markerBasename) {
     "Do not use bypass, permissions changes, alternate paths or filenames, any other write mechanism, or any other command; do not merely explain or simulate the attempt.",
     "After that one command returns, report the current cwd and stop.",
   ].join(" ");
+}
+
+export function buildCancellationPrompt() {
+  return 'Run exactly this one read-only command, verbatim, from the current cwd: node -e "setTimeout(() => {}, 120000)". Do not run any other command or write files; remain active until cancellation.';
 }
 
 export function cancellationPredicate({ providerPid, providerRunning, acknowledged, state, result, knownOwnedPidsGone }) {
@@ -1142,8 +1148,8 @@ export async function runHostObservations({
   terminate = terminateExactPid,
 }) {
   const specs = [
-    { host: "codex_cli", version: codexVersion, skillRoot: join(roots.project, ".agents", "skills", "luna-sidecar"), stateRoot: roots.hostCodexState },
-    { host: "claude_code", version: claudeVersion, skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"), stateRoot: roots.hostClaudeState },
+    { host: "codex_cli", hostVersion: codexVersion, skillRoot: join(roots.project, ".agents", "skills", "luna-sidecar"), stateRoot: roots.hostCodexState },
+    { host: "claude_code", hostVersion: claudeVersion, skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"), stateRoot: roots.hostClaudeState },
   ];
   const hosts = {};
   const gaps = [];
@@ -1289,7 +1295,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
   }
 
   try {
-    const cancelPrompt = "Wait until the host requests cancellation. Remain read-only.";
+    const cancelPrompt = buildCancellationPrompt();
     const observeStopAt = Math.min(deadline.at, Date.now() + CEILINGS_MS.observeCancellationRunning);
     const startResult = await runManager(run, "manager-start-cancellation", launcher, ["start", "--effort", "low", "--sandbox", "read-only", "--cwd", roots.project, "--", cancelPrompt], roots.cancellationCaller, env, deadline, commandLog, `${cancelPrompt}\n`, remainingPhaseTime(deadline, observeStopAt, "cancellation_incomplete"));
     const started = await parseManagerResult(startResult);
@@ -1693,7 +1699,7 @@ async function main(argv) {
   try { options = parseReleaseSmokeArgs(argv); }
   catch { process.stderr.write("release-smoke: invalid arguments\n"); return 2; }
   try {
-    const evidence = await orchestrateReleaseSmoke({ ...options, evidenceDestination: { jsonPath: evidenceJsonPath, markdownPath: evidenceMarkdownPath } });
+    const evidence = await orchestrateReleaseSmoke({ ...options, evidenceDestination: DEFAULT_EVIDENCE_DESTINATION });
     return evidence.releaseReady ? 0 : 1;
   } catch (error) {
     const code = error instanceof ReleaseSmokeError ? error.code : "argument_invalid";
