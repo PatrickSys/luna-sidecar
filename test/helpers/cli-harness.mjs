@@ -46,7 +46,7 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
       registerCapturePids(capture, ownedPids);
     }
     await collectManifestPids(stateRoot, ownedPids);
-    await Promise.all([...ownedPids].map((pid) => waitForProcessGone(pid)));
+    for (const pid of ownedPids) await waitForProcessGone(pid);
 
     await removeTestRoot(root);
   });
@@ -141,7 +141,7 @@ export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   }
 
   async function verifyCaptureProcessesGone() {
-    await Promise.all([...ownedPids].map((pid) => waitForProcessGone(pid)));
+    for (const pid of ownedPids) await waitForProcessGone(pid);
   }
 
   function observePid(pid) {
@@ -295,8 +295,6 @@ export async function terminateSpawnedChild(child) {
   if (!pid || child.exitCode !== null || child.signalCode !== null) return;
   rememberSpawnedChildIdentity(child);
   if (process.platform === "win32") {
-    const ownership = await verifyExpectedProcess(pid);
-    if (ownership === "gone") return;
     const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     const result = await waitForChildClose(killer, TERMINATION_WAIT_MS, "taskkill");
     if (result.code !== 0 && isAlive(pid)) throw new Error(`taskkill exited ${result.code} for spawn-owned PID ${pid}`);

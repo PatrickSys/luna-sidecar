@@ -356,7 +356,7 @@ function registerCleanup(t, root) {
       if (!closed) await terminateSpawnedChild(run.child);
     }
 
-    await Promise.all([...pids, ...[...runs].map((run) => run.child.pid)].map((pid) => waitForProcessGone(pid)));
+    for (const pid of [...pids, ...[...runs].map((run) => run.child.pid)]) await waitForProcessGone(pid);
 
     await rm(root, { recursive: true, force: true });
   });
