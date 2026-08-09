@@ -464,7 +464,7 @@ function inspectWindowsProcess(pid) {
       settled = true;
       child.kill();
       resolve({ exists: true, uncertain: true });
-    }, 1_000);
+    }, TERMINATION_WAIT_MS);
     child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
     child.once("error", () => {
       if (!settled) { settled = true; clearTimeout(timer); resolve({ exists: true, uncertain: true }); }
