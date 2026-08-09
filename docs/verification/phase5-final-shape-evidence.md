@@ -1,82 +1,298 @@
-# Luna Sidecar Phase 5 final-shape evidence
+# Luna Sidecar release evidence
 
-This artifact records deterministic local checks for the tested commit. The required CI-bound live host observations were not run: the exact CI query returned no run for the tested commit, so both host claims remain ineligible and release readiness is false.
+This file is a deterministic rendering of the canonical JSON evidence.
 
 ```json
 {
   "schemaVersion": 1,
-  "testedCommit": "dfcb77af9daefa4558a0fa475c3565d7947580a6",
+  "testedCommit": "7dfbc0bcbae7b2d7d0939abecf0efbdb0248ae38",
   "platform": "win32",
   "nodeVersion": "24.14.1",
-  "codexVersion": null,
+  "codexVersion": "0.147.0",
   "skillsVersion": "1.5.22",
-  "roots": [],
-  "installs": [],
-  "ci": null,
+  "roots": [
+    {
+      "role": "project",
+      "relativePath": "project",
+      "pathHash": "c803532da7ca349677aafb14c8e38c2beb0f6624ac8e25fca99b04aabb056af6"
+    },
+    {
+      "role": "installer-home",
+      "relativePath": "installer-home",
+      "pathHash": "8ee06dd408490a74d44377eb77ef175c55a0f871ef1c9a331c714c44cb23cab1"
+    },
+    {
+      "role": "state",
+      "relativePath": "state",
+      "pathHash": "61d75bf69f25399157103ec17ae377d48b4ef68df461d3ee2a0f5177a51ebf7b"
+    },
+    {
+      "role": "parent-caller",
+      "relativePath": "parent-caller",
+      "pathHash": "b25e0a2a1f33e68e60d76f326848c1039c82c389a05aa7f607e2b4221f891ecf"
+    },
+    {
+      "role": "resume-caller",
+      "relativePath": "resume-caller",
+      "pathHash": "bbfeb626a6cb8ceb6bb70591d9652872c78228ae3bd928c2ee680d096272f206"
+    },
+    {
+      "role": "cancellation-caller",
+      "relativePath": "cancellation-caller",
+      "pathHash": "4f90ddd56f2cad01dfad361a7c169a7a823de19fc1eb05855902124abe236aac"
+    },
+    {
+      "role": "temp",
+      "relativePath": "temp",
+      "pathHash": "dfd3d3c325deded879c989b33c031ba571bc6e16594374b6c05557ad62b02494"
+    },
+    {
+      "role": "canonical-source",
+      "relativePath": "repository/skills/luna-sidecar",
+      "pathHash": "3a447a4221f9cc10ac13799a05ad5e5e64692cc297f63ec6ab7bed03a1b8e45d"
+    }
+  ],
+  "installs": [
+    {
+      "agent": "codex",
+      "relativePath": ".agents/skills/luna-sidecar",
+      "manifestHash": "71e9acd01d73e54ac2460ed58d8ad83ba4dd4aa75907d98892ed6ce55a284514"
+    },
+    {
+      "agent": "claude-code",
+      "relativePath": ".claude/skills/luna-sidecar",
+      "manifestHash": "71e9acd01d73e54ac2460ed58d8ad83ba4dd4aa75907d98892ed6ce55a284514"
+    },
+    {
+      "agent": "canonical",
+      "relativePath": "skills/luna-sidecar",
+      "manifestHash": "71e9acd01d73e54ac2460ed58d8ad83ba4dd4aa75907d98892ed6ce55a284514"
+    }
+  ],
+  "ci": {
+    "runId": "31340386540",
+    "headSha": "7dfbc0bcbae7b2d7d0939abecf0efbdb0248ae38",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 93313074971,
+        "name": "windows-latest / Node 22.20.0",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 93313075016,
+        "name": "windows-latest / Node 24.x",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 93313074990,
+        "name": "ubuntu-latest / Node 22.20.0",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 93313075014,
+        "name": "ubuntu-latest / Node 24.x",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
   "hosts": {
     "codex_cli": {
-      "available": false,
-      "invocationRef": null,
-      "procedureRef": null,
-      "hostVersion": null,
+      "available": true,
+      "invocationRef": "evidence://codex-cli/observation-1",
+      "procedureRef": "release-smoke.codex_cli.v1",
+      "hostVersion": "0.147.0",
       "sidecarReceipt": {
         "schemaVersion": 2,
-        "schemaResult": "not_run"
+        "schemaResult": "invalid"
       },
       "cleanup": {
-        "result": "not_run",
-        "ownedPidResult": "not_run",
+        "result": "verified",
+        "ownedPidResult": "all_gone",
         "ownedPids": [],
-        "ownedPidsGone": false
+        "ownedPidsGone": true
       },
-      "failureCode": "ci_unavailable",
+      "failureDiagnostics": null,
+      "failureCode": "host_schema_mismatch",
       "claimEligible": false
     },
     "claude_code": {
-      "available": false,
-      "invocationRef": null,
-      "procedureRef": null,
-      "hostVersion": null,
+      "available": true,
+      "invocationRef": "evidence://claude-code/observation-1",
+      "procedureRef": "release-smoke.claude_code.v1",
+      "hostVersion": "2.1.220",
       "sidecarReceipt": {
         "schemaVersion": 2,
-        "schemaResult": "not_run"
+        "schemaResult": "invalid"
       },
       "cleanup": {
-        "result": "not_run",
-        "ownedPidResult": "not_run",
+        "result": "verified",
+        "ownedPidResult": "all_gone",
         "ownedPids": [],
-        "ownedPidsGone": false
+        "ownedPidsGone": true
       },
-      "failureCode": "ci_unavailable",
+      "failureDiagnostics": {
+        "kind": "auth",
+        "exitCode": 1,
+        "signal": null,
+        "spawnError": null,
+        "stdout": {
+          "present": true,
+          "summary": "Not logged in · Please run /login",
+          "truncated": false
+        },
+        "stderr": {
+          "present": false,
+          "summary": "",
+          "truncated": false
+        }
+      },
+      "failureCode": "claude_code_host_failed",
       "claimEligible": false
     }
   },
   "otherGates": {
     "deterministic": true,
     "installedParity": true,
-    "ci": false,
+    "ci": true,
     "delivery": true,
     "evidence": true
   },
-  "commands": [],
+  "commands": [
+    {
+      "name": "git-init",
+      "exitCode": 0
+    },
+    {
+      "name": "installer",
+      "exitCode": 0
+    },
+    {
+      "name": "git-status",
+      "exitCode": 0
+    },
+    {
+      "name": "git-head",
+      "exitCode": 0
+    },
+    {
+      "name": "ci-run",
+      "exitCode": 0
+    },
+    {
+      "name": "codex-version",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-start-parent",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-wait-parent",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-resume",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-wait-resume",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-start-cancellation",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-status-cancellation",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-cancel",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-wait-cancellation",
+      "exitCode": 0
+    },
+    {
+      "name": "claude-version",
+      "exitCode": 0
+    },
+    {
+      "name": "host-codex",
+      "exitCode": 0
+    },
+    {
+      "name": "host-claude",
+      "exitCode": 1
+    },
+    {
+      "name": "manager-cancel",
+      "exitCode": 0
+    },
+    {
+      "name": "manager-cancel",
+      "exitCode": 0
+    }
+  ],
   "predicates": {
-    "sixCommandSurface": true,
-    "explicitControls": true,
-    "readiness": true,
-    "zeroDefaultRetry": true,
-    "providerOwnedMcp": true,
-    "usagePassthroughOrUnavailable": true,
-    "boundedListHistory": true
+    "outerTimedOut": false,
+    "parent": {
+      "authority": true,
+      "cwd": true,
+      "lineage": true,
+      "completed": true,
+      "providerCompleted": true,
+      "logs": true,
+      "nativeChildCount": 2
+    },
+    "resume": {
+      "authority": true,
+      "cwd": true,
+      "lineage": true,
+      "completed": true,
+      "providerCompleted": true,
+      "logs": true,
+      "markerCommandFailed": true,
+      "markerAbsent": true
+    },
+    "cancellation": {
+      "authority": true,
+      "cwd": true,
+      "lineage": true,
+      "providerRunningBeforeCancel": true,
+      "acknowledged": true,
+      "cancelled": true,
+      "result": true,
+      "knownPidsGone": true
+    },
+    "nativeChildCount": 2
   },
   "cleanup": {
-    "attempted": false,
-    "releaseReady": false
+    "attempted": true,
+    "launchedWorkerCount": 2,
+    "discoveredWorkerCount": 2,
+    "ownedPidCount": 6,
+    "stopFailures": 0,
+    "identityUncertain": 0,
+    "identityMismatches": 0,
+    "lingeringPids": 0,
+    "recoveryUsed": false,
+    "scratchCleanupFailed": false,
+    "releaseReady": true
   },
   "unresolvedGaps": [
-    "ci_unavailable"
+    "claude_code_host_failed",
+    "host_schema_mismatch"
   ],
-  "claim": "Agent Skills copied-install portability and deterministic Codex CLI process evidence for the recorded commit, platforms, and CI run only; no live provider task-success or universal-host claim.",
+  "claim": "Agent Skills copied-install portability plus bounded Codex CLI and Claude Code host observations for the recorded commit, platforms, and CI run only; no task-success or universal-host claim.",
   "releaseReady": false,
-  "failureStage": "preflight"
+  "failureStage": "provider"
 }
 ```
