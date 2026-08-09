@@ -92,6 +92,7 @@ test("a definitely dead pre-readiness runner persists sealed unknown cleanup", a
   const beforeTurn = beforeManifest.turns.at(-1);
   const runner = beforeManifest.runnerPid;
   await terminateOwnedPid(runner);
+  await started;
   const status = await harness.invoke(["status", workerId]);
   assert.equal(status.json().state, "unknown");
   assert.equal(status.json().errorCode, "runner_died");
@@ -116,8 +117,6 @@ test("a definitely dead pre-readiness runner persists sealed unknown cleanup", a
   const waited = await harness.invoke(["wait", workerId, "--timeout", "10"]);
   assert.equal(waited.json().state, "unknown");
   assert.equal(waited.json().timedOut, false);
-  await writeFile(join(harness.stateRoot, "1.start.barrier"), "release\n", "utf8");
-  await started;
   const resumed = await harness.invoke(["resume", workerId, "--", "must reject"], { scenario: {} });
   assert.equal(resumed.code, 1);
   assert.equal(resumed.json().error.code, "worker_unknown");
