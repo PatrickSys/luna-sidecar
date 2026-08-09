@@ -67,7 +67,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 ## Phase 3 — Observation and safeguards
 
-**Status:** `[ ]`
+**Status:** `[x]`
 
 **Plan:** [`phases/03-observation-and-safety/03-PLAN.md`](phases/03-observation-and-safety/03-PLAN.md)
 
