@@ -687,7 +687,7 @@ function normalizePredicateObject(value, allowedKeys) {
 
 function normalizePredicates(value) {
   const allowed = {
-    top: new Set(["outerTimedOut", "parent", "resume", "cancellation", "nativeChildCount"]),
+    top: new Set(["outerTimedOut", "parent", "resume", "cancellation", "nativeChildCount", "sixCommandSurface", "explicitControls", "readiness", "zeroDefaultRetry", "providerOwnedMcp", "usagePassthroughOrUnavailable", "boundedListHistory"]),
     parent: new Set(["authority", "cwd", "lineage", "completed", "providerCompleted", "logs", "nativeChildCount"]),
     resume: new Set(["authority", "cwd", "lineage", "completed", "providerCompleted", "logs", "markerCommandFailed", "markerAbsent"]),
     cancellation: new Set(["authority", "cwd", "lineage", "providerRunningBeforeCancel", "acknowledged", "cancelled", "result", "knownPidsGone"]),
