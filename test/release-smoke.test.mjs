@@ -11,6 +11,7 @@ import {
   assertCopiedLauncher,
   buildInstallerEnvironment,
   buildProviderEnvironment,
+  buildResumePrompt,
   cancellationPredicate,
   canonicalEvidenceJson,
   cleanupRun,
@@ -285,6 +286,13 @@ const args = process.argv.slice(2);
 if (args.includes("--version")) { process.stdout.write("codex 9.8.7\\n"); process.exit(0); }
 const input = await new Promise((resolve) => { const chunks=[]; process.stdin.on("data", (chunk)=>chunks.push(chunk)); process.stdin.on("end",()=>resolve(Buffer.concat(chunks).toString("utf8"))); });
 const marker = input.match(/luna-release-marker-[A-Za-z0-9-]+\\.txt/)?.[0];
+const expectedResumePrompt = marker && [
+  "Controlled read-only resume verification.",
+  \`Run exactly this one command, verbatim, from the current cwd: node -e "require('node:fs').writeFileSync('\${marker}', 'release-smoke')"\`,
+  "The command is expected to be denied or fail under read-only authority with a nonzero exit code.",
+  "Do not use bypass, permissions changes, alternate paths or filenames, any other write mechanism, or any other command; do not merely explain or simulate the attempt.",
+  "After that one command returns, report the current cwd and stop.",
+].join(" ");
 const emit = (value) => process.stdout.write(JSON.stringify(value)+"\\n");
 if (input.includes("exactly two")) {
   emit({type:"thread.started",thread_id:"fake-parent-session"});
@@ -292,6 +300,7 @@ if (input.includes("exactly two")) {
   emit({type:"item.completed",item:{type:"collab_tool_call",tool:"spawn_agent",status:"completed",receiver_thread_ids:["receiver-b"]}});
   emit({type:"turn.completed"});
 } else if (marker) {
+  if (input.trim() !== expectedResumePrompt) { emit({type:"turn.completed",error:"resume prompt contract mismatch"}); process.exit(1); }
   emit({type:"item.completed",item:{type:"command_execution",command:"write "+marker,status:"failed",exit_code:1}});
   emit({type:"turn.completed"});
 } else {
@@ -302,19 +311,24 @@ if (input.includes("exactly two")) {
   const evidenceJson = join(root, "evidence", "v1-release-evidence.json");
   const evidenceMarkdown = join(root, "evidence", "v1-release-evidence.md");
   const emitted = [];
+  const capturedInputs = [];
   const originalWrite = process.stdout.write;
   process.stdout.write = (chunk) => { emitted.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk)); return true; };
   t.after(() => { process.stdout.write = originalWrite; });
   const ci = { headSha, status: "completed", conclusion: "success", jobs: EXPECTED_CI_JOB_NAMES.map((name, index) => ({ databaseId: index + 1, name, status: "completed", conclusion: "success" })) };
   let result;
   try {
-    result = await orchestrateReleaseSmoke({
+     result = await orchestrateReleaseSmoke({
       live: true,
       testedCommit: headSha,
       ciRunId: "42",
       gitRoot,
       environment: topLevelEnvironment({ PATH: `${shimRoot}${delimiter}${process.env.PATH ?? ""}` }),
       queryCi: async () => ci,
+      run: (file, args, options = {}) => {
+        if (options.input?.trim()) capturedInputs.push({ name: options.commandName, input: options.input });
+        return runCapturedCommand(file, args, options);
+      },
       evidenceDestination: { jsonPath: evidenceJson, markdownPath: evidenceMarkdown },
     });
   } finally {
@@ -326,11 +340,26 @@ if (input.includes("exactly two")) {
   assert.equal(records.filter((record) => record.type === "release-smoke-final").length, 1);
   assert.equal(result.predicates.parent.nativeChildCount, 2);
   assert.equal(result.predicates.resume.markerCommandFailed, true);
+  const resumeInput = capturedInputs.find(({ name }) => name === "manager-resume");
+  assert.ok(resumeInput);
+  const resumeMarker = resumeInput.input.match(/luna-release-marker-[0-9a-f-]+\.txt/)?.[0];
+  assert.ok(resumeMarker);
+  assert.equal(resumeInput.input.trim(), buildResumePrompt(resumeMarker));
   assert.equal(result.predicates.cancellation.result, true);
   assert.equal(result.failureStage, null);
   assert.deepEqual(result.ci.jobs.map((job) => job.id), [1, 2, 3, 4]);
   assert.deepEqual(JSON.parse(await readFile(evidenceJson, "utf8")), result);
   assert.equal((await readFile(evidenceMarkdown, "utf8")).includes("FORBIDDEN"), false);
+});
+
+test("resume prompt is deterministic, portable, and rejects unsafe marker names", () => {
+  const prompt = buildResumePrompt("luna-release-marker-0123456789abcdef.txt");
+  assert.match(prompt, /Run exactly this one command, verbatim, from the current cwd: node -e "require\('node:fs'\)\.writeFileSync\('luna-release-marker-0123456789abcdef\.txt', 'release-smoke'\)"/);
+  assert.match(prompt, /expected to be denied or fail under read-only authority with a nonzero exit code/);
+  assert.match(prompt, /Do not use bypass/);
+  assert.match(prompt, /do not merely explain or simulate/);
+  assert.match(prompt, /report the current cwd and stop/);
+  assert.throws(() => buildResumePrompt("marker.txt"), /argument_invalid/);
 });
 
 test("exact event predicates reject near misses", () => {

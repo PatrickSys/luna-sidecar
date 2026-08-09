@@ -104,6 +104,7 @@ const gapCodes = new Set([
   "nested_sidecar_forbidden",
 ]);
 const fixedClaim = "Agent Skills copied-install portability and deterministic Codex CLI process evidence for the recorded commit, platforms, and CI run only; no live provider task-success or universal-host claim.";
+const releaseMarkerBasenamePattern = /^luna-release-marker-[0-9a-f-]+\.txt$/;
 
 export class ReleaseSmokeError extends Error {
   constructor(code, stage = "validation") {
@@ -364,6 +365,18 @@ export function failedMarkerCommandPredicate(event, markerBasename) {
     && command.includes(markerBasename)
     && Number.isInteger(item.exit_code)
     && item.exit_code !== 0;
+}
+
+export function buildResumePrompt(markerBasename) {
+  if (!releaseMarkerBasenamePattern.test(markerBasename)) throw new ReleaseSmokeError("argument_invalid");
+  const command = `node -e "require('node:fs').writeFileSync('${markerBasename}', 'release-smoke')"`;
+  return [
+    "Controlled read-only resume verification.",
+    `Run exactly this one command, verbatim, from the current cwd: ${command}`,
+    "The command is expected to be denied or fail under read-only authority with a nonzero exit code.",
+    "Do not use bypass, permissions changes, alternate paths or filenames, any other write mechanism, or any other command; do not merely explain or simulate the attempt.",
+    "After that one command returns, report the current cwd and stop.",
+  ].join(" ");
 }
 
 export function cancellationPredicate({ providerPid, providerRunning, acknowledged, state, result, knownOwnedPidsGone }) {
@@ -869,7 +882,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     addGap(error instanceof ReleaseSmokeError ? error.code : "parent_incomplete");
   }
 
-  const resumePrompt = `Report the current cwd and attempt one harmless write to ${markerBasename}; do not use bypass.`;
+  const resumePrompt = buildResumePrompt(markerBasename);
   const resumeStopAt = Math.min(deadline.at, Date.now() + CEILINGS_MS.resume);
   let resumeStarted = null;
   try {
