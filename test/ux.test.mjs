@@ -16,9 +16,10 @@ test("skill metadata and guidance define the narrow host-facing activation bound
 
   assert.match(skill, /description:.*human explicitly mentions.*Luna subagent.*Luna sidecar.*sidecar.*case-insensitively/i);
   assert.match(skill, /Use this skill only after the human explicitly mentions.*Luna subagent.*Luna sidecar.*sidecar/s);
-  assert.match(skill, /host agent owns commands, worker IDs, lifecycle results, and the final report/i);
-  assert.match(skill, /workspace-write.*compatibility behavior, not inferred approval/i);
-  assert.match(skill, /explicit cwd, sandbox, or bypass change/i);
+  assert.match(skill, /host agent owns .*commands, worker IDs, lifecycle results, and the final report/i);
+  assert.match(skill, /every start names an absolute existing cwd, sandbox, effort, and one bounded task/i);
+  assert.match(skill, /--cwd .*--sandbox read-only --effort high/);
+  assert.match(skill, /read-only.*workspace-write.*full-access.*explicit host choices/i);
   assert.match(skill, /direct human intent/i);
   assert.match(skill, /independent workers/i);
   assert.match(skill, /native subagents/i);
@@ -28,27 +29,29 @@ test("skill metadata and guidance define the narrow host-facing activation bound
   assert.match(skill, /state root, raw logs, and provider final messages are sensitive/i);
   assert.match(skill, /compact receipts use an allowlist/i);
   assert.match(skill, /\[references\/USAGE\.md\]\(references\/USAGE\.md\)/);
-  assert.match(skill, /scripts\/luna-sidecar\.mjs" start --effort high --read-only/);
+  assert.match(skill, /scripts\/luna-sidecar\.mjs" start --cwd .*--sandbox read-only --effort high/);
   assert.match(skill, /scripts\/luna-sidecar\.mjs" --help/);
 
   for (const pattern of [/Web research/, /Local inspection/, /Audit/, /Adversarial review/, /Planning/, /Execution/]) {
     assert.match(usage, pattern);
   }
   assert.match(usage, /not CLI modes or runtime task types/i);
-  assert.match(usage, /starting.*runner record.*provider spawn/s);
-  assert.match(usage, /completed.*not proof.*task succeeded/s);
-  assert.match(usage, /unknown.*terminal.*new `start`/s);
-  assert.match(usage, /cancellation timeout or failure.*not.*cancelled/s);
+  assert.match(usage, /start.*thread\.started.*readiness\/running/s);
+  assert.match(usage, /Operational completion is not task success/i);
+  assert.match(usage, /unknown state.*new `start`/s);
+  assert.match(usage, /cancellation timeout or failure.*not.*cancelled/is);
   assert.match(usage, /taskOutcome: not_evaluated/);
   for (const command of ["start", "status", "wait", "resume", "cancel", "list"]) {
     assert.match(usage, new RegExp(`luna-sidecar\\.mjs\\" ${command}`));
   }
   assert.doesNotMatch(usage, /--(research|inspection|audit|adversarial|planning|execution)\b/);
+  assert.doesNotMatch(`${skill}\n${usage}`, /luna-sidecar\.mjs" (run|stop)\b/);
 
   assert.match(readme, /Agent Skill asset.*zero-dependency Node launcher/i);
   assert.match(readme, /human asks the host agent/i);
   assert.match(readme, /does not add a host adapter.*every host routes skill metadata/i);
-  assert.match(readme, /does not claim universal-host behavior, live Claude execution/i);
+  assert.match(readme, /start --cwd .*--sandbox read-only --effort high/);
+  assert.match(readme, /does not claim universal-host behavior|Missing host evidence keeps release readiness false/i);
 });
 
 test("global and public command help are plain, successful, and side-effect free", async (t) => {

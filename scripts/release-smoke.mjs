@@ -99,6 +99,7 @@ const gapCodes = new Set([
   "cleanup_empty_ownership",
   "cleanup_recovery_used",
   "scratch_cleanup_failed",
+  "claude_code_unavailable",
   "evidence_write_failed",
   "nested_sidecar_forbidden",
 ]);
@@ -604,6 +605,8 @@ export function redactEvidence(input) {
       .sort((left, right) => EXPECTED_CI_JOB_NAMES.indexOf(left.name) - EXPECTED_CI_JOB_NAMES.indexOf(right.name)),
   } : null;
   const commands = (input.commands ?? []).map((command) => ({ name: controlledCommandNames.has(command.name) ? command.name : "unknown", exitCode: Number.isInteger(command.exitCode) ? command.exitCode : null }));
+  const hosts = normalizeHosts(input.hosts);
+  const otherGates = normalizeOtherGates(input.otherGates);
   return {
     schemaVersion: 1,
     testedCommit: /^[0-9a-f]{40}$/i.test(String(input.testedCommit ?? "")) ? String(input.testedCommit).toLowerCase() : null,
@@ -614,6 +617,8 @@ export function redactEvidence(input) {
     roots,
     installs,
     ci,
+    hosts,
+    otherGates,
     commands,
     predicates: normalizePredicates(input.predicates),
     cleanup: normalizeCleanup(input.cleanup),
@@ -622,6 +627,51 @@ export function redactEvidence(input) {
     releaseReady: input.releaseReady === true,
     failureStage: failureStages.has(input.failureStage) ? input.failureStage : null,
   };
+}
+
+function normalizeHosts(value) {
+  const output = {};
+  for (const name of ["codex_cli", "claude_code"]) {
+    const host = value?.[name] && typeof value[name] === "object" ? value[name] : {};
+    const receipt = host.sidecarReceipt && typeof host.sidecarReceipt === "object" ? host.sidecarReceipt : {};
+    const cleanup = host.cleanup && typeof host.cleanup === "object" ? host.cleanup : {};
+    const available = host.available === true;
+    const schemaResult = ["valid", "missing", "invalid", "not_run"].includes(receipt.schemaResult) ? receipt.schemaResult : "not_run";
+    const cleanupResult = ["verified", "uncertain", "not_run"].includes(cleanup.result) ? cleanup.result : "not_run";
+    const ownedPidResult = ["all_gone", "uncertain", "lingering", "not_run"].includes(cleanup.ownedPidResult) ? cleanup.ownedPidResult : "not_run";
+    const eligible = available
+      && typeof host.invocationRef === "string" && host.invocationRef.length > 0
+      && typeof host.procedureRef === "string" && host.procedureRef.length > 0
+      && safeVersion(host.hostVersion)
+      && receipt.schemaVersion === 2
+      && schemaResult === "valid"
+      && cleanupResult === "verified"
+      && ownedPidResult === "all_gone"
+      && cleanup.ownedPidsGone === true
+      && host.failureCode === null;
+    output[name] = {
+      available,
+      invocationRef: typeof host.invocationRef === "string" && host.invocationRef.length > 0 ? host.invocationRef : null,
+      procedureRef: typeof host.procedureRef === "string" && host.procedureRef.length > 0 ? host.procedureRef : null,
+      hostVersion: safeVersion(host.hostVersion),
+      sidecarReceipt: { schemaVersion: receipt.schemaVersion === 2 ? 2 : null, schemaResult },
+      cleanup: {
+        result: cleanupResult,
+        ownedPidResult,
+        ownedPids: [],
+        ownedPidsGone: cleanup.ownedPidsGone === true,
+      },
+      failureCode: typeof host.failureCode === "string" && host.failureCode.length > 0 ? host.failureCode : (eligible ? null : "host_evidence_invalid"),
+      claimEligible: eligible,
+    };
+  }
+  return output;
+}
+
+function normalizeOtherGates(value) {
+  const defaults = { deterministic: false, installedParity: false, ci: false, delivery: false, evidence: false };
+  if (!value || typeof value !== "object") return defaults;
+  return Object.fromEntries(Object.keys(defaults).map((key) => [key, value[key] === true]));
 }
 
 function normalizePredicateObject(value, allowedKeys) {
@@ -1100,6 +1150,14 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
     { agent: "claude-code", relativePath: relative(roots.project, install.roots.claude).split(sep).join("/"), manifestHash: install.manifestHashes.claude },
     { agent: "canonical", relativePath: "skills/luna-sidecar", manifestHash: install.manifestHashes.canonical },
   ] : [];
+  const hosts = buildHostEvidence({ codexVersion, scenarios, cleanup, gaps: allGaps });
+  const otherGates = {
+    deterministic: scenarios?.gaps?.length === 0,
+    installedParity: Boolean(install),
+    ci: Boolean(ci),
+    delivery: Boolean(options.testedCommit),
+    evidence: true,
+  };
   return redactEvidence({
     testedCommit: options.testedCommit,
     platform: process.platform,
@@ -1109,6 +1167,8 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
     rootRoles,
     installs,
     ci: ci ? { ...ci, runId: options.ciRunId } : null,
+    hosts,
+    otherGates,
     commands,
     predicates: {
       outerTimedOut,
@@ -1119,9 +1179,46 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
     },
     cleanup: cleanup?.facts ? { ...cleanup.facts, releaseReady: cleanup.result?.releaseReady === true } : { attempted: false, releaseReady: false },
     unresolvedGaps: allGaps,
-    releaseReady: allGaps.length === 0 && Boolean(scenarios?.gaps?.length === 0) && Boolean(cleanup?.result?.releaseReady) && !outerTimedOut,
+    releaseReady: Object.values(hosts).every((host) => host.claimEligible) && Object.values(otherGates).every(Boolean) && !outerTimedOut,
     failureStage,
   });
+}
+
+function buildHostEvidence({ codexVersion, scenarios, cleanup, gaps }) {
+  const cleanupVerified = cleanup?.result?.releaseReady === true && cleanup.processesGone === true;
+  const codexReady = Boolean(codexVersion && scenarios?.gaps?.length === 0 && cleanupVerified);
+  return {
+    codex_cli: {
+      available: Boolean(codexVersion),
+      invocationRef: codexVersion ? "evidence://codex-cli/observation-1" : null,
+      procedureRef: codexVersion ? "release-smoke.codex_cli.v1" : null,
+      hostVersion: codexVersion ?? null,
+      sidecarReceipt: { schemaVersion: 2, schemaResult: codexVersion ? (scenarios?.gaps?.length === 0 ? "valid" : "invalid") : "not_run" },
+      cleanup: hostCleanupEvidence(cleanup),
+      failureCode: codexReady ? null : (scenarios?.gaps?.[0] ?? gaps.find((code) => code !== "claude_code_unavailable") ?? "codex_cli_unavailable"),
+      claimEligible: codexReady,
+    },
+    claude_code: {
+      available: false,
+      invocationRef: null,
+      procedureRef: null,
+      hostVersion: null,
+      sidecarReceipt: { schemaVersion: 2, schemaResult: "not_run" },
+      cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
+      failureCode: "claude_code_unavailable",
+      claimEligible: false,
+    },
+  };
+}
+
+function hostCleanupEvidence(cleanup) {
+  const verified = cleanup?.result?.releaseReady === true && cleanup.processesGone === true;
+  return {
+    result: verified ? "verified" : (cleanup?.facts?.attempted ? "uncertain" : "not_run"),
+    ownedPidResult: verified ? "all_gone" : (cleanup?.processesGone === false ? "lingering" : "uncertain"),
+    ownedPids: [],
+    ownedPidsGone: verified,
+  };
 }
 
 export async function orchestrateReleaseSmoke(options = {}) {

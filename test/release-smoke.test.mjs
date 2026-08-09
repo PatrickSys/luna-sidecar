@@ -350,7 +350,19 @@ if (input.includes("exactly two")) {
     process.stdout.write = originalWrite;
   }
   const records = emitted.join("").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-  assert.equal(result.releaseReady, true, JSON.stringify(result));
+  assert.equal(result.releaseReady, false, JSON.stringify(result));
+  assert.equal(result.hosts.codex_cli.available, true);
+  assert.equal(result.hosts.codex_cli.sidecarReceipt.schemaVersion, 2);
+  assert.equal(result.hosts.codex_cli.sidecarReceipt.schemaResult, "valid");
+  assert.equal(result.hosts.codex_cli.cleanup.ownedPidResult, "all_gone");
+  assert.equal(result.hosts.codex_cli.claimEligible, true);
+  assert.equal(result.hosts.claude_code.available, false);
+  assert.equal(result.hosts.claude_code.sidecarReceipt.schemaResult, "not_run");
+  assert.equal(result.hosts.claude_code.failureCode, "claude_code_unavailable");
+  assert.equal(result.hosts.claude_code.claimEligible, false);
+  assert.equal(result.otherGates.deterministic, true);
+  assert.equal(result.otherGates.installedParity, true);
+  assert.equal(result.otherGates.ci, true);
   assert.equal(records.filter((record) => record.type === "release-smoke-preflight").length, 1);
   assert.equal(records.filter((record) => record.type === "release-smoke-final").length, 1);
   assert.equal(result.predicates.parent.nativeChildCount, 2);
