@@ -55,6 +55,9 @@ const controlledCommandNames = new Set([
   "git-head",
   "installer",
   "codex-version",
+  "claude-version",
+  "host-codex",
+  "host-claude",
   "manager-start-parent",
   "manager-wait-parent",
   "manager-resume",
@@ -77,6 +80,12 @@ const gapCodes = new Set([
   "install_hash_drift",
   "source_launcher_fallback",
   "provider_version_invalid",
+  "codex_cli_unavailable",
+  "claude_code_unavailable",
+  "codex_cli_host_failed",
+  "claude_code_host_failed",
+  "host_observation_timeout",
+  "host_schema_mismatch",
   "repository_dirty",
   "tested_commit_mismatch",
   "ci_unavailable",
@@ -99,11 +108,10 @@ const gapCodes = new Set([
   "cleanup_empty_ownership",
   "cleanup_recovery_used",
   "scratch_cleanup_failed",
-  "claude_code_unavailable",
   "evidence_write_failed",
   "nested_sidecar_forbidden",
 ]);
-const fixedClaim = "Agent Skills copied-install portability and deterministic Codex CLI process evidence for the recorded commit, platforms, and CI run only; no live provider task-success or universal-host claim.";
+const fixedClaim = "Agent Skills copied-install portability plus bounded Codex CLI and Claude Code host observations for the recorded commit, platforms, and CI run only; no task-success or universal-host claim.";
 const releaseMarkerBasenamePattern = /^luna-release-marker-[0-9a-f-]+\.txt$/;
 
 export class ReleaseSmokeError extends Error {
@@ -840,6 +848,300 @@ function runCodexCommand(run, name, args, cwd, env, deadline, commandLog, timeou
   return run("codex", args, { cwd, env, deadline, timeout, commandLog, commandName: name });
 }
 
+const hostObservationSchema = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["schemaVersion", "skill", "workflow", "taskOutcome", "sidecarReceipt"],
+  properties: {
+    schemaVersion: { const: 1 },
+    skill: { const: "luna-sidecar" },
+    workflow: { const: "subagent" },
+    taskOutcome: { const: "not_evaluated" },
+    sidecarReceipt: { type: "object" },
+  },
+});
+const hostCommands = Object.freeze({ codex_cli: "codex", claude_code: "claude" });
+
+export function hostObservationPrompt() {
+  return [
+    "The human explicitly requested the Luna Sidecar skill.",
+    "Activate the installed project skill with /luna-sidecar and use it as the host skill/subagent workflow.",
+    "Do not invoke the launcher from the canonical source or substitute a direct manager call outside the skill workflow.",
+    "Delegate exactly one bounded read-only task: inspect the installed luna-sidecar skill files and report only their six public commands.",
+    "Start one worker with explicit cwd, sandbox, and effort from the skill instructions, wait for it, and harvest the exact final v2 sidecar receipt.",
+    "Do not claim the delegated task succeeded; taskOutcome must remain not_evaluated.",
+    "Return exactly one JSON object with this shape and no Markdown: {\"schemaVersion\":1,\"skill\":\"luna-sidecar\",\"workflow\":\"subagent\",\"taskOutcome\":\"not_evaluated\",\"sidecarReceipt\":<exact final v2 receipt>}.",
+  ].join(" ");
+}
+
+export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, environment = process.env }) {
+  if (!isAbsolute(projectRoot) || !isAbsolute(skillRoot) || !isAbsolute(schemaPath)) throw new ReleaseSmokeError("scratch_invalid", "provider");
+  if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
+  const args = host === "codex_cli"
+    ? ["exec", "--json", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
+    : ["-p", "--bare", "--output-format", "stream-json", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", projectRoot];
+  return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(), cwd: projectRoot };
+}
+
+function wrapHostCommand(host, args, environment) {
+  const command = hostCommands[host];
+  if (!command) throw new ReleaseSmokeError("argument_invalid");
+  if (process.platform === "win32") return { file: environment.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c", command, ...args] };
+  return { file: command, args };
+}
+
+export async function probeHostVersion({ host, run, environment, cwd, deadline, commandLog }) {
+  const invocation = wrapHostCommand(host, ["--version"], environment);
+  const result = await run(invocation.file, invocation.args, { cwd, env: environment, deadline, timeout: CEILINGS_MS.cancellation, commandLog, commandName: host === "codex_cli" ? "codex-version" : "claude-version" });
+  if (result.timedOut || result.code !== 0 || result.signal) return { available: false, version: null, result };
+  const version = versionFromOutput(result.stdout);
+  return { available: Boolean(version), version, result };
+}
+
+function parseJsonLines(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const events = [];
+  for (const line of lines) {
+    try { events.push(JSON.parse(line)); }
+    catch { return null; }
+  }
+  return events;
+}
+
+function collectHostCommands(value, output = []) {
+  if (!value || typeof value !== "object") return output;
+  if (Array.isArray(value)) {
+    for (const item of value) collectHostCommands(item, output);
+    return output;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (["command", "cmd"].includes(key) && typeof item === "string") output.push(item);
+    collectHostCommands(item, output);
+  }
+  return output;
+}
+
+function collectHostOutputStrings(value, output = []) {
+  if (!value || typeof value !== "object") return output;
+  if (Array.isArray(value)) {
+    for (const item of value) collectHostOutputStrings(item, output);
+    return output;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (["aggregated_output", "output", "stdout", "content", "text"].includes(key) && typeof item === "string") output.push(item);
+    collectHostOutputStrings(item, output);
+  }
+  return output;
+}
+
+function parseObjectCandidates(text) {
+  const candidates = [];
+  for (const line of String(text ?? "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object") candidates.push(parsed);
+    } catch {}
+  }
+  return candidates;
+}
+
+function isSidecarReceipt(value) {
+  return value && typeof value === "object"
+    && value.schemaVersion === 2
+    && typeof value.workerId === "string" && value.workerId.length > 0
+    && typeof value.turnId === "string" && value.turnId.length > 0;
+}
+
+function finalHostPayload(events) {
+  const candidates = [];
+  for (const event of events) {
+    if (event?.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") candidates.push(...parseObjectCandidates(event.item.text));
+    if (event?.type === "result" && typeof event.result === "string") candidates.push(...parseObjectCandidates(event.result));
+    if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
+      for (const block of event.message.content) if (typeof block?.text === "string") candidates.push(...parseObjectCandidates(block.text));
+    }
+    if (event?.structured_output && typeof event.structured_output === "object") candidates.push(event.structured_output);
+  }
+  return candidates.at(-1) ?? null;
+}
+
+export function parseHostObservationResult(host, result, { projectRoot, skillRoot }) {
+  const events = parseJsonLines(result.stdout);
+  if (!events || events.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  const commands = events.flatMap((event) => collectHostCommands(event));
+  const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
+  const copiedSkillCommand = commands.some((command) => {
+    const normalized = command.replaceAll("\\", "/").toLowerCase();
+    return normalized.includes(expectedSkillRoot) && normalized.includes("luna-sidecar.mjs") && /(?:^|\s)start(?:\s|$)/.test(normalized);
+  });
+  if (!copiedSkillCommand) throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  const receipts = events.flatMap((event) => collectHostOutputStrings(event)).flatMap((text) => parseObjectCandidates(text)).filter(isSidecarReceipt);
+  const payload = finalHostPayload(events);
+  if (!payload || payload.schemaVersion !== 1 || payload.skill !== "luna-sidecar" || payload.workflow !== "subagent" || payload.taskOutcome !== "not_evaluated" || !isSidecarReceipt(payload.sidecarReceipt)) {
+    throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  }
+  const observed = receipts.find((receipt) => receipt.workerId === payload.sidecarReceipt.workerId && receipt.turnId === payload.sidecarReceipt.turnId);
+  if (!observed || payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
+    throw new ReleaseSmokeError("host_schema_mismatch", "provider");
+  }
+  return { events, payload, receipt: payload.sidecarReceipt, commands };
+}
+
+function unavailableHostEvidence(host, failureCode) {
+  return {
+    available: false,
+    invocationRef: null,
+    procedureRef: null,
+    hostVersion: null,
+    sidecarReceipt: { schemaVersion: null, schemaResult: "not_run" },
+    cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
+    failureCode,
+    claimEligible: false,
+    host,
+  };
+}
+
+async function cleanupObservedProcess(pid, { deadline, inspect, terminate }) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { gone: false, result: "uncertain", ownedPidResult: "uncertain" };
+  let actual;
+  try { actual = await inspect(pid); }
+  catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  if (actual?.exists === true && actual.uncertain === true) return { gone: false, result: "uncertain", ownedPidResult: "uncertain" };
+  if (actual?.exists === true) {
+    try { await terminate(pid); }
+    catch { return { gone: false, result: "uncertain", ownedPidResult: "uncertain" }; }
+  }
+  const gone = await waitPidsGone([pid], CEILINGS_MS.knownPidAbsence, deadline);
+  return { gone, result: gone ? "verified" : "uncertain", ownedPidResult: gone ? "all_gone" : "lingering" };
+}
+
+export async function runHostObservation({
+  host,
+  hostVersion,
+  projectRoot,
+  skillRoot,
+  stateRoot,
+  cancellationCaller,
+  schemaPath,
+  environment,
+  run,
+  deadline,
+  commandLog = [],
+  inspect = inspectProcessIdentity,
+  terminate = terminateExactPid,
+}) {
+  if (!hostVersion) {
+    const failureCode = host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable";
+    return { evidence: unavailableHostEvidence(host, failureCode), gaps: [failureCode], ownedPids: [] };
+  }
+  const invocation = buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, environment });
+  let result = null;
+  let parsed = null;
+  let failureCode = null;
+  try {
+    result = await run(invocation.file, invocation.args, {
+      cwd: invocation.cwd,
+      env: { ...environment, LUNA_SIDECAR_HOME: stateRoot },
+      input: invocation.input,
+      deadline,
+      timeout: CEILINGS_MS.parent,
+      commandLog,
+      commandName: host === "codex_cli" ? "host-codex" : "host-claude",
+    });
+    if (result.timedOut) failureCode = "host_observation_timeout";
+    else if (result.code !== 0 || result.signal) failureCode = host === "codex_cli" ? "codex_cli_host_failed" : "claude_code_host_failed";
+    else parsed = parseHostObservationResult(host, result, { projectRoot, skillRoot });
+  } catch (error) {
+    failureCode = error instanceof ReleaseSmokeError ? error.code : "host_schema_mismatch";
+  }
+
+  const receiptPids = parsed ? [parsed.receipt.pid, parsed.receipt.runnerPid, parsed.receipt.providerPid].filter((pid) => Number.isSafeInteger(pid) && pid > 0) : [];
+  const hostCleanup = await cleanupObservedProcess(result?.pid, { deadline, inspect, terminate });
+  let sidecarCleanup;
+  try {
+    sidecarCleanup = await cleanupRun({
+      launcher: join(skillRoot, "scripts", "luna-sidecar.mjs"),
+      roots: { project: projectRoot, state: stateRoot, cancellationCaller },
+      env: { ...environment, LUNA_SIDECAR_HOME: stateRoot },
+      run,
+      deadline,
+      commandLog,
+      launchedWorkerCount: parsed ? 1 : 0,
+      knownOwnedPids: receiptPids,
+      inspect,
+      terminate,
+    });
+  } catch {
+    sidecarCleanup = {
+      processesGone: false,
+      result: { releaseReady: false, gaps: ["cleanup_identity_uncertain"] },
+    };
+  }
+  const cleanupVerified = hostCleanup.gone && sidecarCleanup.processesGone && sidecarCleanup.result.releaseReady === true;
+  if (!cleanupVerified) failureCode ??= sidecarCleanup.result.gaps?.[0] ?? "cleanup_identity_uncertain";
+  const allOwnedPids = [...new Set([result?.pid, ...receiptPids].filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
+  const cleanup = {
+    result: cleanupVerified ? "verified" : (hostCleanup.result === "uncertain" || !sidecarCleanup.processesGone ? "uncertain" : "not_run"),
+    ownedPidResult: cleanupVerified ? "all_gone" : (hostCleanup.ownedPidResult === "lingering" ? "lingering" : "uncertain"),
+    ownedPids: allOwnedPids,
+    ownedPidsGone: cleanupVerified,
+  };
+  const evidence = {
+    available: true,
+    invocationRef: `evidence://${host === "codex_cli" ? "codex-cli" : "claude-code"}/observation-1`,
+    procedureRef: `release-smoke.${host}.v1`,
+    hostVersion,
+    sidecarReceipt: {
+      schemaVersion: 2,
+      schemaResult: parsed ? "valid" : (result?.stdout ? "invalid" : "missing"),
+    },
+    cleanup,
+    failureCode: failureCode ?? null,
+    claimEligible: Boolean(parsed && cleanupVerified && !failureCode),
+    host,
+  };
+  return { evidence, gaps: [...new Set([...(sidecarCleanup.result.gaps ?? []), ...(failureCode ? [failureCode] : [])])], ownedPids: allOwnedPids };
+}
+
+export async function runHostObservations({
+  roots,
+  environment,
+  run,
+  deadline,
+  commandLog = [],
+  schemaPath,
+  codexVersion,
+  claudeVersion,
+  inspect = inspectProcessIdentity,
+  terminate = terminateExactPid,
+}) {
+  const specs = [
+    { host: "codex_cli", version: codexVersion, skillRoot: join(roots.project, ".agents", "skills", "luna-sidecar"), stateRoot: roots.hostCodexState },
+    { host: "claude_code", version: claudeVersion, skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"), stateRoot: roots.hostClaudeState },
+  ];
+  const hosts = {};
+  const gaps = [];
+  const ownedPids = [];
+  for (const spec of specs) {
+    const observation = await runHostObservation({
+      ...spec,
+      projectRoot: roots.project,
+      cancellationCaller: roots.cancellationCaller,
+      schemaPath,
+      environment,
+      run,
+      deadline,
+      commandLog,
+      inspect,
+      terminate,
+    });
+    hosts[spec.host] = observation.evidence;
+    gaps.push(...observation.gaps);
+    ownedPids.push(...observation.ownedPids);
+  }
+  return { hosts, gaps: [...new Set(gaps)], ownedPids: [...new Set(ownedPids)] };
+}
+
 async function parseManagerResult(result) {
   if (result.timedOut) throw new ReleaseSmokeError(result.outerTimedOut ? "outer_timeout" : "manager_timeout", "provider");
   if (result.code !== 0 || result.signal) throw new ReleaseSmokeError("manager_spawn_failed", "provider");
@@ -1141,7 +1443,7 @@ function buildRootRoles(roots) {
     .map(([role, pathValue]) => ({ role: roleNames[role], relativePath: roleNames[role], pathHash: createHash("sha256").update(resolve(pathValue)).digest("hex") }));
 }
 
-function buildEvidence({ options, roots, install, ci, codexVersion, commands, scenarios, cleanup, gaps, failureStage, outerTimedOut }) {
+function buildEvidence({ options, roots, install, ci, codexVersion, commands, scenarios, cleanup, hostObservations, gaps, failureStage, outerTimedOut }) {
   const allGaps = [...new Set([...gaps, ...(outerTimedOut ? ["outer_timeout"] : []), ...(cleanup?.result?.gaps ?? [])])];
   const rootRoles = buildRootRoles(roots);
   rootRoles.push({ role: "canonical-source", relativePath: "repository/skills/luna-sidecar", pathHash: createHash("sha256").update(resolve(canonicalSkillRoot)).digest("hex") });
@@ -1150,7 +1452,7 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
     { agent: "claude-code", relativePath: relative(roots.project, install.roots.claude).split(sep).join("/"), manifestHash: install.manifestHashes.claude },
     { agent: "canonical", relativePath: "skills/luna-sidecar", manifestHash: install.manifestHashes.canonical },
   ] : [];
-  const hosts = buildHostEvidence({ codexVersion, scenarios, cleanup, gaps: allGaps });
+  const hosts = buildHostEvidence({ observations: hostObservations?.hosts });
   const otherGates = {
     deterministic: scenarios?.gaps?.length === 0,
     installedParity: Boolean(install),
@@ -1184,40 +1486,10 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
   });
 }
 
-function buildHostEvidence({ codexVersion, scenarios, cleanup, gaps }) {
-  const cleanupVerified = cleanup?.result?.releaseReady === true && cleanup.processesGone === true;
-  const codexReady = Boolean(codexVersion && scenarios?.gaps?.length === 0 && cleanupVerified);
+function buildHostEvidence({ observations }) {
   return {
-    codex_cli: {
-      available: Boolean(codexVersion),
-      invocationRef: codexVersion ? "evidence://codex-cli/observation-1" : null,
-      procedureRef: codexVersion ? "release-smoke.codex_cli.v1" : null,
-      hostVersion: codexVersion ?? null,
-      sidecarReceipt: { schemaVersion: 2, schemaResult: codexVersion ? (scenarios?.gaps?.length === 0 ? "valid" : "invalid") : "not_run" },
-      cleanup: hostCleanupEvidence(cleanup),
-      failureCode: codexReady ? null : (scenarios?.gaps?.[0] ?? gaps.find((code) => code !== "claude_code_unavailable") ?? "codex_cli_unavailable"),
-      claimEligible: codexReady,
-    },
-    claude_code: {
-      available: false,
-      invocationRef: null,
-      procedureRef: null,
-      hostVersion: null,
-      sidecarReceipt: { schemaVersion: 2, schemaResult: "not_run" },
-      cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
-      failureCode: "claude_code_unavailable",
-      claimEligible: false,
-    },
-  };
-}
-
-function hostCleanupEvidence(cleanup) {
-  const verified = cleanup?.result?.releaseReady === true && cleanup.processesGone === true;
-  return {
-    result: verified ? "verified" : (cleanup?.facts?.attempted ? "uncertain" : "not_run"),
-    ownedPidResult: verified ? "all_gone" : (cleanup?.processesGone === false ? "lingering" : "uncertain"),
-    ownedPids: [],
-    ownedPidsGone: verified,
+    codex_cli: observations?.codex_cli ?? unavailableHostEvidence("codex_cli", "codex_cli_unavailable"),
+    claude_code: observations?.claude_code ?? unavailableHostEvidence("claude_code", "claude_code_unavailable"),
   };
 }
 
@@ -1236,6 +1508,8 @@ export async function orchestrateReleaseSmoke(options = {}) {
   let install = null;
   let ci = null;
   let codexVersion = null;
+  let claudeVersion = null;
+  let hostObservations = { hosts: {}, gaps: [], ownedPids: [] };
   let scenarios = { facts: {}, gaps: ["scratch_invalid"], launchedWorkerCount: 0, ownedPids: [] };
   let cleanup = { facts: { attempted: false, launchedWorkerCount: 0, discoveredWorkerCount: 0, ownedPidCount: 0, stopFailures: 0, identityUncertain: 0, identityMismatches: 0, lingeringPids: 0, recoveryUsed: false, scratchCleanupFailed: false }, processesGone: true, result: { releaseReady: false, gaps: ["cleanup_identity_uncertain"] } };
   const gaps = [];
@@ -1253,7 +1527,11 @@ export async function orchestrateReleaseSmoke(options = {}) {
     roots.parentCaller = await createFreshRoot(scratch, "parent-caller");
     roots.resumeCaller = await createFreshRoot(scratch, "resume-caller");
     roots.cancellationCaller = await createFreshRoot(scratch, "cancellation-caller");
+    roots.hostCodexState = await createFreshRoot(scratch, "host-codex-state");
+    roots.hostClaudeState = await createFreshRoot(scratch, "host-claude-state");
     roots.temp = await createFreshRoot(scratch, "temp");
+    const hostSchemaPath = join(roots.temp, "luna-host-observation-schema.json");
+    await writeFile(hostSchemaPath, JSON.stringify(hostObservationSchema), "utf8");
     const init = await run("git", ["init", "--quiet", roots.project], { cwd: scratch, deadline, commandLog, commandName: "git-init" });
     if (init.timedOut) throw new ReleaseSmokeError("outer_timeout", "scratch");
     if (init.code !== 0 || init.signal) throw new ReleaseSmokeError("scratch_invalid", "scratch");
@@ -1274,6 +1552,13 @@ export async function orchestrateReleaseSmoke(options = {}) {
     scenarios = await runLiveScenarios({ launcher: install.launchers.codex, roots, env: providerEnv, run, deadline, commandLog });
     gaps.push(...scenarios.gaps);
     if (scenarios.gaps.length > 0) failureStage = "provider";
+    const claudeProbe = await probeHostVersion({ host: "claude_code", run, environment: providerEnv, cwd: roots.project, deadline, commandLog });
+    claudeVersion = claudeProbe.version;
+    hostObservations = options.observeHosts
+      ? await options.observeHosts({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid })
+      : await runHostObservations({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid });
+    gaps.push(...hostObservations.gaps);
+    if (hostObservations.gaps.length > 0) failureStage ??= "provider";
   } catch (error) {
     const code = error instanceof ReleaseSmokeError ? error.code : "scratch_invalid";
     gaps.push(code);
@@ -1302,7 +1587,7 @@ export async function orchestrateReleaseSmoke(options = {}) {
     if (Date.now() >= deadline.at) deadline.timedOut = true;
     if (deadline.timedOut) failureStage ??= currentStage;
     const finalFailureStage = gaps.length === 0 && cleanup.result.releaseReady && scratchClean && !deadline.timedOut ? null : (failureStage ?? currentStage);
-    const evidence = buildEvidence({ options, roots, install, ci, codexVersion, commands: commandLog, scenarios, cleanup, gaps, failureStage: finalFailureStage, outerTimedOut: deadline.timedOut });
+    const evidence = buildEvidence({ options, roots, install, ci, codexVersion, commands: commandLog, scenarios, cleanup, hostObservations, gaps, failureStage: finalFailureStage, outerTimedOut: deadline.timedOut });
     let finalEvidence = evidence;
     if (options.evidenceDestination) {
       try {
