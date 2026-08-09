@@ -15,7 +15,9 @@ files-modified:
   - skills/luna-sidecar/SKILL.md
   - skills/luna-sidecar/references/USAGE.md
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
+  - test/authority.test.mjs
   - test/contract.test.mjs
+  - test/harness.test.mjs
   - test/helpers/cli-harness.mjs
   - test/ux.test.mjs
   - test/install-parity.test.mjs
@@ -169,7 +171,9 @@ Execute `04-01 -> 04-02 -> 04-03`. First require Phase 3's verification file to 
     - CREATE: skills/luna-sidecar/references/USAGE.md
     - MODIFY: skills/luna-sidecar/scripts/luna-sidecar.mjs
     - MODIFY: README.md
+    - MODIFY: test/authority.test.mjs
     - MODIFY: test/contract.test.mjs
+    - MODIFY: test/harness.test.mjs
     - CREATE: test/ux.test.mjs
   </files>
   <action>
@@ -185,6 +189,9 @@ Execute `04-01 -> 04-02 -> 04-03`. First require Phase 3's verification file to 
     sidecar state root, raw logs, and provider final messages as sensitive because they are not
     generically redacted. Put examples for web research, local inspection, audits, adversarial
     review, planning, and execution in one `references/USAGE.md` as prompting patterns, not modes.
+    Keep one exact start-command skeleton and a `--help` pointer in the root skill; put exact
+    status/wait/resume/stop/list harvesting examples in the reference so a host can operate the full
+    lifecycle without making the human use the CLI.
     The reference must explain that `starting` is unconfirmed spawn, `completed` is not task success,
     `unknown` is terminal and requires a new `start`, cancellation timeout/failure is not
     cancellation, and the host evaluates `taskOutcome: not_evaluated` plus final evidence. Update
@@ -196,7 +203,9 @@ Execute `04-01 -> 04-02 -> 04-03`. First require Phase 3's verification file to 
     manager error envelope: malformed options/UUIDs and unknown workers produce exactly one JSON
     value on stdout and exit 2; valid-target mutation failures produce JSON and exit 1; foreground
     `run` keeps provider passthrough and its separate failure behavior. Update existing contract tests
-    for the changed error protocol instead of duplicating that dynamic matrix in the UX suite.
+    plus any prior harness/authority characterization assertions that directly contradict the new
+    help/error protocol, instead of preserving stderr-only carveouts or duplicating that dynamic
+    matrix in the UX suite.
     Same-cwd dynamics remain owned by `test/safety.test.mjs`; UX adds only static interpretation.
     The UX test must assert the three activation phrases, human-only authority broadening, no-secret
     delegation guidance, and the distinction between compact-receipt redaction and sensitive raw
