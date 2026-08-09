@@ -90,7 +90,7 @@ A fresh agent context then reads `SPEC.md`, this roadmap, the phase plan, the su
 
 ## Phase 4 — Agent UX and delivery proof
 
-**Status:** `[ ]`
+**Status:** `[x]`
 
 **Plan:** [`phases/04-agent-ux-and-delivery/04-PLAN.md`](phases/04-agent-ux-and-delivery/04-PLAN.md)
 
