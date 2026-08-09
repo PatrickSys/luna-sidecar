@@ -89,7 +89,8 @@ test("background start preserves manager shape and transports exact prompt bytes
   const workerPath = join(harness.stateRoot, "workers", `${receipt.workerId}.json`);
   const worker = JSON.parse(await readFile(workerPath, "utf8"));
   assert.equal(worker.id, receipt.workerId);
-  assert.equal(worker.pid, receipt.pid);
+  assert.equal(worker.state, "starting");
+  assert.equal(worker.pid, null);
   assert.equal(worker.sandbox, "read-only");
   assert.equal(pathKey(worker.cwd), pathKey(harness.requestedCwd));
   harness.observePid(receipt.pid);
@@ -112,10 +113,8 @@ test("background start preserves manager shape and transports exact prompt bytes
   assert.equal(capture.stdinBase64, Buffer.from(prompt).toString("base64"));
   assert.equal(Number.isSafeInteger(capture.grandchildPid) && capture.grandchildPid > 0, true);
   assert.equal(capture.grandchild.parentPid, capture.pid);
-  assert.equal(pathKey(capture.grandchild.cwd), pathKey(callerCwd));
-  // AUTH-01 in Phase 2 changes this characterized child-cwd divergence.
-  assert.equal(pathKey(capture.cwd), pathKey(callerCwd));
-  assert.notEqual(pathKey(capture.cwd), pathKey(harness.requestedCwd));
+  assert.equal(pathKey(capture.cwd), pathKey(harness.requestedCwd));
+  assert.equal(pathKey(capture.grandchild.cwd), pathKey(harness.requestedCwd));
 
   await harness.release(result);
   await harness.verifyCaptureProcessesGone();
@@ -136,6 +135,9 @@ test("public commands retain command-specific recognition and current validation
     { args: ["run", "--unknown", "--", "task"], message: /Unknown option: --unknown/ },
     { args: ["run", "--", "   "], message: /Pass one task/ },
     { args: ["wait", absentWorkerId, "--timeout", "later"], message: /--timeout must be a non-negative whole number/ },
+    { args: ["status", "../../outside"], message: /Invalid worker id/ },
+    { args: ["status", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"], message: /Invalid worker id/ },
+    { args: ["status", "C:\\absolute\\worker.json"], message: /Invalid worker id/ },
   ];
 
   for (const { args, message } of failures) {
@@ -152,6 +154,42 @@ test("public commands retain command-specific recognition and current validation
   assert.deepEqual(list.json(), []);
   assert.deepEqual(list.stderr, Buffer.alloc(0));
   await harness.assertNoCapture(list);
+});
+
+test("future schemas and poisoned v2 paths fail closed without rewriting state", async (t) => {
+  const harness = await createCliHarness(t);
+  const workersRoot = join(harness.stateRoot, "workers");
+  await mkdir(workersRoot, { recursive: true });
+  const futurePath = join(workersRoot, `${absentWorkerId}.json`);
+  await writeFile(futurePath, `${JSON.stringify({
+    schemaVersion: 3,
+    workerId: absentWorkerId,
+    id: absentWorkerId,
+    revision: 9,
+    turns: [],
+    prompt: "must remain untouched",
+  })}\n`, "utf8");
+  const before = await fingerprint(futurePath);
+  const future = await harness.invoke(["status", absentWorkerId]);
+  assert.equal(future.code, 2);
+  assert.match(future.stderr.toString(), /Unsupported worker schema version: 3/);
+  assert.deepEqual(await fingerprint(futurePath), before);
+
+  const started = await harness.invoke(["start", "--", "path integrity"], {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+  });
+  const workerId = started.json().workerId;
+  await harness.invoke(["wait", workerId]);
+  const workerPath = join(workersRoot, `${workerId}.json`);
+  const worker = JSON.parse(await readFile(workerPath, "utf8"));
+  const outsidePath = join(harness.root, "outside.prompt");
+  worker.turns.at(-1).promptPath = outsidePath;
+  worker.promptPath = outsidePath;
+  worker.revision += 1;
+  await writeFile(workerPath, `${JSON.stringify(worker, null, 2)}\n`, "utf8");
+  const poisoned = await harness.invoke(["status", workerId]);
+  assert.equal(poisoned.code, 2);
+  assert.match(poisoned.stderr.toString(), /Malformed prompt path/);
 });
 
 test("unknown workers fail through the current raw error surface without launching a provider", async (t) => {

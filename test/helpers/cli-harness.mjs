@@ -22,6 +22,7 @@ export async function createCliHarness(t) {
   const scenarios = new Set();
   const captures = new Set();
   const releasePaths = new Set();
+  const startBarrierPaths = new Set();
   const ownedPids = new Set();
   const runs = new Set();
 
@@ -31,6 +32,7 @@ export async function createCliHarness(t) {
 
   t.after(async () => {
     for (const releasePath of releasePaths) await writeFile(releasePath, "cleanup-release\n", "utf8").catch(() => {});
+    for (const barrierPath of startBarrierPaths) await writeFile(barrierPath, "cleanup-release\n", "utf8").catch(() => {});
 
     for (const run of runs) {
       if (!(await settlesWithin(run.closed, 1_000))) await terminateSpawnedChild(run.child);
@@ -47,7 +49,7 @@ export async function createCliHarness(t) {
     await rm(root, { recursive: true, force: true });
   });
 
-  async function invoke(args, { scenario = {}, stdin = "", cwd = root } = {}) {
+  async function invoke(args, { scenario = {}, stdin = "", cwd = root, extraEnv = {}, timeoutMs = WATCHDOG_MS } = {}) {
     const id = `${scenarios.size + 1}`;
     const scenarioPath = join(root, `${id}.scenario.json`);
     const capturePath = join(root, `${id}.capture.json`);
@@ -55,10 +57,19 @@ export async function createCliHarness(t) {
     const releasePath = join(root, `${id}.release`);
     const grandchildCapturePath = join(root, `${id}.grandchild.capture.json`);
     const grandchildReadyPath = join(root, `${id}.grandchild.ready`);
+    const startBarrierPath = join(stateRoot, `${id}.start.barrier`);
+    const providerStartBarrierPath = extraEnv.FAKE_CODEX_START_BARRIER ?? startBarrierPath;
+    const cancelBarrierPath = extraEnv.LUNA_SIDECAR_TEST_CANCEL_BARRIER ?? null;
     scenarios.add(scenarioPath);
     captures.add(capturePath);
     releasePaths.add(releasePath);
+    startBarrierPaths.add(providerStartBarrierPath);
+    if (cancelBarrierPath) releasePaths.add(`${cancelBarrierPath}.release`);
     await writeFile(scenarioPath, JSON.stringify(scenario), "utf8");
+    await mkdir(stateRoot, { recursive: true });
+    if (!scenario.startBarrier && !extraEnv.FAKE_CODEX_START_BARRIER) {
+      await writeFile(providerStartBarrierPath, "release\n", "utf8");
+    }
 
     const child = spawn(process.execPath, [launcherPath, ...args], {
       cwd,
@@ -73,6 +84,8 @@ export async function createCliHarness(t) {
         FAKE_CODEX_GRANDCHILD_READY: grandchildReadyPath,
         FAKE_CODEX_GRANDCHILD_RELEASE: releasePath,
         LUNA_TEST_SENTINEL: "cli-harness-sentinel",
+        ...extraEnv,
+        FAKE_CODEX_START_BARRIER: providerStartBarrierPath,
       }),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -88,7 +101,7 @@ export async function createCliHarness(t) {
     });
     const run = {
       child,
-      closed: watchSpawnedChild(child, closed, args[0] ?? "default-run"),
+      closed: watchSpawnedChild(child, closed, args[0] ?? "default-run", timeoutMs),
     };
     runs.add(run);
     child.stdin.end(stdin);
@@ -105,6 +118,8 @@ export async function createCliHarness(t) {
       releasePath,
       grandchildCapturePath,
       grandchildReadyPath,
+      startBarrierPath,
+      cancelBarrierPath,
       json() {
         return parseExactlyOneJson(this.stdout, `manager stdout for ${args[0] ?? "run"}`);
       },
@@ -138,6 +153,10 @@ export async function createCliHarness(t) {
     await writeFile(result.releasePath, "release\n", "utf8");
   }
 
+  async function releaseStart(result) {
+    await writeFile(result.startBarrierPath, "release\n", "utf8");
+  }
+
   async function assertNoCapture(result) {
     await assertFileAbsent(result.capturePath);
   }
@@ -153,6 +172,7 @@ export async function createCliHarness(t) {
     verifyCaptureProcessesGone,
     observePid,
     release,
+    releaseStart,
     assertNoCapture,
   };
 }
@@ -272,6 +292,19 @@ export async function terminateSpawnedChild(child) {
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
     }
+  }
+  await waitForProcessGone(pid);
+}
+
+export async function terminateOwnedPid(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("An owned PID is required");
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    const result = await waitForChildClose(killer, TERMINATION_WAIT_MS, "taskkill owned pid");
+    if (result.code !== 0 && isAlive(pid)) throw new Error(`taskkill exited ${result.code} for owned PID ${pid}`);
+  } else {
+    try { process.kill(pid, "SIGKILL"); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
   }
   await waitForProcessGone(pid);
 }

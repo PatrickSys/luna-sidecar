@@ -190,7 +190,7 @@ test("fake Codex fixture supports deterministic process-tree cancellation", asyn
   await waitForProcessGone(capture.grandchildPid);
 });
 
-test("real launcher transports exact prompt and output bytes through the PATH shim and exposes current cwd divergence", async (t) => {
+test("real launcher transports exact prompt and output bytes through the PATH shim with provider cwd fidelity", async (t) => {
   const harness = await createCliHarness(t);
   const previousSecret = process.env.FAKE_CODEX_SECRET_SENTINEL;
   process.env.FAKE_CODEX_SECRET_SENTINEL = "host-secret-must-not-cross";
@@ -233,9 +233,7 @@ test("real launcher transports exact prompt and output bytes through the PATH sh
   ]);
   assert.equal(capture.argv.includes(prompt), false);
   assert.equal(capture.stdinBase64, Buffer.from(prompt).toString("base64"));
-  // AUTH-01 in Phase 2 deliberately changes this characterized current defect.
-  assert.equal(pathKey(capture.cwd), pathKey(callerCwd));
-  assert.notEqual(pathKey(capture.cwd), pathKey(harness.requestedCwd));
+  assert.equal(pathKey(capture.cwd), pathKey(harness.requestedCwd));
   assert.equal(capture.env.LUNA_TEST_SENTINEL, "cli-harness-sentinel");
   assert.equal(capture.forbiddenEnvPresent, false);
   await harness.verifyCaptureProcessesGone();
