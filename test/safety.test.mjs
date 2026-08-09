@@ -130,7 +130,7 @@ test("resume reports active write-capable same-cwd workers without blocking", as
   const base = await harness.invoke(["start", "--", "base"], { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"base-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 } });
   await harness.invoke(["wait", base.json().workerId]);
   const blocker = await harness.invoke(["start", "--", "active blocker"], { scenario: { startBarrier: true, exitCode: 0 } });
-  await waitForRunner(harness, blocker.json().workerId);
+  await waitForRunner(harness, blocker.json().workerId, (worker) => typeof worker.turns.at(-1)?.promptClaimedAt === "string");
   const blockerPath = join(harness.stateRoot, "workers", `${blocker.json().workerId}.json`);
   const phaseTwoShape = JSON.parse(await readFile(blockerPath, "utf8"));
   delete phaseTwoShape.cwdRealpath;
@@ -218,12 +218,12 @@ test("poisoned persisted error codes normalize across observation projections", 
   }
 });
 
-async function waitForRunner(harness, workerId) {
+async function waitForRunner(harness, workerId, isReady = () => true) {
   const path = join(harness.stateRoot, "workers", `${workerId}.json`);
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     const worker = JSON.parse(await readFile(path, "utf8"));
-    if (Number.isSafeInteger(worker.runnerPid)) return worker;
+    if (Number.isSafeInteger(worker.runnerPid) && isReady(worker)) return worker;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for runner: ${workerId}`);
