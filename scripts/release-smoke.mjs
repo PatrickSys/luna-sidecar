@@ -995,7 +995,7 @@ const hostCommands = Object.freeze({ codex_cli: "codex", claude_code: "claude" }
 
 export function hostObservationPrompt(host) {
   const activation = host === "codex_cli"
-    ? "Use the installed project Agent Skill named luna-sidecar through Codex's native Agent Skills mechanism; do not use Claude slash-command syntax."
+    ? "Explicitly activate the installed project Agent Skill with $luna-sidecar through Codex's native Agent Skills mechanism; do not use Claude slash-command syntax."
     : host === "claude_code"
       ? "Activate the installed project skill with /luna-sidecar."
       : null;
@@ -1016,7 +1016,7 @@ export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, 
   if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
   const args = host === "codex_cli"
     ? ["exec", "--json", "--ephemeral", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
-    : ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", projectRoot];
+    : ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "user,project,local", "--add-dir", projectRoot];
   return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(host), cwd: projectRoot };
 }
 

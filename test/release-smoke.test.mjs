@@ -97,7 +97,7 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
   assert.equal(codexArgs.includes("--cd"), true);
   assert.equal(codexArgs.includes("--skip-git-repo-check"), true);
   assert.doesNotMatch(codex.input, /\/luna-sidecar/);
-  assert.match(codex.input, /Agent Skill named luna-sidecar/);
+  assert.match(codex.input, /Explicitly activate .*Agent Skill with \$luna-sidecar through Codex's native Agent Skills mechanism/);
 
   const claude = buildHostInvocation("claude_code", { projectRoot, skillRoot: join(projectRoot, ".claude", "skills", "luna-sidecar"), schemaPath, environment: { ComSpec: "cmd.exe" } });
   assert.equal(claude.file, process.platform === "win32" ? "cmd.exe" : "claude");
@@ -110,6 +110,7 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
   assert.equal(claudeArgs.includes("--permission-mode"), true);
   assert.equal(claudeArgs.includes("bypassPermissions"), true);
   assert.equal(claudeArgs.includes("--no-session-persistence"), true);
+  assert.deepEqual(claudeArgs.slice(claudeArgs.indexOf("--setting-sources"), claudeArgs.indexOf("--setting-sources") + 2), ["--setting-sources", "user,project,local"]);
   assert.match(claude.input, /\/luna-sidecar/);
 });
 
@@ -369,11 +370,11 @@ if (process.cwd() !== project || process.env.LUNA_SIDECAR_HOME !== state) fail("
 if (host === "codex_cli") {
   assert.deepEqual(args, ["exec", "--json", "--ephemeral", "--output-schema", schema, "--sandbox", "workspace-write", "--cd", project, "--skip-git-repo-check", "-"]);
 } else if (host === "claude_code") {
-  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--add-dir", project]);
+  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "user,project,local", "--add-dir", project]);
 } else fail("unknown host");
 const input = await new Promise((resolve) => { const chunks = []; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8"))); });
 if (host === "codex_cli" && input.includes("/luna-sidecar")) fail("codex used Claude activation syntax");
-if (host === "codex_cli" && !input.includes("Agent Skill named luna-sidecar")) fail("Codex skill activation missing");
+if (host === "codex_cli" && !input.includes("$luna-sidecar")) fail("Codex skill activation missing");
 if (host === "claude_code" && !input.includes("/luna-sidecar")) fail("Claude skill activation missing");
 if (mode === "failure") {
   process.stdout.write(JSON.stringify({ error: "structured output unavailable" }) + "\\n");
