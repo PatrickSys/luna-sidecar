@@ -89,6 +89,7 @@ test("provider completion does not outrun process close, then close plus complet
 
 test("start does not acknowledge until the runner persists thread.started readiness", async (t) => {
   const harness = await createCliHarness(t);
+  await mkdir(harness.stateRoot, { recursive: true });
   const startedAt = Date.now();
   const pending = harness.invoke(["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "handshake"], {
     scenario: {
