@@ -11,6 +11,11 @@ import { buildInstallerEnvironment, buildManifest, compareManifests, validateIns
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const installerPath = join(repositoryRoot, "node_modules", "skills", "bin", "cli.mjs");
 const sourceSkillRoot = join(repositoryRoot, "skills", "luna-sidecar");
+const requiredSkillAssets = ["SKILL.md", "scripts/luna-sidecar.mjs", "references/USAGE.md"];
+
+test("install parity remains scoped to the three canonical copied assets", () => {
+  assert.deepEqual(requiredSkillAssets, ["SKILL.md", "scripts/luna-sidecar.mjs", "references/USAGE.md"]);
+});
 
 test("pinned local installer metadata and README expose the tested contract", async () => {
   const metadata = JSON.parse(await readFile(join(repositoryRoot, "node_modules", "skills", "package.json"), "utf8"));
@@ -58,6 +63,13 @@ test("project copied installs are byte-identical and run the copied launcher", a
   const canonical = await buildManifest(sourceSkillRoot);
   const codex = await buildManifest(codexRoot, projectRoot);
   const claude = await buildManifest(claudeRoot, projectRoot);
+  for (const skillRoot of [sourceSkillRoot, codexRoot, claudeRoot]) {
+    for (const relativePath of requiredSkillAssets) {
+      const info = await lstat(join(skillRoot, relativePath));
+      assert.equal(info.isFile(), true, `${relativePath} must be a regular file`);
+      assert.equal(info.isSymbolicLink(), false, `${relativePath} must not be a symlink`);
+    }
+  }
   assert.deepEqual(compareManifests(canonicalBefore, canonical).equal, true);
   assert.deepEqual(compareManifests(canonical, codex).equal, true);
   assert.deepEqual(compareManifests(codex, claude).equal, true);

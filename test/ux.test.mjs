@@ -20,9 +20,19 @@ test("skill metadata and guidance define the narrow host-facing activation bound
   assert.match(skill, /every start names an absolute existing cwd, sandbox, effort, and one bounded task/i);
   assert.match(skill, /--cwd .*--sandbox read-only --effort high/);
   assert.match(skill, /read-only.*workspace-write.*full-access.*explicit host choices/i);
+  assert.match(skill, /match the host's existing authority/i);
+  assert.match(skill, /already operating with full access.*explicitly select Luna `full-access`/i);
   assert.match(skill, /direct human intent/i);
   assert.match(skill, /independent workers/i);
   assert.match(skill, /native subagents/i);
+  assert.match(skill, /provider_command_blocked:powershell_transcription/);
+  assert.match(skill, /powershell_transcription_admission_blocked/);
+  assert.match(skill, /no Luna provider was started.*requested read-only authority was preserved/is);
+  assert.match(skill, /Route the bounded task directly to a native Codex subagent with read-only authority/i);
+  assert.match(skill, /never auto-spawns that agent/i);
+  assert.match(skill, /defense-in-depth `provider_command_blocked:powershell_transcription`/i);
+  assert.match(skill, /read-only work.*native Codex subagent/i);
+  assert.match(skill, /never.*(?:broaden authority|change transcription policy or ACLs|retry)/is);
   assert.match(skill, /recursively/i);
   assert.match(skill, /failed.*unknown.*taskOutcome: `?not_evaluated`?/s);
   assert.match(skill, /Never delegate secrets/i);
@@ -41,6 +51,13 @@ test("skill metadata and guidance define the narrow host-facing activation bound
   assert.match(usage, /unknown state.*new `start`/s);
   assert.match(usage, /cancellation timeout or failure.*not.*cancelled/is);
   assert.match(usage, /taskOutcome: not_evaluated/);
+  assert.match(usage, /provider_command_blocked:powershell_transcription/);
+  assert.match(usage, /powershell_transcription_admission_blocked/);
+  assert.match(usage, /no Luna provider was started.*requested read-only authority was preserved/is);
+  assert.match(usage, /Route the bounded task directly to a native Codex subagent with read-only authority/i);
+  assert.match(usage, /never auto-spawns the native agent/i);
+  assert.match(usage, /read-only task.*native Codex subagent/i);
+  assert.match(usage, /host's existing authority.*full access.*Luna `full-access`/is);
   for (const command of ["start", "status", "wait", "resume", "cancel", "list"]) {
     assert.match(usage, new RegExp(`luna-sidecar\\.mjs\\" ${command}`));
   }
@@ -51,6 +68,12 @@ test("skill metadata and guidance define the narrow host-facing activation bound
   assert.match(readme, /human asks the host agent/i);
   assert.match(readme, /does not add a host adapter.*every host routes skill metadata/i);
   assert.match(readme, /start --cwd .*--sandbox read-only --effort high/);
+  assert.match(readme, /provider_command_blocked:powershell_transcription/);
+  assert.match(readme, /powershell_transcription_admission_blocked/);
+  assert.match(readme, /no Luna provider was started.*requested read-only authority was preserved/is);
+  assert.match(readme, /route the bounded task directly to a native Codex subagent with read-only authority/i);
+  assert.match(readme, /never auto-spawns that agent/i);
+  assert.match(readme, /read-only host.*native Codex subagent/i);
   assert.match(readme, /does not claim universal-host behavior|Missing host evidence keeps release readiness false/i);
 });
 

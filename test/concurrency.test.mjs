@@ -5,6 +5,23 @@ import test from "node:test";
 
 import { createCliHarness, waitForProcessGone } from "./helpers/cli-harness.mjs";
 
+test("policy admission integration: simultaneous incompatible starts independently reject with zero providers", async (t) => {
+  const harnesses = await Promise.all([createCliHarness(t), createCliHarness(t), createCliHarness(t)]);
+  const results = await Promise.all(harnesses.map((harness, index) => harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", `fan-out-${index}`],
+    { scenario: { exitCode: 0 }, runtimeCaseId: "policy-enabled-hklm" },
+  )));
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    assert.equal(result.code, 1);
+    assert.equal(result.json().error.code, "powershell_transcription_admission_blocked");
+    assert.equal(result.json().workerId, null);
+    assert.deepEqual((await harnesses[index].readRegistryCapture(result)).map(({ hive }) => hive), ["HKLM"]);
+    await harnesses[index].assertNoCapture(result);
+    await harnesses[index].assertNoWorkerArtifacts();
+  }
+});
+
 test("two resumes on one worker serialize and only one active turn launches", async (t) => {
   const harness = await createCliHarness(t);
   const start = await harness.invoke(["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "seed"], {

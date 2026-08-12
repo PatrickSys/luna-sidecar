@@ -6,6 +6,49 @@ import test from "node:test";
 
 import { createCliHarness } from "./helpers/cli-harness.mjs";
 
+test("policy admission unit: non-Windows and unaffected authority paths perform no registry query", async (t) => {
+  const harness = await createCliHarness(t);
+  const result = await harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "unaffected authority"],
+    { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"unaffected-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, runtimeCaseId: "policy-enabled-hklm", expectedRegistryCalls: 0 },
+  );
+  assert.equal(result.code, 0);
+  assert.equal(result.json().sandbox, "workspace-write");
+  assert.deepEqual(await harness.readRegistryCapture(result), []);
+  const capture = await harness.waitForCapture(result);
+  assert.equal(capture.argv.includes("workspace-write"), true);
+  await harness.invoke(["wait", result.json().workerId]);
+
+  const nonWindows = await harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "non-Windows read-only"],
+    { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"non-windows-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 } },
+  );
+  assert.equal(nonWindows.code, 0);
+  assert.deepEqual(await harness.readRegistryCapture(nonWindows), []);
+  await harness.invoke(["wait", nonWindows.json().workerId]);
+
+  const fullAccess = await harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "full-access", "--cwd", harness.requestedCwd, "--", "Windows full access"],
+    { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"full-access-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, runtimeCaseId: "policy-enabled-hklm", expectedRegistryCalls: 0 },
+  );
+  assert.equal(fullAccess.code, 0);
+  assert.deepEqual(await harness.readRegistryCapture(fullAccess), []);
+  await harness.invoke(["wait", fullAccess.json().workerId]);
+
+  const seed = await harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "resume seed"],
+    { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"resume-policy-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, runtimeCaseId: "policy-enabled-hklm", expectedRegistryCalls: 0 },
+  );
+  await harness.invoke(["wait", seed.json().workerId]);
+  const resumed = await harness.invoke(
+    ["resume", seed.json().workerId, "--sandbox", "read-only", "--", "resume remains unaffected"],
+    { scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, runtimeCaseId: "policy-enabled-hklm", expectedRegistryCalls: 0 },
+  );
+  assert.equal(resumed.code, 0);
+  assert.deepEqual(await harness.readRegistryCapture(resumed), []);
+  await harness.invoke(["wait", seed.json().workerId]);
+});
+
 const legacyWorkerId = "11111111-1111-4111-8111-111111111111";
 
 test("start records schema v2, exact initial authority, prompt hash, and requested provider cwd", async (t) => {
@@ -47,6 +90,9 @@ test("start records schema v2, exact initial authority, prompt hash, and request
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=xhigh",
     "--sandbox", "read-only", "--skip-git-repo-check", "-C", harness.requestedCwd, "-",
   ]);
+  assert.equal(capture.argv.includes("--add-dir"), false);
+  assert.equal(capture.argv.includes("workspace-write"), false);
+  assert.equal(capture.argv.includes("--dangerously-bypass-approvals-and-sandbox"), false);
   assert.equal(capture.cwd, harness.requestedCwd);
   assert.equal(capture.stdinBase64, Buffer.from("authority prompt").toString("base64"));
   await harness.release(result);
@@ -172,6 +218,9 @@ test("bypass is explicit and contradictory authority is rejected", async (t) => 
     "exec", "--json", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=medium",
     "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", receipt.cwd, "-",
   ]);
+  assert.equal(capture.argv.includes("--add-dir"), false);
+  assert.equal(capture.argv.includes("workspace-write"), false);
+  assert.equal(capture.argv.includes("--dangerously-bypass-approvals-and-sandbox"), false);
   await harness.release(result);
   await harness.invoke(["wait", receipt.workerId]);
 });

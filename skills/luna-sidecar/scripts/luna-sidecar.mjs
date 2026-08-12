@@ -17,7 +17,7 @@ import {
 } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 
 const model = "gpt-5.6-luna";
 const schemaVersion = 2;
@@ -47,6 +47,13 @@ const promptsRoot = join(stateRoot, "prompts");
 const requestsRoot = join(stateRoot, "requests");
 const launcherPath = fileURLToPath(import.meta.url);
 const globalHelpRequested = invokedToken === "--help";
+const registryQueryDeadlineMs = 2_000;
+const registryDecisionDeadlineMs = 4_000;
+const registryStreamCapBytes = 8 * 1024;
+const transcriptionValueName = "EnableTranscripting";
+const transcriptionPolicyPath = "SOFTWARE\\Policies\\Microsoft\\PowerShellCore\\Transcription";
+const missingRegistryDiagnostic = Buffer.from("ERROR: The system was unable to find the specified registry key or value.\r\n", "ascii");
+const transcriptionAdmissionMessage = "Windows read-only Luna admission is unavailable because PowerShellCore transcription is enabled or its safe state could not be established. Keep read-only authority and use a native Codex subagent.";
 
 class SidecarError extends Error {
   constructor(message, code = "sidecar_error", exitCode = 2) {
@@ -62,7 +69,7 @@ class RevisionConflict extends SidecarError {
   }
 }
 
-async function main() {
+async function main(runtimeDependencies = productionRuntimeDependencies()) {
   if (isHelpInvocation(rawArgs)) {
     printHelp(command);
     return;
@@ -74,7 +81,7 @@ async function main() {
     fail(`Unknown command: ${command}`, "unknown_command");
   }
   assertExecutionAllowed(command);
-  if (command === "start") return startWorker(await parseTask(rawArgs, { requireExplicitControls: true }));
+  if (command === "start") return startWorker(await parseTask(rawArgs, { requireExplicitControls: true }), null, null, runtimeDependencies);
   if (command === "status") return showStatus(requireWorkerId(rawArgs));
   if (command === "wait") return waitForWorker(requireWorkerId(rawArgs), parseWait(rawArgs.slice(1)));
   if (command === "resume") return resumeWorker(requireWorkerId(rawArgs), await parseTask(rawArgs.slice(1)));
@@ -348,8 +355,9 @@ async function runForeground(taskInput) {
   process.exitCode = result.code ?? (result.signal ? 1 : 0);
 }
 
-async function startWorker(taskInput, parentWorkerId = null, threadId = null) {
+async function startWorker(taskInput, parentWorkerId = null, threadId = null, runtimeDependencies = productionRuntimeDependencies()) {
   const task = await resolvedTask(taskInput);
+  await assertPowerShellTranscriptionAdmission(task, runtimeDependencies);
   let worker;
   let workerId;
   await withRetentionLock(async () => {
@@ -370,6 +378,201 @@ async function startWorker(taskInput, parentWorkerId = null, threadId = null) {
     }
   });
   return launchRunner(workerId, worker, { printResult: true });
+}
+
+function productionRuntimeDependencies() {
+  return Object.freeze({
+    platform: platform(),
+    systemRoot: process.env.SystemRoot,
+    executeRegistryQuery: executeProductionRegistryQuery,
+  });
+}
+
+async function assertPowerShellTranscriptionAdmission(task, runtimeDependencies) {
+  if (task.sandbox !== "read-only" || runtimeDependencies.platform !== "win32") return;
+  const state = await effectivePowerShellTranscriptionState(runtimeDependencies);
+  if (state === "disabled" || state === "missing") return;
+  throw new SidecarError(transcriptionAdmissionMessage, "powershell_transcription_admission_blocked", 1);
+}
+
+async function effectivePowerShellTranscriptionState(runtimeDependencies) {
+  const executable = resolveRegistryExecutable(runtimeDependencies.systemRoot);
+  if (!executable) return "unknown";
+  const startedAt = performance.now();
+  const hklm = await queryPowerShellTranscription("HKLM", executable, runtimeDependencies.executeRegistryQuery, registryQueryDeadlineMs);
+  if (hklm !== "missing") return hklm;
+  const remainingMs = registryDecisionDeadlineMs - Math.ceil(performance.now() - startedAt);
+  if (remainingMs <= 0) return "timeout";
+  return queryPowerShellTranscription("HKCU", executable, runtimeDependencies.executeRegistryQuery, Math.min(registryQueryDeadlineMs, remainingMs));
+}
+
+function resolveRegistryExecutable(systemRoot) {
+  if (typeof systemRoot !== "string" || systemRoot.length === 0 || systemRoot.includes("\0") || !win32.isAbsolute(systemRoot)) return null;
+  try {
+    const absoluteRoot = win32.resolve(systemRoot);
+    if (!win32.isAbsolute(absoluteRoot)) return null;
+    return win32.join(absoluteRoot, "System32", "reg.exe");
+  } catch {
+    return null;
+  }
+}
+
+async function queryPowerShellTranscription(hive, executable, executeRegistryQuery, deadlineMs) {
+  let facts;
+  try {
+    facts = await executeRegistryQuery({
+      executable,
+      args: ["query", `${hive}\\${transcriptionPolicyPath}`, "/v", transcriptionValueName, "/reg:64"],
+      options: { shell: false, windowsHide: true },
+      deadlineMs,
+      streamCapBytes: registryStreamCapBytes,
+    });
+  } catch {
+    return "unknown";
+  }
+  return classifyRegistryQueryFacts(facts);
+}
+
+function classifyRegistryQueryFacts(facts) {
+  if (!validRegistryFactShape(facts)) return "unknown";
+  if (facts.timedOut) return "timeout";
+  if (!facts.spawned || facts.spawnError) return "spawn_error";
+  if (!facts.closed || facts.signal || facts.stdoutTruncated || facts.stderrTruncated) return "unknown";
+  if (
+    facts.exitCode === 1
+    && facts.stdoutBytes.length === 0
+    && facts.stderrBytes.equals(missingRegistryDiagnostic)
+  ) return "missing";
+  if (facts.exitCode !== 0) return "failure";
+  if (facts.stderrBytes.length !== 0) return "malformed";
+  const decoded = decodeRegistryValueOutput(facts.stdoutBytes);
+  if (decoded === null) return "unknown";
+  const candidates = decoded.split(/\r\n|\n|\r/u).filter((line) => line.toLowerCase().includes(transcriptionValueName.toLowerCase()));
+  if (candidates.length !== 1) return "malformed";
+  const match = /^[\t ]*EnableTranscripting[\t ]+REG_DWORD[\t ]+(0x0|0x1)[\t ]*$/iu.exec(candidates[0]);
+  if (!match) return "malformed";
+  return match[1].toLowerCase() === "0x1" ? "enabled" : "disabled";
+}
+
+function validRegistryFactShape(facts) {
+  return Boolean(
+    facts
+    && typeof facts.spawned === "boolean"
+    && (facts.spawnError === null || typeof facts.spawnError === "object")
+    && typeof facts.timedOut === "boolean"
+    && typeof facts.killAttempted === "boolean"
+    && typeof facts.closed === "boolean"
+    && (facts.exitCode === null || Number.isInteger(facts.exitCode))
+    && (facts.signal === null || typeof facts.signal === "string")
+    && Buffer.isBuffer(facts.stdoutBytes)
+    && Buffer.isBuffer(facts.stderrBytes)
+    && typeof facts.stdoutTruncated === "boolean"
+    && typeof facts.stderrTruncated === "boolean"
+    && Number.isFinite(facts.elapsedMs)
+    && facts.elapsedMs >= 0
+  );
+}
+
+function decodeRegistryValueOutput(bytes) {
+  try {
+    if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+      if ((bytes.length - 2) % 2 !== 0) return null;
+      return bytes.subarray(2).toString("utf16le");
+    }
+    if (hasUtf16LeTargetSignature(bytes)) {
+      if (bytes.length % 2 !== 0) return null;
+      return bytes.toString("utf16le");
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function hasUtf16LeTargetSignature(bytes) {
+  const token = Buffer.from(transcriptionValueName, "ascii");
+  outer: for (let offset = 0; offset + token.length * 2 <= bytes.length; offset += 1) {
+    for (let index = 0; index < token.length; index += 1) {
+      if (bytes[offset + index * 2] !== token[index] || bytes[offset + index * 2 + 1] !== 0) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+function executeProductionRegistryQuery({ executable, args, options, deadlineMs, streamCapBytes }) {
+  const startedAt = performance.now();
+  return new Promise((resolvePromise) => {
+    let child;
+    let spawned = false;
+    let spawnError = null;
+    let timedOut = false;
+    let killAttempted = false;
+    let closed = false;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutLength = 0;
+    let stderrLength = 0;
+    let settled = false;
+    let timer = null;
+
+    const capture = (chunks, currentLength, chunk) => {
+      const bytes = Buffer.from(chunk);
+      const remaining = Math.max(0, streamCapBytes - currentLength);
+      if (remaining > 0) chunks.push(bytes.subarray(0, remaining));
+      return { length: currentLength + Math.min(bytes.length, remaining), truncated: bytes.length > remaining };
+    };
+    const finish = (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolvePromise({
+        spawned,
+        spawnError,
+        timedOut,
+        killAttempted,
+        closed,
+        exitCode,
+        signal,
+        stdoutBytes: Buffer.concat(stdoutChunks, stdoutLength),
+        stderrBytes: Buffer.concat(stderrChunks, stderrLength),
+        stdoutTruncated,
+        stderrTruncated,
+        elapsedMs: performance.now() - startedAt,
+      });
+    };
+
+    try {
+      child = spawn(executable, args, { ...options, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      spawnError = { code: error?.code ?? null, message: error instanceof Error ? error.message : String(error) };
+      finish(null, null);
+      return;
+    }
+    child.once("spawn", () => { spawned = true; });
+    child.once("error", (error) => { spawnError = { code: error?.code ?? null, message: error instanceof Error ? error.message : String(error) }; });
+    child.stdout.on("data", (chunk) => {
+      const result = capture(stdoutChunks, stdoutLength, chunk);
+      stdoutLength = result.length;
+      stdoutTruncated ||= result.truncated;
+    });
+    child.stderr.on("data", (chunk) => {
+      const result = capture(stderrChunks, stderrLength, chunk);
+      stderrLength = result.length;
+      stderrTruncated ||= result.truncated;
+    });
+    child.once("close", (exitCode, signal) => {
+      closed = true;
+      finish(exitCode, signal);
+    });
+    timer = setTimeout(() => {
+      timedOut = true;
+      killAttempted = true;
+      child.kill("SIGKILL");
+    }, deadlineMs);
+  });
 }
 
 function makeWorker(workerId, parentWorkerId, turn) {
@@ -708,6 +911,8 @@ async function runWorkerLifecycle(workerId) {
     }
     if (event.type === "turn.completed") providerCompleted = true;
     if (event.type === "turn.failed" || event.type === "error") providerFailed = true;
+    const commandBlockWarning = providerCommandBlockWarning(event);
+    if (commandBlockWarning) warningCollector.add(commandBlockWarning);
     if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
       finalMessage = utf8Prefix(event.item.text, maxFinalMessageBytes);
       if (finalMessage !== event.item.text) warningCollector.add("final_message_truncated");
@@ -1095,19 +1300,45 @@ class CappedRawWriter {
   }
 }
 
-try {
-  await main();
-} catch (error) {
-  if (managerCommands.has(command)) {
-    const sidecarError = error instanceof SidecarError
-      ? error
-      : new SidecarError("Sidecar evidence is unavailable; inspect the local state root and retry", "sidecar_error", 2);
-    printFailure(command, null, sidecarError.code, sidecarError.message);
-    process.exitCode = Number.isInteger(sidecarError.exitCode) ? sidecarError.exitCode : 2;
-  } else {
-    process.stderr.write(`luna-sidecar: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = error instanceof SidecarError && Number.isInteger(error.exitCode) ? error.exitCode : 2;
+if (isDirectExecution()) await runManager(productionRuntimeDependencies());
+
+export async function __testOnlyRunManager(runtimeDependencies) {
+  assertPrivateRuntimeDependencies(runtimeDependencies);
+  await runManager(runtimeDependencies);
+}
+
+async function runManager(runtimeDependencies) {
+  try {
+    await main(runtimeDependencies);
+  } catch (error) {
+    if (managerCommands.has(command)) {
+      const sidecarError = error instanceof SidecarError
+        ? error
+        : new SidecarError("Sidecar evidence is unavailable; inspect the local state root and retry", "sidecar_error", 2);
+      printFailure(command, null, sidecarError.code, sidecarError.message);
+      process.exitCode = Number.isInteger(sidecarError.exitCode) ? sidecarError.exitCode : 2;
+    } else {
+      process.stderr.write(`luna-sidecar: ${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = error instanceof SidecarError && Number.isInteger(error.exitCode) ? error.exitCode : 2;
+    }
   }
+}
+
+function assertPrivateRuntimeDependencies(runtimeDependencies) {
+  const expectedKeys = ["executeRegistryQuery", "platform", "systemRoot"];
+  if (
+    !runtimeDependencies
+    || !Object.isFrozen(runtimeDependencies)
+    || JSON.stringify(Object.keys(runtimeDependencies).sort()) !== JSON.stringify(expectedKeys)
+    || typeof runtimeDependencies.platform !== "string"
+    || typeof runtimeDependencies.executeRegistryQuery !== "function"
+  ) throw new TypeError("Invalid private manager runtime dependencies");
+}
+
+function isDirectExecution() {
+  if (!process.argv[1]) return false;
+  try { return resolve(process.argv[1]) === resolve(launcherPath); }
+  catch { return false; }
 }
 
 async function finalizeCancelled(workerId, stdoutMeta, stderrMeta) {
@@ -1204,6 +1435,25 @@ async function finalizeProvider(workerId, facts) {
   });
   const turn = latestTurn(result.worker);
   if (turn?.cancel?.result === "not_applied") await removeCancelRequest(workerId, turn.turnId);
+}
+
+function providerCommandBlockWarning(event) {
+  const item = event?.type === "item.completed" ? event.item : null;
+  if (item?.type !== "command_execution" || item.status !== "failed" || typeof item.aggregated_output !== "string") return null;
+  const output = item.aggregated_output.toLowerCase();
+  if (output.includes("helper_sandbox_lock_failed") && output.includes("setnamedsecurityinfow") && output.includes("1340")) {
+    return "provider_command_blocked:sandbox_lock_1340";
+  }
+  if (output.includes("batch file arguments are invalid")) return "provider_command_blocked:invalid_batch_shim";
+  if (
+    output.includes("system.unauthorizedaccessexception")
+    && output.includes("powershell_transcript.")
+    && output.includes("access to ")
+    && output.includes(" is denied")
+  ) {
+    return "provider_command_blocked:powershell_transcription";
+  }
+  return null;
 }
 
 async function persistSealedLogMetadata(workerId, stdoutMeta, stderrMeta) {

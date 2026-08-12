@@ -4,6 +4,63 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createCliHarness, terminateOwnedPid } from "./helpers/cli-harness.mjs";
+import fakeRegistryFixture from "./fixtures/fake-reg-query.mjs";
+
+const admissionCode = "powershell_transcription_admission_blocked";
+const admissionMessage = "Windows read-only Luna admission is unavailable because PowerShellCore transcription is enabled or its safe state could not be established. Keep read-only authority and use a native Codex subagent.";
+
+test("policy admission unit: exact raw fixtures enforce precedence, redaction, and deterministic absence", async (t) => {
+  assert.equal(fakeRegistryFixture.schemaVersion, 1);
+  assert.equal(fakeRegistryFixture.capture.id, "reg-missing-exact-diagnostic-en-us-ascii-crlf-v1");
+  assert.equal(Buffer.from(fakeRegistryFixture.capture.stderrBase64, "base64").length, 75);
+  assert.equal(fakeRegistryFixture.capture.stderrSha256, "f441ad85601f9eb5f698450818c42155f1961fd925522e4d7687721e316b4fc8");
+  const missingScenarios = fakeRegistryFixture.cases.filter(({ id }) => id.startsWith("reg-missing-"));
+  assert.equal(missingScenarios.length, 4);
+  for (const fixtureCase of fakeRegistryFixture.cases) {
+    await t.test(fixtureCase.id, async (t) => {
+      const harness = await createCliHarness(t);
+      const result = await harness.invoke(
+        ["start", "--effort", "medium", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", fixtureCase.id],
+        { scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"policy-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 }, runtimeCaseId: fixtureCase.id },
+      );
+      if (fixtureCase.expect.admit) {
+        assert.equal(result.code, 0);
+        assert.equal(result.json().sandbox, "read-only");
+        await harness.waitForCapture(result);
+        await harness.invoke(["wait", result.json().workerId]);
+      } else {
+        assert.equal(result.code, 1);
+        assert.deepEqual(result.json(), { schemaVersion: 2, ok: false, command: "start", workerId: null, error: { code: admissionCode, message: admissionMessage } });
+        assert.equal(JSON.stringify(result.json()).includes("registry"), false);
+        assert.equal(JSON.stringify(result.json()).includes("ERROR:"), false);
+        await harness.assertNoCapture(result);
+        await harness.assertNoWorkerArtifacts();
+      }
+      const calls = await harness.readRegistryCapture(result);
+      assert.deepEqual(calls.map(({ hive }) => hive), fixtureCase.expect.queryOrder);
+      assert.equal(calls.every(({ executable }) => executable === "C:\\Windows\\System32\\reg.exe"), true);
+      assert.equal(calls.every(({ shell, windowsHide, deadlineMs, streamCapBytes }) => shell === false && windowsHide === true && deadlineMs === 2000 && streamCapBytes === 8192), true);
+      if (fixtureCase.id === "policy-timeout") {
+        assert.equal(fixtureCase.steps[0].result.killAttempted, true);
+        assert.equal(fixtureCase.steps[0].result.closed, true);
+      }
+    });
+  }
+});
+
+test("host PowerShellCore transcription admission blocks before provider spawn", { skip: process.env.LUNA_SIDECAR_HOST_PROOF !== "1" }, async (t) => {
+  const harness = await createCliHarness(t);
+  const startedAt = Date.now();
+  const result = await harness.invoke(
+    ["start", "--effort", "low", "--sandbox", "read-only", "--cwd", harness.requestedCwd, "--", "safe host admission tripwire"],
+    { scenario: { exitCode: 99 }, productionRuntime: true, timeoutMs: 10_000 },
+  );
+  assert.equal(Date.now() - startedAt < 10_000, true);
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.json(), { schemaVersion: 2, ok: false, command: "start", workerId: null, error: { code: admissionCode, message: admissionMessage } });
+  await harness.assertNoCapture(result);
+  await harness.assertNoWorkerArtifacts();
+});
 
 test("provider completion does not outrun process close, then close plus completion completes", async (t) => {
   const harness = await createCliHarness(t);
@@ -107,6 +164,102 @@ test("nonfatal provider item errors remain warnings on successful close", async 
   const value = done.json();
   assert.equal(value.state, "completed");
   assert.deepEqual(value.warnings, ["provider_item_error"]);
+});
+
+test("exact failed command signatures are deduplicated receipt warnings without changing completion", async (t) => {
+  const cases = [
+    {
+      output: "helper_sandbox_lock_failed\nSetNamedSecurityInfoW failed with Windows error 1340",
+      warning: "provider_command_blocked:sandbox_lock_1340",
+    },
+    {
+      output: "batch file arguments are invalid",
+      warning: "provider_command_blocked:invalid_batch_shim",
+    },
+  ];
+  for (const expected of cases) {
+    const harness = await createCliHarness(t);
+    const event = JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", status: "failed", aggregated_output: expected.output },
+    });
+    const start = await harness.invoke(explicitStartArgs(harness, "blocked command"), {
+      scenario: { stdoutChunks: [`${event}\n`, `${event}\n`, "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    });
+    const waited = await harness.invoke(["wait", start.json().workerId]);
+    const status = await harness.invoke(["status", start.json().workerId]);
+    for (const receipt of [waited.json(), status.json()]) {
+      assert.equal(receipt.state, "completed");
+      assert.equal(receipt.providerState, "completed");
+      assert.equal(receipt.taskOutcome, "not_evaluated");
+      assert.deepEqual(receipt.warnings, [expected.warning]);
+    }
+  }
+});
+
+test("only failed command aggregated output can emit a command-blocked warning", async (t) => {
+  const harness = await createCliHarness(t);
+  const signature = "helper_sandbox_lock_failed SetNamedSecurityInfoW 1340";
+  const events = [
+    { type: "item.completed", item: { type: "agent_message", text: signature } },
+    { type: "item.completed", item: { type: "command_execution", status: "completed", aggregated_output: signature } },
+    { type: "item.completed", item: { type: "command_execution", status: "failed", aggregated_output: "ordinary command failure" } },
+    { type: "turn.completed" },
+  ].map((event) => `${JSON.stringify(event)}\n`);
+  const start = await harness.invoke(explicitStartArgs(harness, "signature words are not enough"), {
+    scenario: { stdoutChunks: events, exitCode: 0 },
+  });
+  const done = await harness.invoke(["wait", start.json().workerId]);
+  assert.equal(done.json().state, "completed");
+  assert.deepEqual(done.json().warnings, []);
+});
+
+test("PowerShell transcription startup failures are redacted, deduplicated, and nonfatal", async (t) => {
+  const harness = await createCliHarness(t);
+  const transcriptPath = "C:\\Users\\bitaz\\ForensicLogs\\PowerShellTranscripts\\20260811\\PowerShell_transcript.20260811.txt";
+  const output = `System.UnauthorizedAccessException: Access to ${transcriptPath} is denied.`;
+  const event = JSON.stringify({
+    type: "item.completed",
+    item: { type: "command_execution", status: "failed", aggregated_output: output },
+  });
+  const start = await harness.invoke(explicitStartArgs(harness, "transcription warning"), {
+    scenario: { stdoutChunks: [`${event}\n`, `${event}\n`, "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+  });
+  const waited = await harness.invoke(["wait", start.json().workerId]);
+  const receipt = waited.json();
+
+  assert.equal(receipt.state, "completed");
+  assert.equal(receipt.providerState, "completed");
+  assert.equal(receipt.taskOutcome, "not_evaluated");
+  assert.equal(receipt.turnCount, 1);
+  assert.equal(receipt.sandbox, "workspace-write");
+  assert.equal(receipt.bypass, false);
+  assert.deepEqual(receipt.warnings, ["provider_command_blocked:powershell_transcription"]);
+  assert.equal(JSON.stringify(receipt).includes(transcriptPath), false);
+  assert.equal(JSON.stringify(receipt).includes("System.UnauthorizedAccessException"), false);
+});
+
+test("PowerShell transcription warning ignores agent prose, successful commands, and near misses", async (t) => {
+  const harness = await createCliHarness(t);
+  const transcriptPath = "C:\\Users\\bitaz\\ForensicLogs\\PowerShellTranscripts\\20260811\\PowerShell_transcript.20260811.txt";
+  const completeOutput = `System.UnauthorizedAccessException: Access to ${transcriptPath} is denied.`;
+  const nearMiss = `System.UnauthorizedAccessException: Access to ${transcriptPath} is not denied.`;
+  const events = [
+    { type: "item.completed", item: { type: "agent_message", text: completeOutput } },
+    { type: "item.completed", item: { type: "command_execution", status: "completed", aggregated_output: completeOutput } },
+    { type: "item.completed", item: { type: "command_execution", status: "failed", aggregated_output: nearMiss } },
+    { type: "item.completed", item: { type: "command_execution", status: "failed", aggregated_output: "Access to C:\\other\\command.txt is denied." } },
+    { type: "turn.completed" },
+  ].map((event) => `${JSON.stringify(event)}\n`);
+  const start = await harness.invoke(explicitStartArgs(harness, "transcription near misses"), {
+    scenario: { stdoutChunks: events, exitCode: 0 },
+  });
+  const done = await harness.invoke(["wait", start.json().workerId]);
+  const receipt = done.json();
+  assert.equal(receipt.state, "completed");
+  assert.equal(receipt.providerState, "completed");
+  assert.equal(receipt.taskOutcome, "not_evaluated");
+  assert.deepEqual(receipt.warnings, []);
 });
 
 test("prompt claim and stdin acknowledgement are durable without retaining prompt text", async (t) => {

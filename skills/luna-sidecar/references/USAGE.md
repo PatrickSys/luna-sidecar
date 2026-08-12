@@ -17,7 +17,9 @@ node "<skill-folder>/scripts/luna-sidecar.mjs" list
 
 `start` acknowledges only after the runner persists the provider’s `thread.started` readiness/running proof. Harvest the receipt, status, wait result, logs, warnings, and final state. `resume` keeps the worker identity and creates a new turn; omitted controls inherit the stored values, while explicit cwd, sandbox, and effort changes remain visible. Use `cancel` when abandoning work. `list` is bounded deterministic history plus active workers.
 
-Run one worker first and confirm its environment is usable before bounded independent work. The host owns file and worktree coordination; native subagents must remain bounded and must not invoke Luna Sidecar recursively.
+If `start` returns `powershell_transcription_admission_blocked`, no Luna provider was started and requested read-only authority was preserved. Route the bounded task directly to a native Codex subagent with read-only authority. Luna Sidecar never auto-spawns the native agent, retries, widens authority, or changes policy, ACLs, Codex configuration, transcript/writable roots, or sandbox authority.
+
+After admission succeeds, run one real worker first and wait for its terminal receipt before bounded independent work. `thread.started` proves provider startup only; it does not prove that a later command can run. If the terminal warnings contain `provider_command_blocked:sandbox_lock_1340`, `provider_command_blocked:invalid_batch_shim`, or the defense-in-depth `provider_command_blocked:powershell_transcription` warning during a read-only task, stop Luna fan-out and use a native Codex subagent for it; surface the host-environment failure. The host owns file and worktree coordination; Luna Sidecar cannot prevent independently issued `start` calls, and native subagents must remain bounded and must not invoke Luna Sidecar recursively.
 
 ## Result evaluation
 
@@ -27,7 +29,7 @@ Operational completion is not task success. Compare the final receipt and conten
 
 Cancellation timeout or failure is not `cancelled`.
 
-`read-only`, `workspace-write`, and `full-access` are explicit authority choices. A cwd outside provider Git admission does not grant authority. Never broaden authority as failure recovery. Provider MCP setup remains outside this skill; pass through usage when present and report `unavailable` when the provider supplies no usage event.
+`read-only`, `workspace-write`, and `full-access` are explicit authority choices. Match the host's existing authority first; a host already operating with full access may explicitly choose Luna `full-access`. A cwd outside provider Git admission does not grant authority. Never broaden authority, change transcription policy or ACLs, or retry as failure recovery. Provider MCP setup remains outside this skill; pass through usage when present and report `unavailable` when the provider supplies no usage event.
 
 Treat the local state root, raw logs, and provider final messages as sensitive. Compact receipts are allowlisted, but content-bearing files are not generically redacted. Do not pass secrets in prompts or delegate secret handling.
 

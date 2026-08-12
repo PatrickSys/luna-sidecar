@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve, toNamespacedPath } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   CEILINGS_MS,
   EXPECTED_CI_JOB_NAMES,
@@ -749,6 +749,27 @@ if (input.includes("exactly two")) {
   await writeFakeShim(shimRoot, fakePath);
   const evidenceJson = join(root, "evidence", "v1-release-evidence.json");
   const evidenceMarkdown = join(root, "evidence", "v1-release-evidence.md");
+  const injectedPolicyEvidence = join(root, "private-policy-calls.jsonl");
+  const helperUrl = pathToFileURL(join(repositoryRoot, "test", "helpers", "cli-harness.mjs")).href;
+  let managerWrapperCount = 0;
+  const runWithPrivateDisabledPolicy = async (file, args, options) => {
+    if (file !== process.execPath || !options.commandName?.startsWith("manager-")) return runCapturedCommand(file, args, options);
+    const [copiedLauncher, ...managerArgs] = args;
+    const expectedRegistryCalls = options.commandName.startsWith("manager-start-") ? 1 : 0;
+    const wrapperPath = join(root, `private-manager-${managerWrapperCount += 1}.mjs`);
+    const wrapperSource = [
+      `import { appendFile } from ${JSON.stringify("node:fs/promises")};`,
+      `import { createInjectedRegistryRuntime } from ${JSON.stringify(helperUrl)};`,
+      `const target = await import(${JSON.stringify(pathToFileURL(copiedLauncher).href)});`,
+      `const injected = createInjectedRegistryRuntime("policy-disabled-hklm");`,
+      `await target.__testOnlyRunManager(injected.runtime);`,
+      `injected.assertConsumed(${expectedRegistryCalls});`,
+      `await appendFile(${JSON.stringify(injectedPolicyEvidence)}, JSON.stringify({commandName:${JSON.stringify(options.commandName)},caseId:"policy-disabled-hklm",expectedRegistryCalls:${expectedRegistryCalls},calls:injected.calls}) + "\\n", "utf8");`,
+      "",
+    ].join("\n");
+    await writeFile(wrapperPath, wrapperSource, "utf8");
+    return runCapturedCommand(file, [wrapperPath, ...managerArgs], options);
+  };
   const emitted = [];
   const capturedInputs = [];
   const originalWrite = process.stdout.write;
@@ -766,7 +787,7 @@ if (input.includes("exactly two")) {
       queryCi: async () => ci,
       run: (file, args, options = {}) => {
         if (options.input?.trim()) capturedInputs.push({ name: options.commandName, input: options.input });
-        return runCapturedCommand(file, args, options);
+        return runWithPrivateDisabledPolicy(file, args, options);
       },
       observeHosts: async ({ roots }) => {
         assert.equal(isPathWithin(roots.project, roots.hostCodexState), true);
@@ -830,6 +851,17 @@ if (input.includes("exactly two")) {
   assert.ok(cancellationInput);
   assert.equal(cancellationInput.input.trim(), buildCancellationPrompt());
   assert.equal(result.predicates.cancellation.result, true);
+  const injectedPolicyRecords = (await readFile(injectedPolicyEvidence, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(injectedPolicyRecords.every(({ caseId }) => caseId === "policy-disabled-hklm"), true);
+  assert.deepEqual(
+    injectedPolicyRecords.filter(({ expectedRegistryCalls }) => expectedRegistryCalls === 1).map(({ commandName }) => commandName),
+    ["manager-start-parent", "manager-start-cancellation"],
+  );
+  for (const record of injectedPolicyRecords) {
+    assert.equal(record.calls.length, record.expectedRegistryCalls, record.commandName);
+    assert.equal(record.calls.every(({ hive, executable, shell }) => hive === "HKLM" && executable === "C:\\Windows\\System32\\reg.exe" && shell === false), true);
+  }
+  assert.equal(result.predicates.parent.nativeChildCount === 2 && result.predicates.cancellation.result === true, true, "fake provider runs only after the private disabled-policy admission");
   assert.equal(result.failureStage, "provider");
   assert.deepEqual(result.ci.jobs.map((job) => job.id), [1, 2, 3, 4]);
   assert.deepEqual(JSON.parse(await readFile(evidenceJson, "utf8")), result);
