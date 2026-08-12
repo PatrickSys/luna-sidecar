@@ -44,6 +44,8 @@ import {
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const installerPath = join(repositoryRoot, "node_modules", "skills", "bin", "cli.mjs");
+const releaseSmokeScript = join(repositoryRoot, "scripts", "release-smoke.mjs");
+const HOST_LIFECYCLE_COMMANDS = ["start", "status", "wait", "resume", "cancel", "list"];
 
 test("release smoke parser keeps its exact internal control contract", () => {
   assert.deepEqual(parseReleaseSmokeArgs(["--live", "--tested-commit", "A".repeat(40), "--ci-run-id", "run-42"]), {
@@ -80,6 +82,109 @@ test("release smoke refuses recursive sidecar execution before any command spawn
     run: async () => { spawned += 1; },
   }), /nested_sidecar_forbidden/);
   assert.equal(spawned, 0);
+});
+
+test("release smoke help is stable, bounded, and side-effect free", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna release help-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const shimRoot = join(root, "host-shims");
+  const fakeHost = join(root, "fake-host.mjs");
+  const invocationCounter = join(root, "fake-host-invocations.txt");
+  await writeFile(fakeHost, `import { appendFile } from "node:fs/promises"; await appendFile(${JSON.stringify(invocationCounter)}, "host\\n");`, "utf8");
+  await writeHostShim(shimRoot, "codex", fakeHost);
+  await writeHostShim(shimRoot, "claude", fakeHost);
+
+  const help = await runCapturedCommand(process.execPath, [releaseSmokeScript, "--help"], {
+    cwd: root,
+    env: topLevelEnvironment({ PATH: `${shimRoot}${delimiter}${process.env.PATH ?? ""}`, LUNA_SIDECAR_HOME: join(root, "state") }),
+  });
+  assert.equal(help.code, 0);
+  assert.equal(help.signal, null);
+  assert.equal(help.stderr, "");
+  assert.equal(help.stdout, [
+    "Usage: node scripts/release-smoke.mjs --live --tested-commit <40-hex-commit> --ci-run-id <ci-run-id>",
+    "",
+    "Limits: per-host <= 180000 ms; overall <= 420000 ms; host concurrency = 1; cleanup confirmation = 15000 ms.",
+    "No other arguments are accepted.",
+    "",
+  ].join("\n"));
+  await assert.rejects(readFile(invocationCounter, "utf8"));
+});
+
+test("release smoke persists source-owned bounds and rejects undocumented parser flags", () => {
+  assert.ok(CEILINGS_MS.parent <= 180_000);
+  assert.ok(CEILINGS_MS.resume <= 180_000);
+  assert.ok(CEILINGS_MS.outer <= 420_000);
+  assert.equal(CEILINGS_MS.knownPidAbsence, 15_000);
+  for (const args of [
+    ["--help"],
+    ["--live", "--tested-commit", "a".repeat(40), "--ci-run-id", "42", "--provider"],
+    ["--live", "--tested-commit", "a".repeat(40), "--ci-run-id", "42", "--timeout", "1"],
+  ]) assert.throws(() => parseReleaseSmokeArgs(args), /argument_invalid/);
+
+  const evidence = redactEvidence({ limits: { perHostMs: 1, overallMs: 2, maxHostConcurrency: 99, cleanupConfirmationMs: 3 } });
+  assert.deepEqual(evidence.limits, { perHostMs: 180_000, overallMs: 420_000, maxHostConcurrency: 1, cleanupConfirmationMs: 15_000 });
+});
+
+test("fake host observations are serialized and retain the six-command lifecycle", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna release lifecycle-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const callerRoot = join(root, "caller");
+  const codexState = join(projectRoot, ".luna-host-state-codex");
+  const claudeState = join(projectRoot, ".luna-host-state-claude");
+  await Promise.all([projectRoot, callerRoot, join(codexState, "workers"), join(claudeState, "workers")].map((path) => mkdir(path, { recursive: true })));
+  const specs = [
+    { host: "codex_cli", version: "0.147.0", skillRoot: join(projectRoot, ".agents", "skills", "luna-sidecar"), stateRoot: codexState },
+    { host: "claude_code", version: "2.1.220", skillRoot: join(projectRoot, ".claude", "skills", "luna-sidecar"), stateRoot: claudeState },
+  ];
+  let activeHosts = 0;
+  let maxHosts = 0;
+  const observedHosts = [];
+  const result = await runHostObservations({
+    roots: { project: projectRoot, hostCodexState: codexState, hostClaudeState: claudeState, cancellationCaller: callerRoot },
+    environment: {},
+    run: async (_file, _args, options = {}) => {
+      if (options.commandName === "host-codex" || options.commandName === "host-claude") {
+        activeHosts += 1;
+        maxHosts = Math.max(maxHosts, activeHosts);
+        observedHosts.push(options.commandName);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+        activeHosts -= 1;
+        const spec = specs.find(({ host }) => options.commandName === `host-${host === "codex_cli" ? "codex" : "claude"}`);
+        const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: null };
+        return { code: 0, signal: null, timedOut: false, pid: null, stdout: makeFakeHostOutput(spec.host, projectRoot, spec.skillRoot, receipt), stderr: "" };
+      }
+      return { code: 0, signal: null, timedOut: false, pid: null, stdout: "{}", stderr: "" };
+    },
+    deadline: { at: Date.now() + 10_000, timedOut: false },
+    schemaPath: join(root, "schema.json"),
+    codexVersion: specs[0].version,
+    claudeVersion: specs[1].version,
+    inspect: async (pid) => ({ exists: false, pid }),
+  });
+  assert.equal(maxHosts, 1);
+  assert.deepEqual(observedHosts, ["host-codex", "host-claude"]);
+  for (const host of ["codex_cli", "claude_code"]) {
+    assert.deepEqual(result.hosts[host].lifecycle, Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((command) => [command, true])));
+    assert.equal(result.hosts[host].claimEligible, false, "cleanup is not proven by this fake fixture");
+  }
+});
+
+test("missing lifecycle evidence cannot become a host claim", () => {
+  const projectRoot = resolve(tmpdir(), "luna-host-project");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
+  const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
+  const command = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
+  const output = [
+    JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: JSON.stringify(receipt) } }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }),
+  ].join("\n");
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: output }, { projectRoot, skillRoot }), (error) => error.schemaReason === "lifecycle_missing");
+  const evidence = redactEvidence({ releaseReady: true, hosts: { codex_cli: { available: true, invocationRef: "evidence://codex", procedureRef: "release-smoke.codex", hostVersion: "0.147.0", sidecarReceipt: { schemaVersion: 2, schemaResult: "valid" }, cleanup: { result: "verified", ownedPidResult: "all_gone", ownedPidsGone: true }, failureCode: null, claimEligible: true } }, otherGates: { deterministic: true, installedParity: true, ci: true, delivery: true, evidence: true }, cleanup: { attempted: true, launchedWorkerCount: 0, discoveredWorkerCount: 0, ownedPidCount: 0, stopFailures: 0, identityUncertain: 0, identityMismatches: 0, lingeringPids: 0, recoveryUsed: false, scratchCleanupFailed: false, releaseReady: true } });
+  assert.equal(evidence.hosts.codex_cli.claimEligible, false);
+  assert.equal(evidence.releaseReady, false);
 });
 
 test("host adapters use the installed skill workflow and documented CLI surfaces", () => {
@@ -197,18 +302,11 @@ test("host event parsing requires copied-skill execution, a v2 receipt, and no t
   const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
   const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
   const command = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
-  const codexResult = { stdout: [
-    JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: JSON.stringify(receipt) } }),
-    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }),
-  ].join("\n") };
+  const codexResult = { stdout: makeFakeHostOutput("codex_cli", projectRoot, skillRoot, receipt) };
   const parsedCodex = parseHostObservationResult("codex_cli", codexResult, { projectRoot, skillRoot });
   assert.equal(parsedCodex.receipt.turnId, receipt.turnId);
 
-  const claudeResult = { stdout: [
-    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } }),
-    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } }),
-    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } }),
-  ].join("\n") };
+  const claudeResult = { stdout: makeFakeHostOutput("claude_code", projectRoot, skillRoot, receipt) };
   const parsedClaude = parseHostObservationResult("claude_code", claudeResult, { projectRoot, skillRoot });
   assert.equal(parsedClaude.payload.taskOutcome, "not_evaluated");
   assert.throws(() => parseHostObservationResult("codex_cli", { stdout: [JSON.stringify({ type: "item.completed", item: { type: "command_execution", command } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ ...payload, taskOutcome: "completed" }) } })].join("\n") }, { projectRoot, skillRoot }), (error) => error.code === "host_schema_mismatch" && error.schemaReason === "payload_shape_invalid");
@@ -223,6 +321,7 @@ test("host schema failures report distinct bounded predicates", () => {
     "receipt_not_observed",
     "receipt_mismatch",
     "receipt_terminal_invalid",
+    "lifecycle_missing",
   ]);
   const projectRoot = resolve(tmpdir(), "luna-host-project");
   const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
@@ -311,8 +410,6 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
 
   const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: 4444, runnerPid: 4444, providerPid: null };
   await writeFile(join(stateRoot, "workers", `${receipt.workerId}.json`), JSON.stringify({ schemaVersion: 2, workerId: receipt.workerId, state: "completed", turns: [{ ...receipt, cwd: projectRoot }] }), "utf8");
-  const skillCommand = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
-  const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
   const cleanupUncertain = await runHostObservation({
     host: "codex_cli",
     hostVersion: "0.147.0",
@@ -323,7 +420,7 @@ test("host availability, command failure, and cleanup uncertainty fail closed", 
     schemaPath: join(root, "schema.json"),
     environment: {},
     run: async (_file, _args, options) => options.commandName === "host-codex"
-      ? { code: 0, signal: null, timedOut: false, pid: 5555, stdout: `${JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: skillCommand, aggregated_output: JSON.stringify(receipt) } })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } })}`, stderr: "" }
+      ? { code: 0, signal: null, timedOut: false, pid: 5555, stdout: makeFakeHostOutput("codex_cli", projectRoot, skillRoot, receipt), stderr: "" }
       : { code: 0, signal: null, timedOut: false, pid: null, stdout: "", stderr: "" },
     deadline: { at: Date.now() + 10_000, timedOut: false },
     inspect: async (pid) => pid === 4444 ? { exists: true, uncertain: true, pid } : { exists: false, pid },
@@ -385,16 +482,21 @@ const goneChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windows
 await new Promise((resolve) => goneChild.once("close", resolve));
 const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: goneChild.pid };
 const command = "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" start --cwd \\\"" + project + "\\\" --sandbox read-only --effort medium -- \\\"inspect\\\"";
+const lifecycleCommands = ["start", "status", "wait", "resume", "cancel", "list"];
+const lifecycleCommand = (name) => name === "start" ? command : "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" " + name;
 const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: { schemaVersion: receipt.schemaVersion, workerId: receipt.workerId, turnId: receipt.turnId, state: receipt.state, providerState: receipt.providerState, errorCode: receipt.errorCode, taskOutcome: receipt.taskOutcome } };
 await mkdir(join(skill, "scripts"), { recursive: true });
 await writeFile(join(skill, "scripts", "luna-sidecar.mjs"), "process.exit(0);", "utf8");
 await mkdir(join(state, "workers"), { recursive: true });
 await writeFile(join(state, "workers", receipt.workerId + ".json"), JSON.stringify({ schemaVersion: 2, workerId: receipt.workerId, state: "completed", turns: [{ turnId: receipt.turnId, cwd: project, pid: receipt.pid }] }), "utf8");
 if (host === "codex_cli") {
-  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: JSON.stringify(receipt) } }) + "\\n");
+  for (const name of lifecycleCommands) {
+    const lifecycleInvocation = lifecycleCommand(name);
+    process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: lifecycleInvocation, ...(name === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } }) + "\\n");
+  }
   process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }) + "\\n");
 } else {
-  process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } }) + "\\n");
+  for (const name of lifecycleCommands) process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: lifecycleCommand(name) } }] } }) + "\\n");
   process.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } }) + "\\n");
   process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } }) + "\\n");
 }
@@ -800,6 +902,7 @@ if (input.includes("exactly two")) {
               procedureRef: "release-smoke.codex_cli.v1",
               hostVersion: "9.8.7",
               sidecarReceipt: { schemaVersion: 2, schemaResult: "valid" },
+              lifecycle: Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((command) => [command, true])),
               cleanup: { result: "verified", ownedPidResult: "all_gone", ownedPids: [], ownedPidsGone: true },
               failureCode: null,
               claimEligible: true,
@@ -904,6 +1007,24 @@ function topLevelEnvironment(extra = {}) {
   const env = { ...process.env, ...extra };
   delete env.LUNA_SIDECAR_WORKER_MARKER;
   return env;
+}
+
+function makeFakeHostOutput(host, projectRoot, skillRoot, receipt) {
+  const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
+  const commandLine = (commandName) => commandName === "start"
+    ? `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`
+    : `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" ${commandName}`;
+  const events = HOST_LIFECYCLE_COMMANDS.map((commandName) => {
+    const command = commandLine(commandName);
+    if (host === "codex_cli") return { type: "item.completed", item: { type: "command_execution", command, ...(commandName === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } };
+    return { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } };
+  });
+  if (host === "codex_cli") events.push({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } });
+  else {
+    events.push({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } });
+    events.push({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } });
+  }
+  return events.map((event) => JSON.stringify(event)).join("\n");
 }
 
 async function writeFakeShim(shimRoot, fakePath) {

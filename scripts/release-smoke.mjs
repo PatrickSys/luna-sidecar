@@ -32,14 +32,28 @@ export const EXPECTED_CI_JOB_NAMES = Object.freeze([
   "ubuntu-latest / Node 22.20.0",
   "ubuntu-latest / Node 24.x",
 ]);
+export const RELEASE_LIMITS_MS = Object.freeze({
+  perHost: 180_000,
+  overall: 420_000,
+  cleanupConfirmation: 15_000,
+});
+export const MAX_HOST_CONCURRENCY = 1;
+export const HOST_LIFECYCLE_COMMANDS = Object.freeze(["start", "status", "wait", "resume", "cancel", "list"]);
 export const CEILINGS_MS = Object.freeze({
-  parent: 15 * 60_000,
-  resume: 8 * 60_000,
+  parent: RELEASE_LIMITS_MS.perHost,
+  resume: RELEASE_LIMITS_MS.perHost,
   observeCancellationRunning: 2 * 60_000,
   cancellation: 30_000,
-  knownPidAbsence: 15_000,
-  outer: 30 * 60_000,
+  knownPidAbsence: RELEASE_LIMITS_MS.cleanupConfirmation,
+  outer: RELEASE_LIMITS_MS.overall,
 });
+export const RELEASE_SMOKE_HELP = [
+  "Usage: node scripts/release-smoke.mjs --live --tested-commit <40-hex-commit> --ci-run-id <ci-run-id>",
+  "",
+  `Limits: per-host <= ${RELEASE_LIMITS_MS.perHost} ms; overall <= ${RELEASE_LIMITS_MS.overall} ms; host concurrency = ${MAX_HOST_CONCURRENCY}; cleanup confirmation = ${RELEASE_LIMITS_MS.cleanupConfirmation} ms.`,
+  "No other arguments are accepted.",
+  "",
+].join("\n");
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const canonicalSkillRoot = join(repositoryRoot, "skills", "luna-sidecar");
@@ -61,6 +75,7 @@ const controlledCommandNames = new Set([
   "host-codex",
   "host-claude",
   "manager-start-parent",
+  "manager-list",
   "manager-wait-parent",
   "manager-resume",
   "manager-wait-resume",
@@ -125,6 +140,7 @@ export const HOST_SCHEMA_REASONS = Object.freeze([
   "receipt_not_observed",
   "receipt_mismatch",
   "receipt_terminal_invalid",
+  "lifecycle_missing",
 ]);
 const hostSchemaReasons = new Set(HOST_SCHEMA_REASONS);
 
@@ -632,8 +648,22 @@ export function redactEvidence(input) {
       .sort((left, right) => EXPECTED_CI_JOB_NAMES.indexOf(left.name) - EXPECTED_CI_JOB_NAMES.indexOf(right.name)),
   } : null;
   const commands = (input.commands ?? []).map((command) => ({ name: controlledCommandNames.has(command.name) ? command.name : "unknown", exitCode: Number.isInteger(command.exitCode) ? command.exitCode : null }));
-  const hosts = normalizeHosts(input.hosts);
+  const normalizedHosts = normalizeHosts(input.hosts);
+  const hosts = Object.fromEntries(Object.entries(normalizedHosts).map(([provider, host]) => {
+    const lifecycle = normalizeLifecycle(input.hosts?.[provider]?.lifecycle ?? host.lifecycle);
+    return [provider, {
+      ...host,
+      lifecycle,
+      claimEligible: host.claimEligible === true && lifecycleComplete(lifecycle),
+    }];
+  }));
   const otherGates = normalizeOtherGates(input.otherGates);
+  const cleanup = normalizeCleanup(input.cleanup);
+  const releaseReady = input.releaseReady === true
+    && Object.values(hosts).every((host) => host.claimEligible === true)
+    && Object.values(otherGates).every(Boolean)
+    && cleanup.releaseReady === true
+    && input.predicates?.outerTimedOut !== true;
   return {
     schemaVersion: 1,
     testedCommit: /^[0-9a-f]{40}$/i.test(String(input.testedCommit ?? "")) ? String(input.testedCommit).toLowerCase() : null,
@@ -644,15 +674,38 @@ export function redactEvidence(input) {
     roots,
     installs,
     ci,
+    limits: normalizeLimits(),
     hosts,
     otherGates,
     commands,
     predicates: normalizePredicates(input.predicates),
-    cleanup: normalizeCleanup(input.cleanup),
+    cleanup,
     unresolvedGaps: [...new Set((input.unresolvedGaps ?? []).filter((code) => gapCodes.has(code)))].sort(),
     claim: fixedClaim,
-    releaseReady: input.releaseReady === true,
+    releaseReady,
     failureStage: failureStages.has(input.failureStage) ? input.failureStage : null,
+  };
+}
+
+function emptyLifecycle() {
+  return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((command) => [command, false]));
+}
+
+function normalizeLifecycle(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((command) => [command, source[command] === true]));
+}
+
+function lifecycleComplete(value) {
+  return HOST_LIFECYCLE_COMMANDS.every((command) => value?.[command] === true);
+}
+
+function normalizeLimits() {
+  return {
+    perHostMs: CEILINGS_MS.parent,
+    overallMs: CEILINGS_MS.outer,
+    maxHostConcurrency: MAX_HOST_CONCURRENCY,
+    cleanupConfirmationMs: CEILINGS_MS.knownPidAbsence,
   };
 }
 
@@ -817,10 +870,11 @@ function normalizePredicates(value) {
     parent: new Set(["authority", "cwd", "lineage", "completed", "providerCompleted", "logs", "nativeChildCount"]),
     resume: new Set(["authority", "cwd", "lineage", "completed", "providerCompleted", "logs", "markerCommandFailed", "markerAbsent"]),
     cancellation: new Set(["authority", "cwd", "lineage", "providerRunningBeforeCancel", "acknowledged", "cancelled", "result", "knownPidsGone"]),
+    lifecycle: new Set(HOST_LIFECYCLE_COMMANDS),
   };
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const output = normalizePredicateObject(value, allowed.top);
-  for (const key of ["parent", "resume", "cancellation"]) if (value[key] && typeof value[key] === "object") output[key] = normalizePredicateObject(value[key], allowed[key]);
+  for (const key of ["parent", "resume", "cancellation", "lifecycle"]) if (value[key] && typeof value[key] === "object") output[key] = normalizePredicateObject(value[key], allowed[key]);
   return output;
 }
 
@@ -1005,7 +1059,7 @@ export function hostObservationPrompt(host) {
     activation,
     "Do not invoke the launcher from the canonical source or substitute a direct manager call outside the skill workflow.",
     "Delegate exactly one bounded read-only task: inspect the installed luna-sidecar skill files and report only their six public commands.",
-    "Start one worker with explicit cwd, sandbox, and effort from the skill instructions, wait for it, and harvest the exact final v2 sidecar receipt.",
+    "Start one worker with explicit cwd, sandbox, and effort from the skill instructions; exercise start, status, wait, resume, cancel, and list through the installed workflow; then harvest the exact final v2 sidecar receipt.",
     "Do not claim the delegated task succeeded; taskOutcome must remain not_evaluated.",
     "Return exactly one JSON object with this shape and no Markdown: {\"schemaVersion\":1,\"skill\":\"luna-sidecar\",\"workflow\":\"subagent\",\"taskOutcome\":\"not_evaluated\",\"sidecarReceipt\":<exact final v2 receipt>}.",
   ].join(" ");
@@ -1089,6 +1143,17 @@ function isSidecarReceipt(value) {
     && typeof value.turnId === "string" && value.turnId.length > 0;
 }
 
+function hostLifecyclePredicates(commands, skillRoot) {
+  const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
+  return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((commandName) => [commandName, commands.some((command) => {
+    const normalized = command.replaceAll("\\", "/").toLowerCase();
+    const invocation = normalized.split(/\s--\s/, 1)[0];
+    return invocation.includes(expectedSkillRoot)
+      && invocation.includes("luna-sidecar.mjs")
+      && new RegExp(`(?:^|\\s)${commandName}(?:\\s|$)`).test(invocation);
+  })]));
+}
+
 function finalHostPayload(events) {
   const candidates = [];
   for (const event of events) {
@@ -1124,7 +1189,9 @@ export function parseHostObservationResult(host, result, { projectRoot, skillRoo
   if (payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
     throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_terminal_invalid");
   }
-  return { events, payload, receipt: payload.sidecarReceipt, commands };
+  const lifecycle = hostLifecyclePredicates(commands, skillRoot);
+  if (!lifecycleComplete(lifecycle)) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "lifecycle_missing");
+  return { events, payload, receipt: payload.sidecarReceipt, commands, lifecycle };
 }
 
 function unavailableHostEvidence(host, failureCode) {
@@ -1135,6 +1202,7 @@ function unavailableHostEvidence(host, failureCode) {
     hostVersion: null,
     sidecarReceipt: { schemaVersion: null, schemaResult: "not_run" },
     cleanup: { result: "not_run", ownedPidResult: "not_run", ownedPids: [], ownedPidsGone: false },
+    lifecycle: emptyLifecycle(),
     failureDiagnostics: null,
     failureCode,
     claimEligible: false,
@@ -1259,10 +1327,11 @@ export async function runHostObservation({
       schemaResult: parsed ? "valid" : (result?.stdout ? "invalid" : "missing"),
       ...(schemaReason ? { schemaReason } : {}),
     },
+    lifecycle: parsed?.lifecycle ?? emptyLifecycle(),
     cleanup,
     failureDiagnostics: result && (result.timedOut || result.spawnError || result.code !== 0 || result.signal) ? hostFailureDiagnostics(result) : null,
     failureCode: failureCode ?? null,
-    claimEligible: Boolean(parsed && cleanupVerified && !failureCode),
+    claimEligible: Boolean(parsed && lifecycleComplete(parsed.lifecycle) && cleanupVerified && !failureCode),
     host,
   };
   return { evidence, gaps: [...new Set([...(sidecarCleanup.result.gaps ?? []), ...(failureCode ? [failureCode] : [])])], ownedPids: allOwnedPids };
@@ -1360,6 +1429,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     parent: { authority: false, cwd: false, lineage: false, completed: false, providerCompleted: false, logs: false, nativeChildCount: 0 },
     resume: { authority: false, cwd: false, lineage: false, completed: false, providerCompleted: false, logs: false, markerCommandFailed: false, markerAbsent: false },
     cancellation: { authority: false, cwd: false, lineage: false, providerRunningBeforeCancel: false, acknowledged: false, cancelled: false, result: false, knownPidsGone: false },
+    lifecycle: emptyLifecycle(),
   };
   const gaps = [];
   const launchedWorkerIds = [];
@@ -1379,9 +1449,16 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     remember(started);
     parentTurnId = started.turnId;
     if (typeof started.workerId !== "string" || !started.workerId || typeof started.turnId !== "string" || !started.turnId) throw new ReleaseSmokeError("parent_incomplete", "provider");
+    facts.lifecycle.start = true;
+    const listResult = await runManager(run, "manager-list", launcher, ["list"], roots.parentCaller, env, deadline, commandLog, "", remainingPhaseTime(deadline, parentStopAt));
+    if (listResult.timedOut) throw new ReleaseSmokeError(listResult.outerTimedOut ? "outer_timeout" : "manager_timeout", "provider");
+    const listed = await parseManagerResult(listResult);
+    if (!Array.isArray(listed) || !listed.some((worker) => worker?.workerId === started.workerId)) throw new ReleaseSmokeError("parent_incomplete", "provider");
+    facts.lifecycle.list = true;
     const parentWaitResult = await runManager(run, "manager-wait-parent", launcher, ["wait", started.workerId, "--timeout", String(remainingPhaseTime(deadline, parentStopAt))], roots.parentCaller, env, deadline, commandLog, "", remainingPhaseTime(deadline, parentStopAt));
     if (parentWaitResult.timedOut) throw new ReleaseSmokeError(parentWaitResult.outerTimedOut ? "outer_timeout" : "manager_timeout", "provider");
     if (!validateWaitOutcome(parentWaitResult)) throw new ReleaseSmokeError("manager_timeout", "provider");
+    facts.lifecycle.wait = true;
     const parent = await parseManagerResult(parentWaitResult);
     remember(parent);
     facts.parent.authority = parent.effort === "max" && parent.sandbox === "read-only" && parent.bypass === false;
@@ -1408,6 +1485,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     resumeStarted = await parseManagerResult(resumeResult);
     remember(resumeStarted);
     if (typeof resumeStarted?.turnId !== "string" || !resumeStarted.turnId) throw new ReleaseSmokeError("resume_incomplete", "provider");
+    facts.lifecycle.resume = true;
     const waitResult = await runManager(run, "manager-wait-resume", launcher, ["wait", workerId, "--timeout", String(remainingPhaseTime(deadline, resumeStopAt))], roots.resumeCaller, env, deadline, commandLog, "", remainingPhaseTime(deadline, resumeStopAt));
     if (waitResult.timedOut) throw new ReleaseSmokeError(waitResult.outerTimedOut ? "outer_timeout" : "manager_timeout", "provider");
     if (!validateWaitOutcome(waitResult)) throw new ReleaseSmokeError("manager_timeout", "provider");
@@ -1436,6 +1514,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     if (typeof started.workerId !== "string" || !started.workerId || typeof started.turnId !== "string" || !started.turnId) throw new ReleaseSmokeError("cancellation_incomplete", "provider");
     const running = await pollRunning(run, launcher, started.workerId, roots.cancellationCaller, env, deadline, commandLog, observeStopAt);
     if (!running) throw new ReleaseSmokeError("cancellation_incomplete", "provider");
+    facts.lifecycle.status = true;
     remember(running);
     facts.cancellation.providerRunningBeforeCancel = true;
     facts.cancellation.providerPid = running.providerPid;
@@ -1443,6 +1522,7 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
     const cancelResult = await runManager(run, "manager-cancel", launcher, ["cancel", started.workerId], roots.cancellationCaller, env, deadline, commandLog, "", remainingPhaseTime(deadline, cancellationStopAt, "cancellation_incomplete"));
     if (cancelResult.timedOut || cancelResult.code !== 0 || cancelResult.signal) throw new ReleaseSmokeError(cancelResult.timedOut && cancelResult.outerTimedOut ? "outer_timeout" : "cancellation_incomplete", "provider");
     const cancelReceipt = await parseManagerResult(cancelResult);
+    facts.lifecycle.cancel = true;
     const waitResult = await runManager(run, "manager-wait-cancellation", launcher, ["wait", started.workerId, "--timeout", String(remainingPhaseTime(deadline, cancellationStopAt, "cancellation_incomplete"))], roots.cancellationCaller, env, deadline, commandLog, "", remainingPhaseTime(deadline, cancellationStopAt, "cancellation_incomplete"));
     if (waitResult.timedOut) throw new ReleaseSmokeError(waitResult.outerTimedOut ? "outer_timeout" : "cancellation_incomplete", "provider");
     if (!validateWaitOutcome(waitResult)) throw new ReleaseSmokeError("cancellation_incomplete", "provider");
@@ -1465,6 +1545,8 @@ export async function runLiveScenarios({ launcher, roots, env, run, deadline, co
   if (!facts.resume.completed || !facts.resume.providerCompleted || !facts.resume.logs || !facts.resume.authority || !facts.resume.cwd || !facts.resume.lineage || !facts.resume.markerCommandFailed || !facts.resume.markerAbsent) addGap("resume_incomplete");
   const cancellationSatisfied = cancellationPredicate({ providerPid: facts.cancellation.providerPid, providerRunning: facts.cancellation.providerRunningBeforeCancel, acknowledged: facts.cancellation.acknowledged, state: facts.cancellation.cancelled ? "cancelled" : null, result: facts.cancellation.result ? "cancelled" : null, knownOwnedPidsGone: facts.cancellation.knownPidsGone });
   if (!facts.cancellation.authority || !facts.cancellation.cwd || !facts.cancellation.lineage || !cancellationSatisfied) addGap("cancellation_incomplete");
+  facts.sixCommandSurface = lifecycleComplete(facts.lifecycle);
+  if (!facts.sixCommandSurface) addGap("parent_incomplete");
   return { facts, gaps, launchedWorkerCount: launchedWorkerIds.length, ownedPids: [...ownedPids] };
 }
 
@@ -1642,7 +1724,9 @@ function buildEvidence({ options, roots, install, ci, codexVersion, commands, sc
       parent: scenarios?.facts?.parent ?? {},
       resume: scenarios?.facts?.resume ?? {},
       cancellation: scenarios?.facts?.cancellation ?? {},
+      lifecycle: scenarios?.facts?.lifecycle ?? {},
       nativeChildCount: scenarios?.facts?.parent?.nativeChildCount ?? 0,
+      sixCommandSurface: scenarios?.facts?.sixCommandSurface === true,
     },
     cleanup: cleanup?.facts ? { ...cleanup.facts, releaseReady: cleanup.result?.releaseReady === true } : { attempted: false, releaseReady: false },
     unresolvedGaps: allGaps,
@@ -1828,6 +1912,10 @@ function stripTestEnvironment(env) {
 }
 
 async function main(argv) {
+  if (argv.length === 1 && argv[0] === "--help") {
+    process.stdout.write(RELEASE_SMOKE_HELP);
+    return 0;
+  }
   let options;
   try { options = parseReleaseSmokeArgs(argv); }
   catch { process.stderr.write("release-smoke: invalid arguments\n"); return 2; }
