@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import {
+  copyFile,
   link,
   mkdir,
   open,
@@ -984,7 +985,6 @@ async function runWorkerLifecycle(workerId) {
       } catch {
         warnings.add("stdin_receipt_unavailable");
       }
-      await cleanupPublishedPrompt(turn, workerId);
     });
 
     const cancelTimer = setInterval(() => {
@@ -1435,6 +1435,8 @@ async function finalizeProvider(workerId, facts) {
   });
   const turn = latestTurn(result.worker);
   if (turn?.cancel?.result === "not_applied") await removeCancelRequest(workerId, turn.turnId);
+  if (turn?.state === "completed") await cleanupPublishedPrompt(turn, workerId);
+  else if (turn) await preservePromptOnFailure(turn, workerId);
 }
 
 function providerCommandBlockWarning(event) {
@@ -1921,6 +1923,18 @@ async function cleanupPublishedPrompt(turn, workerId = null) {
       return syncProjection(current);
     }).catch(() => {});
   }
+}
+
+async function preservePromptOnFailure(turn, workerId) {
+  if (turn.sourceSchemaVersion === 0) return;
+  const preservedPath = join(logsRoot, `${turn.turnId}.prompt`);
+  for (const source of [turn.promptClaimedPath, turn.promptPath]) {
+    try {
+      await copyFile(source, preservedPath);
+      break;
+    } catch { /* try the next candidate */ }
+  }
+  await cleanupPublishedPrompt(turn, workerId);
 }
 
 async function safeRealpath(cwd) {

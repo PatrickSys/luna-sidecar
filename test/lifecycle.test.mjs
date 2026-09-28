@@ -278,7 +278,28 @@ test("prompt claim and stdin acknowledgement are durable without retaining promp
   assert.equal(JSON.stringify(worker).includes("secret prompt body"), false);
   assert.equal(worker.turns[0].promptSha256.length, 64);
   await harness.release(start);
-  await harness.invoke(["wait", receipt.workerId]);
+  const done = await harness.invoke(["wait", receipt.workerId]);
+  assert.equal(done.json().state, "completed");
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt.claimed`));
+  await assertFileMissing(join(harness.stateRoot, "logs", `${receipt.turnId}.prompt`));
+});
+
+test("a failed run preserves the prompt next to its logs instead of deleting it", async (t) => {
+  const harness = await createCliHarness(t);
+  const prompt = "replay me after the failure";
+  const start = await harness.invoke(explicitStartArgs(harness, prompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.failed\",\"message\":\"bad\"}\n"], exitCode: 0 },
+  });
+  const receipt = start.json();
+  const workerId = receipt.workerId ?? await waitForCreatedWorker(harness);
+  const done = await harness.invoke(start.code === 0 ? ["wait", workerId] : ["status", workerId]);
+  const view = done.json();
+  assert.equal(view.state, "failed");
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt.claimed`));
+  const preserved = await readFile(join(harness.stateRoot, "logs", `${view.turnId}.prompt`), "utf8");
+  assert.equal(preserved, prompt);
 });
 
 test("starting cancellation is acknowledged before provider spawn", async (t) => {
