@@ -178,7 +178,7 @@ test("missing lifecycle evidence cannot become a host claim", () => {
   const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
   const command = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
   const output = [
-    JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: JSON.stringify(receipt) } }),
+    JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, exit_code: 0, aggregated_output: JSON.stringify(receipt) } }),
     JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }),
   ].join("\n");
   assert.throws(() => parseHostObservationResult("codex_cli", { stdout: output }, { projectRoot, skillRoot }), (error) => error.schemaReason === "lifecycle_missing");
@@ -311,7 +311,7 @@ test("host event parsing requires copied-skill execution, a v2 receipt, and no t
   const claudeResult = { stdout: makeFakeHostOutput("claude_code", projectRoot, skillRoot, receipt) };
   const parsedClaude = parseHostObservationResult("claude_code", claudeResult, { projectRoot, skillRoot });
   assert.equal(parsedClaude.payload.taskOutcome, "not_evaluated");
-  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: [JSON.stringify({ type: "item.completed", item: { type: "command_execution", command } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ ...payload, taskOutcome: "completed" }) } })].join("\n") }, { projectRoot, skillRoot }), (error) => error.code === "host_schema_mismatch" && error.schemaReason === "payload_shape_invalid");
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: [JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, exit_code: 0 } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ ...payload, taskOutcome: "completed" }) } })].join("\n") }, { projectRoot, skillRoot }), (error) => error.code === "host_schema_mismatch" && error.schemaReason === "payload_shape_invalid");
 });
 
 test("host schema failures report distinct bounded predicates", () => {
@@ -330,7 +330,7 @@ test("host schema failures report distinct bounded predicates", () => {
   const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
   const otherReceipt = { ...receipt, workerId: "33333333-3333-4333-8333-333333333333" };
   const command = `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`;
-  const event = (output = null) => ({ type: "item.completed", item: { type: "command_execution", command, ...(output === null ? {} : { aggregated_output: JSON.stringify(output) }) } });
+  const event = (output = null) => ({ type: "item.completed", item: { type: "command_execution", command, exit_code: 0, ...(output === null ? {} : { aggregated_output: JSON.stringify(output) }) } });
   const message = (value) => ({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(value) } });
   const parse = (events) => parseHostObservationResult("codex_cli", { code: 0, stdout: typeof events === "string" ? events : events.map(JSON.stringify).join("\n") }, { projectRoot, skillRoot });
   const assertReason = (events, reason) => assert.throws(() => parse(events), (error) => error.code === "host_schema_mismatch" && error.schemaReason === reason);
@@ -381,6 +381,50 @@ test("Codex 0.159 project-relative launcher commands are read as copied-skill co
   }
   const partial = captured().split("\n").filter((line) => !/ (resume|cancel|list)\b/.test(line)).join("\n");
   assert.throws(() => parseHostObservationResult("codex_cli", { code: 0, stdout: partial }, { projectRoot, skillRoot }), (error) => error.schemaReason === "lifecycle_missing");
+});
+
+test("copied launcher invocation rejects mentions, alternate roots and unrelated lifecycle words", () => {
+  const projectRoot = resolve(tmpdir(), "luna-host-project");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
+  const captured = (commandFor, eventType = "command_execution") => makeFakeHostOutput("codex_cli", projectRoot, skillRoot, receipt).split("\n").map((line) => {
+    const event = JSON.parse(line);
+    if (event.item?.command) {
+      const name = event.item.command.match(/\.mjs" (\w+)/)[1];
+      event.item.command = commandFor(name);
+      event.item.type = eventType;
+    }
+    return JSON.stringify(event);
+  }).join("\n");
+  const absolute = join(skillRoot, "scripts", "luna-sidecar.mjs");
+  const invalidCommands = [
+    (name) => `echo '.agents/skills/luna-sidecar/scripts/luna-sidecar.mjs' ${name}`,
+    (name) => `echo "node '${absolute}' ${name}"`,
+    (name) => `node '${join(`${skillRoot}-evil`, "scripts", "luna-sidecar.mjs")}' ${name}`,
+    (name) => `node '${absolute}.bak' ${name}`,
+    (name) => `node '${absolute}' --comment ${name}`,
+    (name) => `node '${absolute}' status -- '${name}'`,
+    (name) => `cd elsewhere; node '.agents/skills/luna-sidecar/scripts/luna-sidecar.mjs' ${name}`,
+    (name) => `node '${absolute}' ${name} --cwd '${projectRoot}' ; echo ok`,
+    (name) => `node '${absolute}' ${name} && echo ok`,
+  ];
+  for (const commandFor of invalidCommands) assert.throws(() => parseHostObservationResult("codex_cli", { stdout: captured(commandFor) }, { projectRoot, skillRoot }), (error) => error.schemaReason === "copied_skill_command_missing");
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: captured((name) => `node '${absolute}' ${name}`, "agent_message") }, { projectRoot, skillRoot }), (error) => error.schemaReason === "copied_skill_command_missing");
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: captured((name) => `node '${absolute}' start -- '${name}'`) }, { projectRoot, skillRoot }), (error) => error.schemaReason === "lifecycle_missing");
+  if (process.platform !== "win32") assert.throws(() => parseHostObservationResult("codex_cli", { stdout: captured((name) => `node '${absolute.toUpperCase()}' ${name}`) }, { projectRoot, skillRoot }), (error) => error.schemaReason === "copied_skill_command_missing");
+  const failedCodex = captured((name) => `node '${absolute}' ${name}`).split("\n").map((line) => {
+    const event = JSON.parse(line);
+    if (event.item?.command) event.item.exit_code = 1;
+    return JSON.stringify(event);
+  }).join("\n");
+  assert.throws(() => parseHostObservationResult("codex_cli", { stdout: failedCodex }, { projectRoot, skillRoot }), (error) => error.schemaReason === "copied_skill_command_missing");
+  const claudeSkill = join(projectRoot, ".claude", "skills", "luna-sidecar");
+  const claudeEvents = makeFakeHostOutput("claude_code", projectRoot, claudeSkill, receipt).split("\n").map(JSON.parse);
+  const failedClaude = claudeEvents.map((event) => {
+    if (event.type === "user") for (const block of event.message.content) if (block.type === "tool_result") block.is_error = true;
+    return JSON.stringify(event);
+  }).join("\n");
+  assert.throws(() => parseHostObservationResult("claude_code", { stdout: failedClaude }, { projectRoot, skillRoot: claudeSkill }), (error) => error.schemaReason === "copied_skill_command_missing");
 });
 
 test("host availability, command failure, and cleanup uncertainty fail closed", async (t) => {
@@ -532,12 +576,14 @@ await writeFile(join(state, "workers", receipt.workerId + ".json"), JSON.stringi
 if (host === "codex_cli") {
   for (const name of lifecycleCommands) {
     const lifecycleInvocation = lifecycleCommand(name);
-    process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: lifecycleInvocation, ...(name === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: lifecycleInvocation, exit_code: 0, ...(name === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } }) + "\\n");
   }
   process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }) + "\\n");
 } else {
-  for (const name of lifecycleCommands) process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: lifecycleCommand(name) } }] } }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } }) + "\\n");
+  for (const name of lifecycleCommands) {
+    process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: name, name: "Bash", input: { command: lifecycleCommand(name) } }] } }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: name, is_error: false, content: name === "start" ? JSON.stringify(receipt) : "{}" }] } }) + "\\n");
+  }
   process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } }) + "\\n");
 }
 `, "utf8");
@@ -831,9 +877,10 @@ test("installer, hash, and CI gates stop production orchestration before provide
   }
 });
 
-test("Claude host gets a private config dir holding only copied credentials, removed with the scratch root", async (t) => {
+test("Claude host preserves file and environment auth in a private config removed with scratch", async (t) => {
   const credentialSentinel = "CLAUDE_CREDENTIAL_SENTINEL_9f3c";
-  for (const scenario of ["copied", "missing"]) {
+  const authNames = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+  for (const scenario of ["copied", "missing", ...authNames, "blank"]) {
     const root = await mkdtemp(join(tmpdir(), `luna release claude config ${scenario}-`));
     t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
     const { gitRoot, headSha } = await createCleanGitRoot(root);
@@ -848,9 +895,13 @@ test("Claude host gets a private config dir holding only copied credentials, rem
     const run = async (file, args, options = {}) => {
       const name = options.commandName ?? "unknown";
       if (["git-init", "installer", "git-status", "git-head"].includes(name)) return runCapturedCommand(file, args, options);
-      const snapshot = { name, env: { ...(options.env ?? {}) }, configFiles: null };
+      const snapshot = { name, env: { ...(options.env ?? {}) }, configFiles: null, configMode: null, credentialMode: null };
       if (typeof options.env?.CLAUDE_CONFIG_DIR === "string") {
-        try { snapshot.configFiles = (await readdir(options.env.CLAUDE_CONFIG_DIR)).sort(); } catch { snapshot.configFiles = "unreadable"; }
+        try {
+          snapshot.configFiles = (await readdir(options.env.CLAUDE_CONFIG_DIR)).sort();
+          snapshot.configMode = (await lstat(options.env.CLAUDE_CONFIG_DIR)).mode & 0o777;
+          if (snapshot.configFiles.includes(".credentials.json")) snapshot.credentialMode = (await lstat(join(options.env.CLAUDE_CONFIG_DIR, ".credentials.json"))).mode & 0o777;
+        } catch { snapshot.configFiles = "unreadable"; }
       }
       spawns.push(snapshot);
       options.commandLog?.push({ name, exitCode: name === "codex-version" || name === "claude-version" ? 0 : 1 });
@@ -867,7 +918,7 @@ test("Claude host gets a private config dir holding only copied credentials, rem
       testedCommit: headSha,
       ciRunId: "42",
       gitRoot,
-      environment: topLevelEnvironment({ CLAUDE_CONFIG_DIR: sourceConfig }),
+      environment: topLevelEnvironment({ CLAUDE_CONFIG_DIR: sourceConfig, ...Object.fromEntries(authNames.map((name) => [name, scenario === name ? ` ${credentialSentinel} ` : scenario === "blank" ? "  " : ""])) }),
       run: async (file, args, options = {}) => {
         if (options.commandName === "codex-version") scratchRoots = { project: options.cwd };
         return run(file, args, options);
@@ -881,7 +932,7 @@ test("Claude host gets a private config dir holding only copied credentials, rem
     assert.ok(codexHost, `${scenario}: ${JSON.stringify({ gaps: result.unresolvedGaps, stage: result.failureStage, spawns: spawns.map(({ name }) => name) })}`);
     assert.equal(codexHost.env.CLAUDE_CONFIG_DIR, sourceConfig, "Codex host env is unchanged");
     for (const managerSpawn of spawns.filter(({ name }) => name.startsWith("manager-"))) assert.equal(managerSpawn.env.CLAUDE_CONFIG_DIR, sourceConfig, `${managerSpawn.name} env is unchanged`);
-    if (scenario === "copied") {
+    if (scenario === "copied" || authNames.includes(scenario)) {
       assert.deepEqual(claudeSpawns.map(({ name }) => name), ["claude-version", "host-claude"]);
       const configDir = claudeSpawns[0].env.CLAUDE_CONFIG_DIR;
       assert.equal(claudeSpawns[1].env.CLAUDE_CONFIG_DIR, configDir);
@@ -889,7 +940,14 @@ test("Claude host gets a private config dir holding only copied credentials, rem
       const scratch = dirname(scratchRoots.project);
       assert.equal(isPathWithin(scratch, configDir), true, "config dir is under the scratch root");
       assert.equal(isPathWithin(scratchRoots.project, configDir), false, "config dir is outside the host project root");
-      for (const spawned of claudeSpawns) assert.deepEqual(spawned.configFiles, [".credentials.json"], spawned.name);
+      for (const spawned of claudeSpawns) {
+        assert.deepEqual(spawned.configFiles, scenario === "copied" ? [".credentials.json"] : [], spawned.name);
+        if (authNames.includes(scenario)) assert.equal(spawned.env[scenario], ` ${credentialSentinel} `, "auth value is inherited unchanged");
+        if (process.platform !== "win32") {
+          assert.equal(spawned.configMode, 0o700);
+          if (scenario === "copied") assert.equal(spawned.credentialMode, 0o600);
+        }
+      }
       await assert.rejects(lstat(configDir), { code: "ENOENT" });
       await assert.rejects(lstat(scratch), { code: "ENOENT" });
       assert.notEqual(result.hosts.claude_code.failureCode, "claude_code_auth_unavailable");
@@ -1162,14 +1220,16 @@ function makeFakeHostOutput(host, projectRoot, skillRoot, receipt) {
   const commandLine = (commandName) => commandName === "start"
     ? `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" start --cwd "${projectRoot}" --sandbox read-only --effort medium -- "inspect"`
     : `node "${join(skillRoot, "scripts", "luna-sidecar.mjs")}" ${commandName}`;
-  const events = HOST_LIFECYCLE_COMMANDS.map((commandName) => {
+  const events = HOST_LIFECYCLE_COMMANDS.flatMap((commandName) => {
     const command = commandLine(commandName);
-    if (host === "codex_cli") return { type: "item.completed", item: { type: "command_execution", command, ...(commandName === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } };
-    return { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } };
+    if (host === "codex_cli") return [{ type: "item.completed", item: { type: "command_execution", command, exit_code: 0, ...(commandName === "start" ? { aggregated_output: JSON.stringify(receipt) } : {}) } }];
+    return [
+      { type: "assistant", message: { content: [{ type: "tool_use", id: commandName, name: "Bash", input: { command } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: commandName, is_error: false, content: commandName === "start" ? JSON.stringify(receipt) : "{}" }] } },
+    ];
   });
   if (host === "codex_cli") events.push({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } });
   else {
-    events.push({ type: "user", message: { content: [{ type: "tool_result", content: JSON.stringify(receipt) }] } });
     events.push({ type: "assistant", message: { content: [{ type: "text", text: JSON.stringify(payload) }] } });
   }
   return events.map((event) => JSON.stringify(event)).join("\n");

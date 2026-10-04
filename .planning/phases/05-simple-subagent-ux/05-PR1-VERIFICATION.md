@@ -1,0 +1,60 @@
+---
+phase: 05-simple-subagent-ux
+plan: 05-PR1
+runtime: codex-cli
+assurance: self_checked
+verified: 2026-10-04
+status: gaps_found
+local_tests: passed
+releaseReady: false
+evidence_contract:
+  observed_kinds: [code, test, judgment]
+  missing_kinds: [final_independent_review, exact_candidate_ci, real_host_runtime]
+git_delivery_check:
+  branch: fix/phase5-live-evidence
+  commits_ahead_of_main: 3
+  pr_state: OPEN
+  local_corrections: verified_before_commit
+  delivery_authorization: commit_and_push_pr_branch_only
+---
+
+# PR 1 verification
+
+The correction has executable local evidence, but review and release closure have gaps. This report supplements the existing Phase 05 verification; it does not replace historical evidence or close the roadmap.
+
+| Requirement | Code and deterministic evidence | Verdict |
+| --- | --- | --- |
+| FINAL-RELEASE-01 invocation proof | Exact copied path and adjacent command; successful Codex events and correlated Claude tool results; relative/absolute positives and echo/root/chain/failure negatives | Local checks passed; live proof missing |
+| AUTH-01 private host configuration | OAuth-only file copy, three supported environment routes, unchanged sentinel values, blank/missing failures, redaction and cleanup fixtures | Local checks passed; POSIX mode assertions conditional on platform |
+| LIFE-01 prompt disposition | Failed/unknown archive, obstruction/collision source preservation, completed/cancelled disposal, independent resume archive | Focused and final suite checks passed |
+| RESOURCE-01 bounded evidence | Archives and fallback prompts join existing canonical terminal pruning; fixture crosses 256 MiB only when prompt bytes are included | Final suite checks passed |
+| SAFETY-01 observer purity | Existing read-only dead-runner projection restored; no recovery/file mutation from observer | Call-graph and final suite checks passed |
+
+## Full-suite result
+
+Final `npm test` completed with exit 0: 147 tests, 146 passed, 0 failed, 1 skipped, duration 163174.5017 ms. The suite uses `--test-concurrency=1` and includes authority, concurrency, contract, harness, lifecycle, observation, resources, safety, UX, installation parity and release-smoke checks. Syntax checks for both production modules and three modified test modules passed. `git diff --check` passed.
+
+The skipped test is `host PowerShellCore transcription admission blocks before provider spawn`: its existing guard requires `LUNA_SIDECAR_HOST_PROOF=1`, which was not enabled. POSIX-specific permission assertions are conditional. The historical cancellation race passed this complete run; earlier failures are preserved in the summary rather than erased by that result.
+
+## Candidate identity
+
+Verification started from HEAD `72151ea9cd52f4d1d748c6ac7587cfdc2682faa6`. The implementation below was tested before committing; these hashes bind the tested source independently of the subsequently authorized commit. SHA-256 of final source/test/reference files:
+
+| Path | SHA-256 |
+| --- | --- |
+| scripts/release-smoke.mjs | 082DFECBDCCAA28D52087BC2B1C8FBE7557C8EDF41209720C61F252494229C02 |
+| skills/luna-sidecar/scripts/luna-sidecar.mjs | 9960E3BFE3F3BE37E89BA7D52B26A9FA20134D005362D7E73525B9BB88001BFF |
+| test/lifecycle.test.mjs | 19F73C40112DB2EDF90ECF556969BC9B348623BC012AA4DFD6C59FE2E0FDC52F |
+| test/release-smoke.test.mjs | 82C7013887CC038532B824EC42A41B168F80C76F293386D818AD3B1298B9FA28 |
+| test/resources.test.mjs | 4DB421D62E5C4BDA2541B8E3901D5FCD7F42AD899D87A74F17B31EB724CC9DB5 |
+| skills/luna-sidecar/references/USAGE.md | C9B44F187B1EB22B8087CF1C90CB78199AAB67A95FC4F9703F391B80BFA5C6BD |
+
+## Gaps and next actions
+
+- **Final independent review:** the intended final verifier could not run because account usage was exhausted. Earlier independent root-cause, plan and parser/auth reviews are partial judgment evidence. Root integration review does not satisfy this final review requirement.
+- **Delivery:** owner subsequently authorized "Commit and push PR updates" on 2026-10-04. This authorizes the correction commit and PR-branch push followed by new CI checks. It does not authorize merge or issue closure. At the verification snapshot GitHub still held the original PR head; delivery results must be checked after the new commit exists.
+- **Exact-candidate CI and runtime:** final release requires the existing four-job matrix and both real hosts on the exact committed candidate. No live provider execution took place; fake-provider test receipts are not real-host acceptance. Preserve existing evidence as historical.
+- **Platform:** local Node 24.14.1 validation ran on Windows. Ubuntu/POSIX behavior and Node 22.20 require the matrix. Conditional POSIX permission assertions cannot establish Windows ACL privacy.
+- **Workflow:** owner-approved legacy `.planning` authority was used. Current Workspine `missing_config` refusal remains; no `.work` migration or current-helper success was manufactured.
+
+The owner can inspect the complete patch and this evidence. Final independent review and release proof remain unfinished; commit and PR-branch delivery are authorized with fresh CI verification next.
