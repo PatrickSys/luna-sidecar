@@ -345,6 +345,44 @@ test("host schema failures report distinct bounded predicates", () => {
   assertReason([event(terminalInvalid), message({ schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: terminalInvalid })], "receipt_terminal_invalid");
 });
 
+test("Codex 0.159 project-relative launcher commands are read as copied-skill commands", () => {
+  // Sanitized from an offline codex-cli 0.159.2 capture on win32: Codex runs with --cd <project> and
+  // invokes the copied launcher through PowerShell by its project-relative path.
+  const projectRoot = resolve(tmpdir(), "luna-host-project");
+  const skillRoot = join(projectRoot, ".agents", "skills", "luna-sidecar");
+  const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated" };
+  const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: receipt };
+  const pwsh = (inner) => `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "${inner}"`;
+  const launcher = (prefix = "") => `node '${prefix}.agents/skills/luna-sidecar/scripts/luna-sidecar.mjs'`;
+  const lifecycleCommand = (name, prefix = "") => name === "start"
+    ? pwsh(`${launcher(prefix)} start --cwd '${projectRoot}' --sandbox read-only --effort medium -- 'Inspect only the installed skill files'`)
+    : pwsh(`${launcher(prefix)} ${name}${name === "list" ? "" : ` ${receipt.workerId}`}`);
+  const captured = (prefix = "") => [
+    { type: "thread.started", thread_id: "thread" },
+    { type: "turn.started" },
+    { type: "item.completed", item: { id: "item_0", type: "command_execution", command: pwsh("Get-Content -LiteralPath '.agents/skills/luna-sidecar/SKILL.md'"), aggregated_output: "skill text", exit_code: 0, status: "completed" } },
+    ...HOST_LIFECYCLE_COMMANDS.map((name, index) => ({ type: "item.completed", item: { id: `item_${index + 1}`, type: "command_execution", command: lifecycleCommand(name, prefix), aggregated_output: name === "start" || name === "wait" ? `${JSON.stringify(receipt)}\n` : "{}\n", exit_code: 0, status: "completed" } })),
+    { type: "item.completed", item: { id: "item_9", type: "agent_message", text: JSON.stringify(payload) } },
+    { type: "turn.completed" },
+  ].map((event) => JSON.stringify(event)).join("\n");
+
+  const parsed = parseHostObservationResult("codex_cli", { code: 0, stdout: captured() }, { projectRoot, skillRoot });
+  assert.equal(parsed.receipt.state, "completed");
+  assert.equal(parsed.receipt.taskOutcome, "not_evaluated");
+  assert.deepEqual(parsed.lifecycle, Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((command) => [command, true])));
+  assert.equal(parseHostObservationResult("codex_cli", { code: 0, stdout: captured("./") }, { projectRoot, skillRoot }).receipt.turnId, receipt.turnId);
+
+  for (const nearMiss of ["other/", "/elsewhere/", "../"]) {
+    assert.throws(
+      () => parseHostObservationResult("codex_cli", { code: 0, stdout: captured(nearMiss) }, { projectRoot, skillRoot }),
+      (error) => error.code === "host_schema_mismatch" && error.schemaReason === "copied_skill_command_missing",
+      nearMiss,
+    );
+  }
+  const partial = captured().split("\n").filter((line) => !/ (resume|cancel|list)\b/.test(line)).join("\n");
+  assert.throws(() => parseHostObservationResult("codex_cli", { code: 0, stdout: partial }, { projectRoot, skillRoot }), (error) => error.schemaReason === "lifecycle_missing");
+});
+
 test("host availability, command failure, and cleanup uncertainty fail closed", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna host gates-"));
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));

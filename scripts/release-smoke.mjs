@@ -1146,14 +1146,31 @@ function isSidecarReceipt(value) {
     && typeof value.turnId === "string" && value.turnId.length > 0;
 }
 
-function hostLifecyclePredicates(commands, skillRoot) {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// A host command refers to the copied launcher either by its absolute path or, because both hosts
+// run with the scratch project as cwd, by the project-relative path that Codex 0.159 emits
+// (`node '.agents/skills/luna-sidecar/scripts/luna-sidecar.mjs' start ...`). The relative form must
+// start at a quote, whitespace, or the start of the command so it cannot be a suffix of another root.
+function copiedLauncherMatcher(projectRoot, skillRoot) {
   const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
+  const relativeSkillRoot = relative(resolve(projectRoot), resolve(skillRoot)).replaceAll("\\", "/").toLowerCase();
+  const relativeLauncher = relativeSkillRoot && !relativeSkillRoot.startsWith("..") && !isAbsolute(relativeSkillRoot)
+    ? new RegExp(`(?:^|[\\s'"])(?:\\./)?${escapeRegExp(`${relativeSkillRoot}/scripts/luna-sidecar.mjs`)}(?:['"\\s]|$)`)
+    : null;
+  return (normalizedCommand) => (normalizedCommand.includes(expectedSkillRoot) && normalizedCommand.includes("luna-sidecar.mjs"))
+    || (relativeLauncher !== null && relativeLauncher.test(normalizedCommand));
+}
+
+function hostLifecyclePredicates(commands, projectRoot, skillRoot) {
+  const referencesCopiedLauncher = copiedLauncherMatcher(projectRoot, skillRoot);
   return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((commandName) => [commandName, commands.some((command) => {
     const normalized = command.replaceAll("\\", "/").toLowerCase();
     const invocation = normalized.split(/\s--\s/, 1)[0];
-    return invocation.includes(expectedSkillRoot)
-      && invocation.includes("luna-sidecar.mjs")
-      && new RegExp(`(?:^|\\s)${commandName}(?:\\s|$)`).test(invocation);
+    return referencesCopiedLauncher(invocation)
+      && new RegExp(`(?:^|\\s)${commandName}(?:[\\s'"]|$)`).test(invocation);
   })]));
 }
 
@@ -1174,10 +1191,10 @@ export function parseHostObservationResult(host, result, { projectRoot, skillRoo
   const events = parseJsonLines(result.stdout);
   if (!events || events.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "jsonl_invalid");
   const commands = events.flatMap((event) => collectHostCommands(event));
-  const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
+  const referencesCopiedLauncher = copiedLauncherMatcher(projectRoot, skillRoot);
   const copiedSkillCommand = commands.some((command) => {
     const normalized = command.replaceAll("\\", "/").toLowerCase();
-    return normalized.includes(expectedSkillRoot) && normalized.includes("luna-sidecar.mjs") && /(?:^|\s)start(?:\s|$)/.test(normalized);
+    return referencesCopiedLauncher(normalized) && /(?:^|\s)start(?:\s|$)/.test(normalized);
   });
   if (!copiedSkillCommand) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "copied_skill_command_missing");
   const receipts = events.flatMap((event) => collectHostOutputStrings(event)).flatMap((text) => parseObjectCandidates(text)).filter(isSidecarReceipt);
@@ -1192,7 +1209,7 @@ export function parseHostObservationResult(host, result, { projectRoot, skillRoo
   if (payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
     throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_terminal_invalid");
   }
-  const lifecycle = hostLifecyclePredicates(commands, skillRoot);
+  const lifecycle = hostLifecyclePredicates(commands, projectRoot, skillRoot);
   if (!lifecycleComplete(lifecycle)) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "lifecycle_missing");
   return { events, payload, receipt: payload.sidecarReceipt, commands, lifecycle };
 }
