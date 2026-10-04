@@ -565,9 +565,9 @@ if (mode === "failure") {
 const goneChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
 await new Promise((resolve) => goneChild.once("close", resolve));
 const receipt = { schemaVersion: 2, workerId: "11111111-1111-4111-8111-111111111111", turnId: "22222222-2222-4222-8222-222222222222", state: "completed", providerState: "completed", errorCode: null, taskOutcome: "not_evaluated", pid: goneChild.pid };
-const command = "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" start --cwd \\\"" + project + "\\\" --sandbox read-only --effort medium -- \\\"inspect\\\"";
+const command = 'node "' + join(skill, "scripts", "luna-sidecar.mjs") + '" start --cwd "' + project + '" --sandbox read-only --effort medium -- "inspect"';
 const lifecycleCommands = ["start", "status", "wait", "resume", "cancel", "list"];
-const lifecycleCommand = (name) => name === "start" ? command : "node \\\"" + skill + "\\\\scripts\\\\luna-sidecar.mjs\\\" " + name;
+const lifecycleCommand = (name) => name === "start" ? command : 'node "' + join(skill, "scripts", "luna-sidecar.mjs") + '" ' + name;
 const payload = { schemaVersion: 1, skill: "luna-sidecar", workflow: "subagent", taskOutcome: "not_evaluated", sidecarReceipt: { schemaVersion: receipt.schemaVersion, workerId: receipt.workerId, turnId: receipt.turnId, state: receipt.state, providerState: receipt.providerState, errorCode: receipt.errorCode, taskOutcome: receipt.taskOutcome } };
 await mkdir(join(skill, "scripts"), { recursive: true });
 await writeFile(join(skill, "scripts", "luna-sidecar.mjs"), "process.exit(0);", "utf8");

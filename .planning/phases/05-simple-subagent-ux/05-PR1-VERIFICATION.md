@@ -58,3 +58,9 @@ Verification started from HEAD `72151ea9cd52f4d1d748c6ac7587cfdc2682faa6`. The i
 - **Workflow:** owner-approved legacy `.planning` authority was used. Current Workspine `missing_config` refusal remains; no `.work` migration or current-helper success was manufactured.
 
 The owner can inspect the complete patch and this evidence. Final independent review and release proof remain unfinished; commit and PR-branch delivery are authorized with fresh CI verification next.
+
+## Delivery follow-up, 2026-10-04
+
+Commit `c370bbd8008db51de9a1f5cf2d33618fe3ec9b8f` reached PR 1. Exact-head CI runs 37232128409 and 37232126428 passed both Windows jobs but failed both Ubuntu jobs in `host adapters execute exact Codex and Claude shims and retain bounded failure diagnostics`. The fixture emitted Windows-only launcher separators on Linux. Correcting the fixture to construct both invocation paths with its existing native `join` leaves production validation and all assertions unchanged.
+
+The corrected release-smoke module passed all 35 tests locally, 0 failed/skipped, duration 20556.3467 ms. Its new SHA-256 is `3FAD152A7EB862C948E56EC6ADEDDDD6C5607DA7E8271C39812F8A6ACEC39EFB`; other implementation hashes above are unchanged. Exact CI for the subsequent fixture commit remains pending at this snapshot. Main, merge, issue closure and release readiness remain unchanged.

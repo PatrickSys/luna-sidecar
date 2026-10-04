@@ -46,3 +46,9 @@ Private local logs: `C:/Users/bitaz/Repos/_private-handoffs/luna-sidecar-pr1-tes
 Owner subsequently authorized "Commit and push PR updates" on 2026-10-04, specifically the PR branch followed by new CI checks. Merge and issue closure remain pending. This artifact travels with the correction commit; exact delivery and CI results are determined after that commit exists, not predicted here.
 
 Complete a fresh independent review of the entire patch. The authorized delivery needs its own exact-commit Windows/Ubuntu Node 22.20/24 CI and both required real-host observations under the existing release-smoke contract. PR-head CI run 37207502995 covers the original head, not these corrections. No live providers were run here. Historical Phase 05 release artifacts remain unchanged; Phase 05 and FINAL-RELEASE-01 remain open and `releaseReady` remains false.
+
+## Delivery follow-up, 2026-10-04
+
+Correction commit `c370bbd8008db51de9a1f5cf2d33618fe3ec9b8f` was pushed to the existing PR branch under explicit owner authorization. PR and push CI runs 37232128409 and 37232126428 both passed Windows Node 22.20/24 and failed Ubuntu Node 22.20/24 in one host-adapter fixture. That fixture constructed Windows-only backslash paths on every platform. The exact-path recognizer correctly rejected those as noncanonical Linux launcher paths. The fixture now uses its existing `node:path.join` import for the actual native path. Production code, success assertions and fail-closed parser behavior are unchanged.
+
+After this fixture correction, all 35 release-smoke tests passed locally, including three targeted invocation/adapter tests. Syntax and diff checks passed. A follow-up commit and exact-head matrix are required; this section does not predict their outcome. The earlier 147-test result binds the production patch before this two-line fixture correction. No live host or final independent review claim is added.
