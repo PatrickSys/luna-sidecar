@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -99,6 +101,7 @@ const gapCodes = new Set([
   "provider_version_invalid",
   "codex_cli_unavailable",
   "claude_code_unavailable",
+  "claude_code_auth_unavailable",
   "codex_cli_host_failed",
   "claude_code_host_failed",
   "host_observation_timeout",
@@ -1070,7 +1073,7 @@ export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, 
   if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
   const args = host === "codex_cli"
     ? ["exec", "--json", "--ephemeral", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
-    : ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "user,project,local", "--add-dir", projectRoot];
+    : ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--strict-mcp-config", "--add-dir", projectRoot];
   return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(host), cwd: projectRoot };
 }
 
@@ -1252,6 +1255,8 @@ export async function runHostObservation({
   cancellationCaller,
   schemaPath,
   environment,
+  hostEnvironment = {},
+  unavailableCode = null,
   run,
   deadline,
   commandLog = [],
@@ -1259,8 +1264,8 @@ export async function runHostObservation({
   terminate = terminateExactPid,
   waitGone = waitPidsGone,
 }) {
-  if (!hostVersion) {
-    const failureCode = host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable";
+  if (unavailableCode || !hostVersion) {
+    const failureCode = gapCodes.has(unavailableCode) ? unavailableCode : (host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable");
     return { evidence: unavailableHostEvidence(host, failureCode), gaps: [failureCode], ownedPids: [] };
   }
   const invocation = buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, environment });
@@ -1271,7 +1276,7 @@ export async function runHostObservation({
   try {
     result = await run(invocation.file, invocation.args, {
       cwd: invocation.cwd,
-      env: { ...environment, LUNA_SIDECAR_HOME: stateRoot },
+      env: { ...environment, ...hostEnvironment, LUNA_SIDECAR_HOME: stateRoot },
       input: invocation.input,
       deadline,
       timeout: CEILINGS_MS.parent,
@@ -1346,12 +1351,21 @@ export async function runHostObservations({
   schemaPath,
   codexVersion,
   claudeVersion,
+  claudeHostEnvironment = {},
+  claudeCredentials = null,
   inspect = inspectProcessIdentity,
   terminate = terminateExactPid,
 }) {
   const specs = [
     { host: "codex_cli", hostVersion: codexVersion, skillRoot: join(roots.project, ".agents", "skills", "luna-sidecar"), stateRoot: roots.hostCodexState },
-    { host: "claude_code", hostVersion: claudeVersion, skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"), stateRoot: roots.hostClaudeState },
+    {
+      host: "claude_code",
+      hostVersion: claudeVersion,
+      skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"),
+      stateRoot: roots.hostClaudeState,
+      hostEnvironment: claudeHostEnvironment,
+      unavailableCode: claudeCredentials === "missing" ? "claude_code_auth_unavailable" : null,
+    },
   ];
   const hosts = {};
   const gaps = [];
@@ -1670,6 +1684,29 @@ async function removeScratch(root) {
   } catch { return false; }
 }
 
+async function pathExists(path) {
+  try { await lstat(path); return true; }
+  catch (error) { return error.code !== "ENOENT"; }
+}
+
+const claudeCredentialsFile = ".credentials.json";
+
+// Copies only the Claude login file into the private host config dir. Returns "copied" or
+// "missing"; the source path and the file contents never leave this function.
+async function copyClaudeCredentials(sourceEnvironment, targetRoot) {
+  const configured = sourceEnvironment.CLAUDE_CONFIG_DIR;
+  const sourceRoot = typeof configured === "string" && configured.length > 0 ? configured : join(homedir(), ".claude");
+  try {
+    const info = await lstat(join(sourceRoot, claudeCredentialsFile));
+    if (!info.isFile()) return "missing";
+    await copyFile(join(sourceRoot, claudeCredentialsFile), join(targetRoot, claudeCredentialsFile), fsConstants.COPYFILE_EXCL);
+    return "copied";
+  } catch {
+    await rm(join(targetRoot, claudeCredentialsFile), { force: true }).catch(() => {});
+    return "missing";
+  }
+}
+
 function versionFromOutput(output) {
   const match = String(output).match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/);
   return match?.[0] ?? null;
@@ -1778,6 +1815,7 @@ export async function orchestrateReleaseSmoke(options = {}) {
     roots.cancellationCaller = await createFreshRoot(scratch, "cancellation-caller");
     roots.hostCodexState = await createFreshRoot(roots.project, ".luna-host-state-codex");
     roots.hostClaudeState = await createFreshRoot(roots.project, ".luna-host-state-claude");
+    roots.hostClaudeConfig = await createFreshRoot(scratch, "host-claude-config");
     roots.temp = await createFreshRoot(scratch, "temp");
     const hostSchemaPath = join(roots.temp, "luna-host-observation-schema.json");
     await writeFile(hostSchemaPath, JSON.stringify(hostObservationSchema), "utf8");
@@ -1801,11 +1839,14 @@ export async function orchestrateReleaseSmoke(options = {}) {
     scenarios = await runLiveScenarios({ launcher: install.launchers.codex, roots, env: providerEnv, run, deadline, commandLog });
     gaps.push(...scenarios.gaps);
     if (scenarios.gaps.length > 0) failureStage = "provider";
-    const claudeProbe = await probeHostVersion({ host: "claude_code", run, environment: providerEnv, cwd: roots.project, deadline, commandLog });
-    claudeVersion = claudeProbe.version;
-    hostObservations = options.observeHosts
-      ? await options.observeHosts({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid })
-      : await runHostObservations({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid });
+    const claudeCredentials = await copyClaudeCredentials(sourceEnvironment, roots.hostClaudeConfig);
+    const claudeHostEnvironment = { CLAUDE_CONFIG_DIR: roots.hostClaudeConfig };
+    if (claudeCredentials === "copied") {
+      const claudeProbe = await probeHostVersion({ host: "claude_code", run, environment: { ...providerEnv, ...claudeHostEnvironment }, cwd: roots.project, deadline, commandLog });
+      claudeVersion = claudeProbe.version;
+    }
+    const hostOptions = { roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, claudeHostEnvironment, claudeCredentials, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid };
+    hostObservations = options.observeHosts ? await options.observeHosts(hostOptions) : await runHostObservations(hostOptions);
     gaps.push(...hostObservations.gaps);
     if (hostObservations.gaps.length > 0) failureStage ??= "provider";
   } catch (error) {
@@ -1828,7 +1869,9 @@ export async function orchestrateReleaseSmoke(options = {}) {
       cleanup.processesGone = true;
       cleanup.result = evaluateCleanupFacts(cleanup.facts);
     }
-    const scratchClean = !scratch || (cleanup.processesGone && await removeScratch(scratch));
+    const scratchRemoved = !scratch || (cleanup.processesGone && await removeScratch(scratch));
+    const claudeConfigGone = !roots.hostClaudeConfig || (await removeScratch(roots.hostClaudeConfig) && !(await pathExists(roots.hostClaudeConfig)));
+    const scratchClean = scratchRemoved && claudeConfigGone;
     cleanup.facts.scratchCleanupFailed = !scratchClean;
     cleanup.result = evaluateCleanupFacts(cleanup.facts);
     gaps.push(...cleanup.result.gaps);

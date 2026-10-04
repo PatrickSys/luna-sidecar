@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { delimiter, join, resolve, toNamespacedPath } from "node:path";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { delimiter, dirname, join, resolve, toNamespacedPath } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -208,14 +208,16 @@ test("host adapters use the installed skill workflow and documented CLI surfaces
   assert.equal(claude.file, process.platform === "win32" ? "cmd.exe" : "claude");
   const claudeArgs = process.platform === "win32" ? claude.args.slice(4) : claude.args;
   assert.equal(claudeArgs[0], "-p");
-  assert.equal(claudeArgs.includes("--bare"), true);
+  assert.equal(claudeArgs.includes("--mcp-config"), false);
+  assert.equal(claudeArgs.includes("--strict-mcp-config"), true);
   assert.equal(claudeArgs.includes("--output-format"), true);
   assert.equal(claudeArgs.includes("stream-json"), true);
   assert.equal(claudeArgs.includes("--verbose"), true);
   assert.equal(claudeArgs.includes("--permission-mode"), true);
   assert.equal(claudeArgs.includes("bypassPermissions"), true);
   assert.equal(claudeArgs.includes("--no-session-persistence"), true);
-  assert.deepEqual(claudeArgs.slice(claudeArgs.indexOf("--setting-sources"), claudeArgs.indexOf("--setting-sources") + 2), ["--setting-sources", "user,project,local"]);
+  assert.deepEqual(claudeArgs.slice(claudeArgs.indexOf("--setting-sources"), claudeArgs.indexOf("--setting-sources") + 2), ["--setting-sources", "project,local"]);
+  assert.deepEqual(claudeArgs, ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--strict-mcp-config", "--add-dir", projectRoot]);
   assert.match(claude.input, /\/luna-sidecar/);
 });
 
@@ -467,7 +469,7 @@ if (process.cwd() !== project || process.env.LUNA_SIDECAR_HOME !== state) fail("
 if (host === "codex_cli") {
   assert.deepEqual(args, ["exec", "--json", "--ephemeral", "--output-schema", schema, "--sandbox", "workspace-write", "--cd", project, "--skip-git-repo-check", "-"]);
 } else if (host === "claude_code") {
-  assert.deepEqual(args, ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "user,project,local", "--add-dir", project]);
+  assert.deepEqual(args, ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--strict-mcp-config", "--add-dir", project]);
 } else fail("unknown host");
 const input = await new Promise((resolve) => { const chunks = []; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8"))); });
 if (host === "codex_cli" && input.includes("/luna-sidecar")) fail("codex used Claude activation syntax");
@@ -791,6 +793,114 @@ test("installer, hash, and CI gates stop production orchestration before provide
   }
 });
 
+test("Claude host gets a private config dir holding only copied credentials, removed with the scratch root", async (t) => {
+  const credentialSentinel = "CLAUDE_CREDENTIAL_SENTINEL_9f3c";
+  for (const scenario of ["copied", "missing"]) {
+    const root = await mkdtemp(join(tmpdir(), `luna release claude config ${scenario}-`));
+    t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+    const { gitRoot, headSha } = await createCleanGitRoot(root);
+    const sourceConfig = join(root, "source-claude-config");
+    await mkdir(join(sourceConfig, "plugins"), { recursive: true });
+    if (scenario === "copied") await writeFile(join(sourceConfig, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: credentialSentinel } }), "utf8");
+    await writeFile(join(sourceConfig, "settings.json"), JSON.stringify({ hooks: { Stop: [] } }), "utf8");
+    await writeFile(join(sourceConfig, "CLAUDE.md"), "user instructions must not load\n", "utf8");
+    await writeFile(join(sourceConfig, "plugins", "installed.json"), "{}", "utf8");
+    const spawns = [];
+    let scratchRoots = null;
+    const run = async (file, args, options = {}) => {
+      const name = options.commandName ?? "unknown";
+      if (["git-init", "installer", "git-status", "git-head"].includes(name)) return runCapturedCommand(file, args, options);
+      const snapshot = { name, env: { ...(options.env ?? {}) }, configFiles: null };
+      if (typeof options.env?.CLAUDE_CONFIG_DIR === "string") {
+        try { snapshot.configFiles = (await readdir(options.env.CLAUDE_CONFIG_DIR)).sort(); } catch { snapshot.configFiles = "unreadable"; }
+      }
+      spawns.push(snapshot);
+      options.commandLog?.push({ name, exitCode: name === "codex-version" || name === "claude-version" ? 0 : 1 });
+      if (name === "codex-version") return { code: 0, signal: null, timedOut: false, pid: null, stdout: "codex 9.8.7\n", stderr: "" };
+      if (name === "claude-version") return { code: 0, signal: null, timedOut: false, pid: null, stdout: "2.1.289 (Claude Code)\n", stderr: "" };
+      return { code: 1, signal: null, timedOut: false, pid: null, stdout: "", stderr: "" };
+    };
+    const ci = { headSha, status: "completed", conclusion: "success", jobs: EXPECTED_CI_JOB_NAMES.map((name, index) => ({ databaseId: index + 1, name, status: "completed", conclusion: "success" })) };
+    const records = [];
+    const evidenceJson = join(root, "evidence", "evidence.json");
+    const evidenceMarkdown = join(root, "evidence", "evidence.md");
+    const result = await orchestrateReleaseSmoke({
+      live: true,
+      testedCommit: headSha,
+      ciRunId: "42",
+      gitRoot,
+      environment: topLevelEnvironment({ CLAUDE_CONFIG_DIR: sourceConfig }),
+      run: async (file, args, options = {}) => {
+        if (options.commandName === "codex-version") scratchRoots = { project: options.cwd };
+        return run(file, args, options);
+      },
+      queryCi: async () => ci,
+      emit: (line) => records.push(line),
+      evidenceDestination: { jsonPath: evidenceJson, markdownPath: evidenceMarkdown },
+    });
+    const claudeSpawns = spawns.filter(({ name }) => name === "claude-version" || name === "host-claude");
+    const codexHost = spawns.find(({ name }) => name === "host-codex");
+    assert.ok(codexHost, `${scenario}: ${JSON.stringify({ gaps: result.unresolvedGaps, stage: result.failureStage, spawns: spawns.map(({ name }) => name) })}`);
+    assert.equal(codexHost.env.CLAUDE_CONFIG_DIR, sourceConfig, "Codex host env is unchanged");
+    for (const managerSpawn of spawns.filter(({ name }) => name.startsWith("manager-"))) assert.equal(managerSpawn.env.CLAUDE_CONFIG_DIR, sourceConfig, `${managerSpawn.name} env is unchanged`);
+    if (scenario === "copied") {
+      assert.deepEqual(claudeSpawns.map(({ name }) => name), ["claude-version", "host-claude"]);
+      const configDir = claudeSpawns[0].env.CLAUDE_CONFIG_DIR;
+      assert.equal(claudeSpawns[1].env.CLAUDE_CONFIG_DIR, configDir);
+      assert.notEqual(configDir, sourceConfig);
+      const scratch = dirname(scratchRoots.project);
+      assert.equal(isPathWithin(scratch, configDir), true, "config dir is under the scratch root");
+      assert.equal(isPathWithin(scratchRoots.project, configDir), false, "config dir is outside the host project root");
+      for (const spawned of claudeSpawns) assert.deepEqual(spawned.configFiles, [".credentials.json"], spawned.name);
+      await assert.rejects(lstat(configDir), { code: "ENOENT" });
+      await assert.rejects(lstat(scratch), { code: "ENOENT" });
+      assert.notEqual(result.hosts.claude_code.failureCode, "claude_code_auth_unavailable");
+    } else {
+      assert.deepEqual(claudeSpawns, [], "Claude is never spawned without credentials");
+      assert.equal(result.hosts.claude_code.failureCode, "claude_code_auth_unavailable");
+      assert.equal(result.hosts.claude_code.claimEligible, false);
+      assert.equal(result.unresolvedGaps.includes("claude_code_auth_unavailable"), true);
+    }
+    assert.equal(result.cleanup.scratchCleanupFailed, false, scenario);
+    const surfaces = [JSON.stringify(result), records.join("\n"), await readFile(evidenceJson, "utf8"), await readFile(evidenceMarkdown, "utf8")];
+    for (const surface of surfaces) {
+      assert.equal(surface.includes(credentialSentinel), false, scenario);
+      assert.equal(surface.includes("claudeAiOauth"), false, scenario);
+      assert.equal(surface.includes(".credentials.json"), false, scenario);
+      assert.equal(surface.includes(sourceConfig) || surface.includes(JSON.stringify(sourceConfig).slice(1, -1)), false, scenario);
+    }
+  }
+});
+
+test("only the Claude host spawn receives the private config dir", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna host claude env-"));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const projectRoot = join(root, "project");
+  const stateRoot = join(root, "state");
+  const callerRoot = join(root, "caller");
+  const configDir = join(root, "host-claude-config");
+  await Promise.all([projectRoot, join(stateRoot, "workers"), callerRoot, configDir].map((path) => mkdir(path, { recursive: true })));
+  const envs = {};
+  const run = async (_file, _args, options = {}) => {
+    envs[options.commandName] = options.env;
+    return { code: 1, signal: null, timedOut: false, pid: null, stdout: "", stderr: "" };
+  };
+  const base = { roots: { project: projectRoot, hostCodexState: stateRoot, hostClaudeState: stateRoot, cancellationCaller: callerRoot }, environment: { BASE_ONLY: "1" }, run, deadline: { at: Date.now() + 10_000, timedOut: false }, schemaPath: join(root, "schema.json"), codexVersion: "0.159.2", claudeVersion: "2.1.289" };
+  const reached = await runHostObservations({ ...base, claudeHostEnvironment: { CLAUDE_CONFIG_DIR: configDir }, claudeCredentials: "copied" });
+  assert.equal(envs["host-claude"].CLAUDE_CONFIG_DIR, configDir);
+  assert.equal(envs["host-claude"].BASE_ONLY, "1");
+  assert.equal(envs["host-codex"].CLAUDE_CONFIG_DIR, undefined);
+  assert.equal(reached.hosts.claude_code.failureCode, "claude_code_host_failed");
+
+  const hostCalls = [];
+  const missing = await runHostObservations({ ...base, run: async (file, args, options = {}) => { hostCalls.push(options.commandName); return run(file, args, options); }, claudeHostEnvironment: { CLAUDE_CONFIG_DIR: configDir }, claudeCredentials: "missing" });
+  assert.equal(hostCalls.includes("host-claude"), false);
+  assert.equal(missing.hosts.claude_code.failureCode, "claude_code_auth_unavailable");
+  assert.equal(missing.hosts.claude_code.claimEligible, false);
+  assert.equal(missing.gaps.includes("claude_code_auth_unavailable"), true);
+  assert.equal(redactEvidence({ unresolvedGaps: ["claude_code_auth_unavailable"] }).unresolvedGaps.includes("claude_code_auth_unavailable"), true);
+});
+
 test("cleanup refuses incomplete run-owned PID provenance", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna release cleanup provenance-"));
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
@@ -885,7 +995,7 @@ if (input.includes("exactly two")) {
       testedCommit: headSha,
       ciRunId: "42",
       gitRoot,
-      environment: topLevelEnvironment({ PATH: `${shimRoot}${delimiter}${process.env.PATH ?? ""}` }),
+      environment: topLevelEnvironment({ PATH: `${shimRoot}${delimiter}${process.env.PATH ?? ""}`, CLAUDE_CONFIG_DIR: join(root, "no-claude-config") }),
       queryCi: async () => ci,
       run: (file, args, options = {}) => {
         if (options.input?.trim()) capturedInputs.push({ name: options.commandName, input: options.input });
