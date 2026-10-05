@@ -9,7 +9,8 @@ local_tests: passed
 releaseReady: false
 evidence_contract:
   observed_kinds: [code, test, judgment]
-  missing_kinds: [final_independent_review, exact_candidate_ci, real_host_runtime]
+  missing_kinds: [exact_final_documentation_head_ci, real_host_runtime]
+review_status: passed
 git_delivery_check:
   branch: fix/phase5-live-evidence
   commits_ahead_of_main: 3
@@ -64,3 +65,17 @@ The owner can inspect the complete patch and this evidence. Final independent re
 Commit `c370bbd8008db51de9a1f5cf2d33618fe3ec9b8f` reached PR 1. Exact-head CI runs 37232128409 and 37232126428 passed both Windows jobs but failed both Ubuntu jobs in `host adapters execute exact Codex and Claude shims and retain bounded failure diagnostics`. The fixture emitted Windows-only launcher separators on Linux. Correcting the fixture to construct both invocation paths with its existing native `join` leaves production validation and all assertions unchanged.
 
 The corrected release-smoke module passed all 35 tests locally, 0 failed/skipped, duration 20556.3467 ms. Its new SHA-256 is `3FAD152A7EB862C948E56EC6ADEDDDD6C5607DA7E8271C39812F8A6ACEC39EFB`; other implementation hashes above are unchanged. Exact CI for the subsequent fixture commit remains pending at this snapshot. Main, merge, issue closure and release readiness remain unchanged.
+
+## Corrective merge verification, 2026-10-05
+
+This block supersedes the earlier reviewer-quota and delivery snapshots for the corrective PR; their historical outcomes are preserved. Owner now explicitly requests reliable merging of PR 1. This does not authorize release or Phase 05 closure.
+
+- Verified GitHub head: `af42ec4d4e683be555f29abddb0b1f34b6361a3a`.
+- Exact-head CI: runs 37232385668 and 37232381344 completed successfully, four distinct Ubuntu/Windows Node 22.20/24 jobs each.
+- Fresh independent correctness review: PASS on the complete `f0f7df2..af42ec4` source/test diff, no blocking production finding. Reviewer reran the full local suite: 146 passed, 0 failed, 1 opt-in host test skipped. Same-runtime judgment; no real-provider acceptance claim.
+- SPEC alignment: existing prompt deletion/retention wording now reflects the tested implementation, including read-only projected unknown versus durable terminal state. Runtime code/tests are unchanged.
+- Remaining release gap: no successful exact-commit real Codex and Claude host observations. Keep `releaseReady: false` and FINAL-RELEASE-01 open. SPEC requirement 55 and Phase05 verification 163 explicitly bind these observations to release/phase closure; they do not prohibit merging a verified corrective implementation.
+
+The documentation/verification follow-up needs exact-final-head CI before merge, then main CI verification afterward. Never bypass checks, replace live evidence with fixtures, or infer release acceptance from the merge.
+
+Fresh independent regression/authority review returned PASS for the corrective merge gate. Executed focused results: lifecycle/resources/observation 72 passed and 1 opt-in skip; release-smoke 35 passed; syntax and diff checks clean. Assertions remain unchanged apart from added failure diagnostics. This reviewer independently confirmed the release-versus-merge distinction. The noted historical-document caution is resolved by preserving the original V1 text and adding the current behavior as a dated Phase5 amendment. Both final reviews are independent contexts on the same runtime, so assurance remains self_checked rather than cross-runtime.

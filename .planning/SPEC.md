@@ -7,7 +7,7 @@
 **Canonical source:** `PatrickSys/luna-sidecar`
 **Delivery policy:** Small verified commits may go directly to `main`; never force-push and never overwrite unexpected remote movement.
 
-**Current State:** Phase 5 implementation and locally executable verification are complete through the prior implementation commits plus this provider-contract repair. Public `full-access` remains persisted as `full-access` while Codex argv uses installed `danger-full-access`, and explicit start/resume cwd invocation includes `--skip-git-repo-check`. Release closure remains open because the exact CI query returned no run for the tested commit and no real host observation was started; the recorded Phase 5 evidence therefore keeps both host claims ineligible and `releaseReady: false`.
+**Current State (2026-10-05):** Phase 5 implementation and locally executable verification are present, including PR 1's host-evidence, authentication and prompt-retention corrections. Public `full-access` remains persisted as `full-access` while Codex argv uses installed `danger-full-access`, and explicit start/resume cwd invocation includes `--skip-git-repo-check`. The corrected implementation has successful exact-head Windows/Linux CI and fresh independent corrective-merge reviews; `.planning/phases/05-simple-subagent-ux/05-PR1-VERIFICATION.md` records the evidence and scope. Successful exact-commit real Codex and Claude host observations remain missing, so release closure stays open and `releaseReady` stays false.
 
 ## Phase 5 final-shape amendment
 
@@ -57,6 +57,12 @@ The host may start more than one independent worker. Same-worktree coordination 
 ### Explicit non-goals for Phase 5
 
 Do not add an MCP manager, provider adapter registry, daemon, queue, scheduler, concurrency budget, path-ownership system, automatic worktrees, task modes, semantic result judge, cost engine, or global configuration mutation. Do not rewrite the historical audits or `.planning/V1-VERIFICATION.md`.
+
+### PR 1 prompt reliability amendment, 2026-10-05
+
+For Phase 5, this amendment supersedes only the V1 prompt-disposition and terminal-retention descriptions below. After stdin acceptance the claimed prompt remains available until terminal disposition. Durably failed/unknown turns preserve it for manual recovery at `logs/<turnId>.prompt`; archive failure retains the source and records `prompt_archive_failed`. Completed/cancelled turns discard their prompt before durable terminal commit. Read-only dead-runner observation may project unknown without moving the original. A crash after claim never auto-replays the prompt.
+
+The existing 256 MiB terminal cap counts raw logs plus canonical archived and fallback original/claimed prompt files. Before a new start, prune oldest eligible terminal evidence; never prune active evidence, manifests or compact receipts. No automatic replay, additional retention subsystem or release-readiness claim is introduced.
 
 ## V1 verified baseline (preserved)
 

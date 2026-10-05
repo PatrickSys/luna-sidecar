@@ -11,6 +11,7 @@ effective_level: high
 depends_on: [05-PLAN.md, 05-VERIFICATION.md]
 requirements: [FINAL-RELEASE-01, AUTH-01, RESOURCE-01, SAFETY-01, LIFE-01]
 files-modified:
+  - .planning/SPEC.md
   - scripts/release-smoke.mjs
   - test/release-smoke.test.mjs
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
@@ -102,3 +103,7 @@ status: passed
 blocking: false
 notes: Independent authority_review context passed the revised exact auth key set, all-state prompt disposition and terminal visibility, retention, parser scope and local-only proof boundaries on 2026-10-04. Same runtime, self_checked assurance only.
 </plan_check></checks>
+
+## Owner-directed merge follow-up, 2026-10-05
+
+Owner asked the agent to take over and merge PR 1 reliably without downgrading quality. This supersedes the earlier PR-branch-only delivery limit for this corrective merge; no release, publication, phase closure or issue closure is inferred. Obtain fresh independent correctness and regression/authority review, preserve failing CI history, verify the exact final head's complete matrix, merge without bypassing checks, then verify main CI. Align the two existing SPEC lifecycle/retention statements with the reviewed prompt implementation; do not relax FINAL-RELEASE-01 or run providers under this follow-up. The existing SPEC explicitly permits implementation to be present while missing real-host proof blocks release closure.
