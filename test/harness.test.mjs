@@ -11,6 +11,7 @@ import {
   createCliHarness,
   expectedProviderIdentity,
   expectedRunnerIdentity,
+  runProcessQuery,
   inspectProcessIdentity,
   parseExactlyOneJson,
   terminateSpawnedChild,
@@ -153,6 +154,16 @@ test("an observed PID without identity provenance still fails cleanup while aliv
   assert.equal(isAlive(process.pid), true);
 });
 
+test("an identity query timeout closes its query child before rejecting and leaves the target alive", async () => {
+  let queryClosed = false;
+  await assert.rejects(runProcessQuery(process.execPath, ["-e", "setInterval(() => {}, 1000)"], process.pid, {
+    timeoutMs: 100,
+    onSpawn(child) { child.once("close", () => { queryClosed = true; }); },
+  }), /process identity query exceeded 100 ms/);
+  assert.equal(queryClosed, true);
+  assert.equal(isAlive(process.pid), true);
+});
+
 test("Windows identity inspection returns a complete identity for a live fixture child", { skip: process.platform !== "win32" }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-harness-"));
   const cleanup = registerCleanup(t, root);
@@ -172,6 +183,7 @@ test("Windows identity inspection returns a complete identity for a live fixture
   cleanup.trackRelease(join(root, "identity.release"));
   await waitForFile(readyPath);
   const identity = await inspectProcessIdentity(run.child.pid);
+  t.diagnostic(`Windows fixture identity query completed in ${identity.queryElapsedMs} ms`);
   assert.equal(identity.exists, true);
   assert.equal(identity.uncertain, false);
   assert.equal(identity.pid, run.child.pid);
@@ -198,6 +210,7 @@ test("Windows identity inspection matches the live manifest provider wrapper", {
   const worker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${receipt.workerId}.json`), "utf8"));
   const turn = worker.turns.at(-1);
   const identity = await inspectProcessIdentity(turn.providerPid);
+  t.diagnostic(`Windows provider identity query completed in ${identity.queryElapsedMs} ms`);
   assert.equal(identity.exists, true);
   assert.equal(identity.uncertain, false);
   assert.equal(ownedProcessIdentityMatches(identity, expectedProviderIdentity(turn.providerPid, turn.cwd, fakeCodexPath)), true);
@@ -206,6 +219,7 @@ test("Windows identity inspection matches the live manifest provider wrapper", {
     /survived cleanup/,
   );
   const runnerIdentity = await inspectProcessIdentity(turn.runnerPid);
+  t.diagnostic(`Windows runner identity query completed in ${runnerIdentity.queryElapsedMs} ms`);
   assert.equal(ownedProcessIdentityMatches(runnerIdentity, expectedRunnerIdentity(turn.runnerPid, receipt.workerId, turn.cwd, copiedLauncher)), true);
   await assert.rejects(
     waitForProcessGone(turn.runnerPid, expectedRunnerIdentity(turn.runnerPid, receipt.workerId, turn.cwd, copiedLauncher), { waitMs: 1 }),

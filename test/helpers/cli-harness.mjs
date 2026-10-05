@@ -15,7 +15,8 @@ const WATCHDOG_MS = 10_000;
 const FILE_WAIT_MS = 10_000;
 const PROCESS_WAIT_MS = 5_000;
 const TERMINATION_WAIT_MS = 3_000;
-const PROCESS_QUERY_MS = PROCESS_WAIT_MS;
+// A metadata query includes cold PowerShell/CIM startup; fixture liveness keeps its 5s deadline.
+const PROCESS_QUERY_MS = 15_000;
 
 export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
@@ -591,27 +592,35 @@ export async function inspectProcessIdentity(pid) {
   try { commandLine = Buffer.from(parsed.CommandLineBase64, "base64").toString("utf8"); }
   catch (error) { throw new Error(`invalid process command line response: ${error.message}`); }
   if (!commandLine) throw new Error("empty process command line response");
-  return { exists: true, uncertain: false, pid, executablePath: parsed.ExecutablePath ?? null, commandLine };
+  return { exists: true, uncertain: false, pid, executablePath: parsed.ExecutablePath ?? null, commandLine, queryElapsedMs: result.elapsedMs };
 }
 
-async function runProcessQuery(executable, args, pid) {
+export async function runProcessQuery(executable, args, pid, { timeoutMs = PROCESS_QUERY_MS, onSpawn = null } = {}) {
+  const started = performance.now();
   const child = spawn(executable, args, {
     env: buildMinimalTestEnvironment(null, { LUNA_HARNESS_PID: String(pid) }),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  onSpawn?.(child);
   const stdout = [];
   const stderr = [];
   child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
   child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
   return await new Promise((resolve, reject) => {
     let settled = false;
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (settled) return;
       settled = true;
+      const closed = waitForChildClose(child, TERMINATION_WAIT_MS, "process identity query termination");
       child.kill();
-      reject(new Error(`process identity query exceeded ${PROCESS_QUERY_MS} ms`));
-    }, PROCESS_QUERY_MS);
+      try { await closed; }
+      catch (error) {
+        reject(new Error(`process identity query exceeded ${timeoutMs} ms; query cleanup failed: ${error.message}`));
+        return;
+      }
+      reject(new Error(`process identity query exceeded ${timeoutMs} ms (elapsed ${Math.ceil(performance.now() - started)} ms, target PID ${pid})`));
+    }, timeoutMs);
     child.once("error", (error) => {
       if (settled) return;
       settled = true;
@@ -623,7 +632,7 @@ async function runProcessQuery(executable, args, pid) {
       settled = true;
       clearTimeout(timer);
       if (code !== 0 || signal) reject(new Error(`process identity query exited ${code ?? "null"}`));
-      else resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
+      else resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), elapsedMs: Math.ceil(performance.now() - started) });
     });
   });
 }
