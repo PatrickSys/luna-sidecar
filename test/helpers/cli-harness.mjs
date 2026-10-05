@@ -578,20 +578,37 @@ export async function inspectProcessIdentity(pid) {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
   if (!systemRoot) throw new Error("SystemRoot is unavailable for process identity query");
   const powershell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const script = "$ErrorActionPreference = 'Stop'; [Console]::Error.WriteLine('luna-process-query:script_started'); $p = Get-WmiObject -Class Win32_Process -Filter ('ProcessId = ' + [int]$env:LUNA_HARNESS_PID); [Console]::Error.WriteLine('luna-process-query:query_returned'); if ($null -eq $p) { [Console]::Out.WriteLine('null'); exit 0 }; $o = [pscustomobject]@{ ProcessId = [int]$p.ProcessId; ExecutablePath = $p.ExecutablePath; CommandLineBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)) }; $o | ConvertTo-Json -Compress";
+  // WinPS cmdlet loading can stall on hosted Windows; use its framework WMI assembly directly.
+  // Only numeric PID and base64 fields enter the JSON transport; no serializer module is loaded.
+  const script = `$ErrorActionPreference = 'Stop';
+[Console]::Error.WriteLine('luna-process-query:script_started');
+$assembly = [Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a');
+[Console]::Error.WriteLine('luna-process-query:assembly_loaded');
+$searcher = [System.Management.ManagementObjectSearcher]::new('root\\cimv2', ('SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE ProcessId = ' + [int]$env:LUNA_HARNESS_PID));
+try {
+  $records = @($searcher.Get());
+  [Console]::Error.WriteLine('luna-process-query:query_returned');
+  if ($records.Count -eq 0) { [Console]::Out.WriteLine('null'); exit 0 };
+  if ($records.Count -ne 1) { throw 'ambiguous process identity response' };
+  $p = $records[0];
+  $command = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine));
+  $executable = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.ExecutablePath));
+  [Console]::Out.WriteLine('{"ProcessId":' + [int]$p.ProcessId + ',"ExecutablePathBase64":"' + $executable + '","CommandLineBase64":"' + $command + '"}');
+} finally { $searcher.Dispose() }`;
   const result = await runProcessQuery(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], pid);
   if (result.stdout.trim() === "null") return { exists: false, pid };
   let parsed;
   try { parsed = JSON.parse(result.stdout); }
   catch (error) { throw new Error(`invalid process identity response: ${error.message}`); }
-  if (!parsed || Array.isArray(parsed) || Number(parsed.ProcessId) !== pid || typeof parsed.CommandLineBase64 !== "string") {
+  if (!parsed || Array.isArray(parsed) || parsed.ProcessId !== pid || typeof parsed.CommandLineBase64 !== "string" || typeof parsed.ExecutablePathBase64 !== "string") {
     throw new Error("incomplete process identity response");
   }
   let commandLine;
   try { commandLine = Buffer.from(parsed.CommandLineBase64, "base64").toString("utf8"); }
   catch (error) { throw new Error(`invalid process command line response: ${error.message}`); }
   if (!commandLine) throw new Error("empty process command line response");
-  return { exists: true, uncertain: false, pid, executablePath: parsed.ExecutablePath ?? null, commandLine, queryElapsedMs: result.elapsedMs };
+  const executablePath = Buffer.from(parsed.ExecutablePathBase64, "base64").toString("utf8") || null;
+  return { exists: true, uncertain: false, pid, executablePath, commandLine, queryElapsedMs: result.elapsedMs };
 }
 
 export async function runProcessQuery(executable, args, pid, { timeoutMs = PROCESS_QUERY_MS, onSpawn = null } = {}) {
@@ -606,7 +623,7 @@ export async function runProcessQuery(executable, args, pid, { timeoutMs = PROCE
   const stderr = [];
   child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
   child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
-  const lastStage = () => [...Buffer.concat(stderr).toString("utf8").matchAll(/luna-process-query:(script_started|query_returned)/g)].at(-1)?.[1] ?? "process_spawned";
+  const lastStage = () => [...Buffer.concat(stderr).toString("utf8").matchAll(/luna-process-query:(script_started|assembly_loaded|query_returned)/g)].at(-1)?.[1] ?? "process_spawned";
   return await new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(async () => {
