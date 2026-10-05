@@ -80,4 +80,10 @@ This block supersedes the earlier reviewer-quota and delivery snapshots for the 
 
 The documentation/verification follow-up needs exact-final-head CI before merge, then main CI verification afterward. Never bypass checks, replace live evidence with fixtures, or infer release acceptance from the merge.
 
+## Intermittent cleanup evidence, 2026-10-05
+
+Head `6cba0b4`: PR CI 37267736126 passed all four jobs; push CI 37267731733 failed only Windows Node24 in the list test's cleanup hook (`Owned fixture process 3028 survived cleanup`). Assertions passed before cleanup. The same unchanged helper failed at base `f0f7df2`, run 31595361497, Windows Node22, in a different contract test (`Owned fixture process 9676 survived cleanup`). Root verified the base SHA and failed log; both independent reviewers confirmed the unchanged list-test body and found no production regression mechanism. Eight focused local list repetitions passed. This supports an existing intermittent harness symptom; missing PID identity prevents claiming a proven reuse cause or proving no orphan from the failed log alone.
+
+Full workflow rerun was requested for 37267731733. Cleanup assertions, timeouts, tests and production code remain unchanged. Require its successful result and both final-head matrices before merge; a repeat failure reopens investigation. This snapshot does not claim their future outcomes. The exact final delivery/main receipts are retained in the private handoff directory to avoid another documentation-only commit cycle.
+
 Fresh independent regression/authority review returned PASS for the corrective merge gate. Executed focused results: lifecycle/resources/observation 72 passed and 1 opt-in skip; release-smoke 35 passed; syntax and diff checks clean. Assertions remain unchanged apart from added failure diagnostics. This reviewer independently confirmed the release-versus-merge distinction. The noted historical-document caution is resolved by preserving the original V1 text and adding the current behavior as a dated Phase5 amendment. Both final reviews are independent contexts on the same runtime, so assurance remains self_checked rather than cross-runtime.
