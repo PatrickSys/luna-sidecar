@@ -15,8 +15,7 @@ const WATCHDOG_MS = 10_000;
 const FILE_WAIT_MS = 10_000;
 const PROCESS_WAIT_MS = 5_000;
 const TERMINATION_WAIT_MS = 3_000;
-// A metadata query includes cold PowerShell/CIM startup; fixture liveness keeps its 5s deadline.
-const PROCESS_QUERY_MS = 15_000;
+const PROCESS_QUERY_MS = PROCESS_WAIT_MS;
 
 export async function createCliHarness(t, launcherPathOverride = launcherPath) {
   const root = await mkdtemp(join(tmpdir(), "luna-sidecar-cli-"));
@@ -579,7 +578,7 @@ export async function inspectProcessIdentity(pid) {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
   if (!systemRoot) throw new Error("SystemRoot is unavailable for process identity query");
   const powershell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const script = "$ErrorActionPreference = 'Stop'; $p = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + [int]$env:LUNA_HARNESS_PID); if ($null -eq $p) { [Console]::Out.WriteLine('null'); exit 0 }; $o = [pscustomobject]@{ ProcessId = [int]$p.ProcessId; ExecutablePath = $p.ExecutablePath; CommandLineBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)) }; $o | ConvertTo-Json -Compress";
+  const script = "$ErrorActionPreference = 'Stop'; [Console]::Error.WriteLine('luna-process-query:script_started'); $p = Get-WmiObject -Class Win32_Process -Filter ('ProcessId = ' + [int]$env:LUNA_HARNESS_PID); [Console]::Error.WriteLine('luna-process-query:query_returned'); if ($null -eq $p) { [Console]::Out.WriteLine('null'); exit 0 }; $o = [pscustomobject]@{ ProcessId = [int]$p.ProcessId; ExecutablePath = $p.ExecutablePath; CommandLineBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)) }; $o | ConvertTo-Json -Compress";
   const result = await runProcessQuery(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], pid);
   if (result.stdout.trim() === "null") return { exists: false, pid };
   let parsed;
@@ -607,6 +606,7 @@ export async function runProcessQuery(executable, args, pid, { timeoutMs = PROCE
   const stderr = [];
   child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
   child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+  const lastStage = () => [...Buffer.concat(stderr).toString("utf8").matchAll(/luna-process-query:(script_started|query_returned)/g)].at(-1)?.[1] ?? "process_spawned";
   return await new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(async () => {
@@ -619,7 +619,7 @@ export async function runProcessQuery(executable, args, pid, { timeoutMs = PROCE
         reject(new Error(`process identity query exceeded ${timeoutMs} ms; query cleanup failed: ${error.message}`));
         return;
       }
-      reject(new Error(`process identity query exceeded ${timeoutMs} ms (elapsed ${Math.ceil(performance.now() - started)} ms, target PID ${pid})`));
+      reject(new Error(`process identity query exceeded ${timeoutMs} ms (elapsed ${Math.ceil(performance.now() - started)} ms, target PID ${pid}, stage ${lastStage()})`));
     }, timeoutMs);
     child.once("error", (error) => {
       if (settled) return;
