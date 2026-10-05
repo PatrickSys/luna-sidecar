@@ -37,7 +37,8 @@ test("two resumes on one worker serialize and only one active turn launches", as
   await mkdir(join(harness.stateRoot, "fixtures"), { recursive: true });
 
   const leftPromise = harness.invoke(["resume", workerId, "--", "left"], {
-    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"left-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+    // Keep the winning turn active until the competing admission has completed.
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"left-thread\"}\n", "{\"type\":\"turn.completed\"}\n"], linger: true, exitCode: 0 },
     extraEnv: { LUNA_SIDECAR_TEST_BARRIER: activeBarrier, FAKE_CODEX_START_BARRIER: providerBarrier },
   });
   await waitForFile(`${activeBarrier}.ready`);
@@ -54,6 +55,9 @@ test("two resumes on one worker serialize and only one active turn launches", as
   assert.equal(successes.length, 1);
   assert.equal(failures.length, 1);
   assert.equal(failures[0].json().error.code, "active_turn");
+  await harness.waitForCapture(leftReceipt);
+  await harness.assertNoCapture(rightReceipt);
+  await harness.release(leftReceipt);
   await harness.invoke(["wait", workerId]);
   const worker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${workerId}.json`), "utf8"));
   assert.equal(worker.turns.length, 2);

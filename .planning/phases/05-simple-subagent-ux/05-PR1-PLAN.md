@@ -17,6 +17,9 @@ files-modified:
   - skills/luna-sidecar/scripts/luna-sidecar.mjs
   - test/lifecycle.test.mjs
   - test/resources.test.mjs
+  - test/concurrency.test.mjs
+  - test/helpers/cli-harness.mjs
+  - test/harness.test.mjs
   - skills/luna-sidecar/references/USAGE.md
   - .planning/phases/05-simple-subagent-ux/05-PR1-PLAN.md
   - .planning/phases/05-simple-subagent-ux/05-PR1-SUMMARY.md
@@ -109,3 +112,9 @@ notes: Independent authority_review context passed the revised exact auth key se
 Owner asked the agent to take over and merge PR 1 reliably without downgrading quality. This supersedes the earlier PR-branch-only delivery limit for this corrective merge; no release, publication, phase closure or issue closure is inferred. Obtain fresh independent correctness and regression/authority review, preserve failing CI history, verify the exact final head's complete matrix, merge without bypassing checks, then verify main CI. Align the two existing SPEC lifecycle/retention statements with the reviewed prompt implementation; do not relax FINAL-RELEASE-01 or run providers under this follow-up. The existing SPEC explicitly permits implementation to be present while missing real-host proof blocks release closure.
 
 The subsequent Windows cleanup-hook failure was independently found on the original base commit with the same unchanged raw-PID helper. Review found no production regression mechanism; failing logs lack process identity. Permit one complete exact-head rerun with failure evidence preserved, and require both final-head matrices before merge. Do not expand into speculative harness changes or weaken checks. Repeated cleanup failure blocks merge pending further ownership evidence. Keep this decision in the existing summary/verification; no new report is needed.
+
+### CI reliability repair after the repeated failure
+
+The permitted rerun repeated Windows24 cleanup failure, so the earlier rerun-only path is exhausted. Extend only the existing test harness to distinguish owned surviving processes from reused historical PIDs using original child-close evidence and bounded process identity inspection. A live owned process must still fail cleanup; missing/uncertain identity must fail closed. Never kill a historical PID based solely on liveness. Add deterministic ownership/uncertainty regressions and validate real Windows inspection. Leave production runtime and existing deadlines unchanged.
+
+An earlier documentation-head CI also failed the concurrent-resume assertion: both resumes succeeded because the test released its first provider before the second process reached admission. Hold the first fixture alive through the competing admission using the existing linger/release mechanism. Preserve the simultaneous attempt and every exclusion assertion; additionally prove the rejected attempt launched no provider. Release the first fixture before terminal assertions. Both independent reviewers challenge the ordering and final patch. Require focused harness/concurrency checks, the full suite, both exact-head matrices, matched-head merge and main CI. Do not infer release closure.

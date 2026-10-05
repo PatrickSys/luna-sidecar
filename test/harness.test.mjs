@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -9,8 +9,12 @@ import test from "node:test";
 import {
   buildMinimalTestEnvironment,
   createCliHarness,
+  expectedProviderIdentity,
+  expectedRunnerIdentity,
+  inspectProcessIdentity,
   parseExactlyOneJson,
   terminateSpawnedChild,
+  ownedProcessIdentityMatches,
   waitForProcessGone,
   watchSpawnedChild,
 } from "./helpers/cli-harness.mjs";
@@ -103,6 +107,112 @@ test("fake Codex captures exact bytes, authority inputs, PIDs, chunks, and expli
   assert.deepEqual(result.stderr, Buffer.concat([Buffer.from("stderr α\r\n"), Buffer.from("00c328", "hex")]));
   await waitForProcessGone(run.child.pid);
   await waitForProcessGone(grandchild.pid);
+});
+
+test("identity-aware cleanup accepts a conclusive PID mismatch but fails closed for live or uncertain ownership", async () => {
+  const pid = process.pid;
+  const expected = { pid, expectedCwd: process.cwd(), commandTokens: ["original-fixture-path.mjs"] };
+  const unrelated = { exists: true, uncertain: false, pid, cwd: process.cwd(), commandLine: "node unrelated-fixture-path.mjs" };
+  assert.equal(ownedProcessIdentityMatches(unrelated, expected), false);
+  await waitForProcessGone(pid, expected, { inspect: async () => unrelated, waitMs: 1 });
+  assert.equal(isAlive(pid), true);
+
+  const owned = { ...unrelated, commandLine: "node original-fixture-path.mjs" };
+  assert.equal(ownedProcessIdentityMatches({ ...owned, cwd: "C:\\changed-after-launch" }, expected), true);
+  assert.equal(ownedProcessIdentityMatches({ ...owned, pid: pid + 1 }, expected), false);
+  assert.equal(ownedProcessIdentityMatches({ ...owned, commandLine: "node prefix-original-fixture-path.mjs" }, expected), false);
+  assert.equal(ownedProcessIdentityMatches({ ...owned, commandLine: 'node "C:\\other\\original-fixture-path.mjs"' }, expected), false);
+  await assert.rejects(
+    waitForProcessGone(pid, expected, { inspect: async () => owned, waitMs: 1 }),
+    /survived cleanup/,
+  );
+  await assert.rejects(
+    waitForProcessGone(pid, expected, { inspect: async () => ({ exists: true, uncertain: true, pid }), waitMs: 1 }),
+    /identity was uncertain/,
+  );
+  await assert.rejects(
+    waitForProcessGone(pid, expected, { inspect: async () => undefined, waitMs: 1 }),
+    /identity was uncertain/,
+  );
+  await assert.rejects(
+    waitForProcessGone(pid, expected, { inspect: async () => ({ exists: false, pid: pid + 1 }), waitMs: 1 }),
+    /identity was uncertain/,
+  );
+  await assert.rejects(
+    waitForProcessGone(pid, expected, { inspect: async () => { throw new Error("query unavailable"); }, waitMs: 1 }),
+    /identity query failed: query unavailable/,
+  );
+});
+
+test("an observed PID without identity provenance still fails cleanup while alive", async (t) => {
+  let cleanup;
+  const harness = await createCliHarness({ after(callback) { cleanup = callback; } });
+  t.after(() => rm(harness.root, { recursive: true, force: true }));
+  harness.observePid(process.pid);
+  await assert.rejects(cleanup(), /has no recorded identity/);
+  assert.equal(isAlive(process.pid), true);
+});
+
+test("Windows identity inspection returns a complete identity for a live fixture child", { skip: process.platform !== "win32" }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "luna-sidecar-harness-"));
+  const cleanup = registerCleanup(t, root);
+  const scenarioPath = join(root, "identity.scenario.json");
+  const capturePath = join(root, "identity.capture.json");
+  const readyPath = join(root, "identity.ready");
+  await writeFile(scenarioPath, JSON.stringify({ linger: true }), "utf8");
+  const run = cleanup.trackRun(launch(process.execPath, [fakeCodexPath], {
+    cwd: root,
+    env: buildMinimalTestEnvironment(null, {
+      FAKE_CODEX_SCENARIO: scenarioPath,
+      FAKE_CODEX_CAPTURE: capturePath,
+      FAKE_CODEX_READY: readyPath,
+      FAKE_CODEX_RELEASE: join(root, "identity.release"),
+    }),
+  }));
+  cleanup.trackRelease(join(root, "identity.release"));
+  await waitForFile(readyPath);
+  const identity = await inspectProcessIdentity(run.child.pid);
+  assert.equal(identity.exists, true);
+  assert.equal(identity.uncertain, false);
+  assert.equal(identity.pid, run.child.pid);
+  assert.equal(identity.commandLine.toLowerCase().includes(fakeCodexPath.toLowerCase()), true);
+  await assert.rejects(
+    waitForProcessGone(run.child.pid, { pid: run.child.pid, commandTokens: [fakeCodexPath] }, { waitMs: 1 }),
+    /survived cleanup/,
+  );
+  await writeFile(join(root, "identity.release"), "release\n", "utf8");
+  await run.closed;
+});
+
+test("Windows identity inspection matches the live manifest provider wrapper", { skip: process.platform !== "win32" }, async (t) => {
+  const overrideRoot = await mkdtemp(join(tmpdir(), "luna-sidecar-launcher-"));
+  const copiedLauncher = join(overrideRoot, "copied-launcher.mjs");
+  await copyFile(join(repositoryRoot, "skills", "luna-sidecar", "scripts", "luna-sidecar.mjs"), copiedLauncher);
+  t.after(() => rm(overrideRoot, { recursive: true, force: true }));
+  const harness = await createCliHarness(t, copiedLauncher);
+  const result = await harness.invoke(
+    ["start", "--effort", "medium", "--sandbox", "workspace-write", "--cwd", harness.requestedCwd, "--", "manifest provider identity"],
+    { scenario: { linger: true } },
+  );
+  const receipt = result.json();
+  const worker = JSON.parse(await readFile(join(harness.stateRoot, "workers", `${receipt.workerId}.json`), "utf8"));
+  const turn = worker.turns.at(-1);
+  const identity = await inspectProcessIdentity(turn.providerPid);
+  assert.equal(identity.exists, true);
+  assert.equal(identity.uncertain, false);
+  assert.equal(ownedProcessIdentityMatches(identity, expectedProviderIdentity(turn.providerPid, turn.cwd, fakeCodexPath)), true);
+  await assert.rejects(
+    waitForProcessGone(turn.providerPid, expectedProviderIdentity(turn.providerPid, turn.cwd, fakeCodexPath), { waitMs: 1 }),
+    /survived cleanup/,
+  );
+  const runnerIdentity = await inspectProcessIdentity(turn.runnerPid);
+  assert.equal(ownedProcessIdentityMatches(runnerIdentity, expectedRunnerIdentity(turn.runnerPid, receipt.workerId, turn.cwd, copiedLauncher)), true);
+  await assert.rejects(
+    waitForProcessGone(turn.runnerPid, expectedRunnerIdentity(turn.runnerPid, receipt.workerId, turn.cwd, copiedLauncher), { waitMs: 1 }),
+    /survived cleanup/,
+  );
+  await harness.release(result);
+  await harness.invoke(["wait", receipt.workerId]);
 });
 
 test("fake Codex reports a scripted nonzero exit", async (t) => {
