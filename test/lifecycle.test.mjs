@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -278,7 +278,105 @@ test("prompt claim and stdin acknowledgement are durable without retaining promp
   assert.equal(JSON.stringify(worker).includes("secret prompt body"), false);
   assert.equal(worker.turns[0].promptSha256.length, 64);
   await harness.release(start);
-  await harness.invoke(["wait", receipt.workerId]);
+  const done = await harness.invoke(["wait", receipt.workerId]);
+  assert.equal(done.json().state, "completed");
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${receipt.turnId}.prompt.claimed`));
+  await assertFileMissing(join(harness.stateRoot, "logs", `${receipt.turnId}.prompt`));
+});
+
+test("a failed run preserves the prompt next to its logs instead of deleting it", async (t) => {
+  const harness = await createCliHarness(t);
+  const prompt = "replay me after the failure";
+  const start = await harness.invoke(explicitStartArgs(harness, prompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.failed\",\"message\":\"bad\"}\n"], exitCode: 0 },
+  });
+  const receipt = start.json();
+  const workerId = receipt.workerId ?? await waitForCreatedWorker(harness);
+  const done = await harness.invoke(start.code === 0 ? ["wait", workerId] : ["status", workerId]);
+  const view = done.json();
+  assert.equal(view.state, "failed");
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt.claimed`));
+  const preserved = await readFile(join(harness.stateRoot, "logs", `${view.turnId}.prompt`), "utf8");
+  assert.equal(preserved, prompt);
+  if (process.platform !== "win32") assert.equal((await stat(join(harness.stateRoot, "logs", `${view.turnId}.prompt`))).mode & 0o777, 0o600);
+});
+
+test("an unknown run preserves its prompt for manual recovery", async (t) => {
+  const harness = await createCliHarness(t);
+  const prompt = "recover after missing completion";
+  const start = await harness.invoke(explicitStartArgs(harness, prompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"unknown-prompt\"}\n"], linger: true, exitCode: 0 },
+  });
+  assert.equal(start.code, 0, start.stdout);
+  await harness.waitForCapture(start);
+  await harness.release(start);
+  const done = await harness.invoke(["wait", start.json().workerId]);
+  const view = done.json();
+  assert.equal(view.state, "unknown");
+  assert.equal(await readFile(join(harness.stateRoot, "logs", `${view.turnId}.prompt`), "utf8"), prompt);
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt.claimed`));
+});
+
+test("archive failure leaves the claimed prompt and warning durable before terminal status", async (t) => {
+  const harness = await createCliHarness(t);
+  const prompt = "keep the only prompt after archive obstruction";
+  const start = await harness.invoke(explicitStartArgs(harness, prompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.failed\",\"message\":\"bad\"}\n"], linger: true, exitCode: 0 },
+  });
+  const receipt = start.json();
+  await harness.waitForCapture(start);
+  const archivePath = join(harness.stateRoot, "logs", `${receipt.turnId}.prompt`);
+  await mkdir(archivePath);
+  await harness.release(start);
+  const view = (await harness.invoke(["wait", receipt.workerId])).json();
+  assert.equal(view.state, "failed");
+  assert.equal(view.warnings.includes("prompt_archive_failed"), true);
+  assert.equal(await readFile(join(harness.stateRoot, "prompts", `${view.turnId}.prompt.claimed`), "utf8"), prompt);
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${view.turnId}.prompt`));
+});
+
+test("an existing unrelated archive never replaces the only submitted prompt", async (t) => {
+  const harness = await createCliHarness(t);
+  const prompt = "retain the actual submitted prompt";
+  const start = await harness.invoke(explicitStartArgs(harness, prompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.failed\"}\n"], linger: true, exitCode: 0 },
+  });
+  const receipt = start.json();
+  await harness.waitForCapture(start);
+  const archivePath = join(harness.stateRoot, "logs", `${receipt.turnId}.prompt`);
+  await writeFile(archivePath, "unrelated content", "utf8");
+  await harness.release(start);
+  const view = (await harness.invoke(["wait", receipt.workerId])).json();
+  assert.equal(view.state, "failed");
+  assert.equal(view.warnings.includes("prompt_archive_failed"), true);
+  assert.equal(await readFile(join(harness.stateRoot, "prompts", `${view.turnId}.prompt.claimed`), "utf8"), prompt);
+  assert.equal(await readFile(archivePath, "utf8"), "unrelated content");
+});
+
+test("resume creates an independent prompt disposition and keeps the earlier recovery archive", async (t) => {
+  const harness = await createCliHarness(t);
+  const firstPrompt = "first turn recovery material";
+  const started = await harness.invoke(explicitStartArgs(harness, firstPrompt), {
+    scenario: { stdoutChunks: ["{\"type\":\"thread.started\",\"thread_id\":\"resume-prompt\"}\n", "{\"type\":\"turn.failed\"}\n"], linger: true, exitCode: 0 },
+  });
+  assert.equal(started.code, 0, started.stdout);
+  await harness.waitForCapture(started);
+  await harness.release(started);
+  const failed = (await harness.invoke(["wait", started.json().workerId])).json();
+  assert.equal(failed.state, "failed");
+  const archivedPath = join(harness.stateRoot, "logs", `${failed.turnId}.prompt`);
+  const resumed = await harness.invoke(["resume", failed.workerId, "--", "second turn prompt"], {
+    scenario: { stdoutChunks: ["{\"type\":\"turn.completed\"}\n"], exitCode: 0 },
+  });
+  const completed = (await harness.invoke(["wait", failed.workerId])).json();
+  assert.equal(completed.state, "completed");
+  assert.equal(completed.turnId, resumed.json().turnId);
+  assert.equal(await readFile(archivedPath, "utf8"), firstPrompt);
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${completed.turnId}.prompt`));
+  await assertFileMissing(join(harness.stateRoot, "prompts", `${completed.turnId}.prompt.claimed`));
 });
 
 test("starting cancellation is acknowledged before provider spawn", async (t) => {
@@ -411,7 +509,7 @@ test("completion before runner acknowledgement wins as not_applied and blocks co
   await waitForProcessExit(capture.pid);
   await writeFile(`${cancelBarrier}.release`, "release\n", "utf8");
   const completed = await cancelPromise;
-  assert.equal(completed.code, 0);
+  assert.equal(completed.code, 0, completed.stdout);
   assert.equal(completed.json().state, "completed");
   assert.equal(completed.json().cancel.result, "not_applied");
   assert.equal(completed.json().cancel.acknowledgedAt, null);

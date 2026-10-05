@@ -31,7 +31,13 @@ Cancellation timeout or failure is not `cancelled`.
 
 `read-only`, `workspace-write`, and `full-access` are explicit authority choices. Match the host's existing authority first; a host already operating with full access may explicitly choose Luna `full-access`. A cwd outside provider Git admission does not grant authority. Never broaden authority, change transcription policy or ACLs, or retry as failure recovery. Provider MCP setup remains outside this skill; pass through usage when present and report `unavailable` when the provider supplies no usage event.
 
-Treat the local state root, raw logs, and provider final messages as sensitive. Compact receipts are allowlisted, but content-bearing files are not generically redacted. Do not pass secrets in prompts or delegate secret handling.
+Treat the local state root, raw logs, preserved prompts, and provider final messages as sensitive. Compact receipts are allowlisted, but content-bearing files are not generically redacted. Do not pass secrets in prompts or delegate secret handling.
+
+## Failed prompt recovery and retention
+
+Durably recorded failed and unknown turns preserve the submitted prompt for manual recovery at `<state-root>/logs/<turn-id>.prompt`. Inspect it locally and decide whether to start a new task; the sidecar never replays it automatically. If the receipt includes `prompt_archive_failed`, the atomic move could not complete and the submitted prompt remains at `<state-root>/prompts/<turn-id>.prompt.claimed` (or `.prompt` if the runner had not claimed it). Read-only observation of a dead runner can project an unknown state without archiving: in that case, inspect the original prompt location. Completed and cancelled turns remove their prompt files.
+
+Terminal raw logs and preserved prompts share the existing 256 MiB retention cap. Older eligible terminal evidence may be pruned, including a recovery prompt; copy any prompt you need to keep before that happens. Active turn evidence and compact worker records remain outside prompt pruning.
 
 ## Prompt patterns
 

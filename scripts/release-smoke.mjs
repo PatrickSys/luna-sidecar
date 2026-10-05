@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
+  chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -99,6 +102,7 @@ const gapCodes = new Set([
   "provider_version_invalid",
   "codex_cli_unavailable",
   "claude_code_unavailable",
+  "claude_code_auth_unavailable",
   "codex_cli_host_failed",
   "claude_code_host_failed",
   "host_observation_timeout",
@@ -1070,7 +1074,7 @@ export function buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, 
   if (!hostCommands[host]) throw new ReleaseSmokeError("argument_invalid");
   const args = host === "codex_cli"
     ? ["exec", "--json", "--ephemeral", "--output-schema", schemaPath, "--sandbox", "workspace-write", "--cd", projectRoot, "--skip-git-repo-check", "-"]
-    : ["-p", "--bare", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "user,project,local", "--add-dir", projectRoot];
+    : ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions", "--no-session-persistence", "--setting-sources", "project,local", "--strict-mcp-config", "--add-dir", projectRoot];
   return { ...wrapHostCommand(host, args, environment), input: hostObservationPrompt(host), cwd: projectRoot };
 }
 
@@ -1099,17 +1103,24 @@ function parseJsonLines(text) {
   return events;
 }
 
-function collectHostCommands(value, output = []) {
-  if (!value || typeof value !== "object") return output;
-  if (Array.isArray(value)) {
-    for (const item of value) collectHostCommands(item, output);
-    return output;
+function collectHostCommands(events) {
+  const toolResults = new Map();
+  for (const event of events) if (event?.type === "user" && Array.isArray(event.message?.content)) {
+    for (const block of event.message.content) if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+      const success = block.is_error === undefined || block.is_error === false;
+      toolResults.set(block.tool_use_id, success && toolResults.get(block.tool_use_id) !== false);
+    }
   }
-  for (const [key, item] of Object.entries(value)) {
-    if (["command", "cmd"].includes(key) && typeof item === "string") output.push(item);
-    collectHostCommands(item, output);
-  }
-  return output;
+  return events.flatMap((event) => {
+    if (event?.type === "item.completed" && event.item?.type === "command_execution"
+        && typeof event.item.command === "string" && event.item.status !== "failed"
+        && event.item.exit_code === 0) return [event.item.command];
+    if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
+      return event.message.content.filter((block) => block.type === "tool_use" && block.name === "Bash"
+        && toolResults.get(block.id) === true && typeof block.input?.command === "string").map((block) => block.input.command);
+    }
+    return [];
+  });
 }
 
 function collectHostOutputStrings(value, output = []) {
@@ -1143,15 +1154,44 @@ function isSidecarReceipt(value) {
     && typeof value.turnId === "string" && value.turnId.length > 0;
 }
 
-function hostLifecyclePredicates(commands, skillRoot) {
-  const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
-  return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((commandName) => [commandName, commands.some((command) => {
-    const normalized = command.replaceAll("\\", "/").toLowerCase();
-    const invocation = normalized.split(/\s--\s/, 1)[0];
-    return invocation.includes(expectedSkillRoot)
-      && invocation.includes("luna-sidecar.mjs")
-      && new RegExp(`(?:^|\\s)${commandName}(?:\\s|$)`).test(invocation);
-  })]));
+// Recognize only literal argv prefixes. This is deliberately not a shell interpreter:
+// chains, cwd changes and other wrappers cannot certify the copied launcher.
+function invocationToken(text) {
+  const match = /^\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s"';&|<>()`]+))(?=\s|$)([\s\S]*)$/.exec(text);
+  return match ? { value: match[1] ?? match[2] ?? match[3], rest: match[4].trimStart() } : null;
+}
+
+function copiedLauncherCommand(command, projectRoot, skillRoot) {
+  let text = command.trim();
+  let executable = invocationToken(text);
+  const executableName = (value) => value.replaceAll("\\", "/").split("/").at(-1);
+  if (/^(?:pwsh|powershell)(?:\.exe)?$/i.test(executableName(executable?.value ?? ""))) {
+    const wrapper = /^-Command\s+(["'])([\s\S]*)\1$/i.exec(executable.rest);
+    if (!wrapper) return null;
+    text = wrapper[2].trim();
+  }
+  if (text.startsWith("& ")) text = text.slice(2).trimStart();
+  executable = invocationToken(text);
+  const nodeName = executableName(executable?.value ?? "");
+  if (!executable || !/^node(?:\.exe)?$/.test(process.platform === "win32" ? nodeName.toLowerCase() : nodeName)) return null;
+  const launcher = invocationToken(executable.rest);
+  const lifecycle = launcher && invocationToken(launcher.rest);
+  if (!launcher || !lifecycle || !HOST_LIFECYCLE_COMMANDS.includes(lifecycle.value)) return null;
+  let remainder = lifecycle.rest;
+  while (remainder) {
+    const argument = invocationToken(remainder);
+    if (!argument) return null;
+    remainder = argument.rest;
+  }
+  const normalizePath = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+  const actual = resolve(projectRoot, launcher.value);
+  const expected = join(resolve(skillRoot), "scripts", "luna-sidecar.mjs");
+  return normalizePath(actual) === normalizePath(expected) ? lifecycle.value : null;
+}
+
+function hostLifecyclePredicates(commands, projectRoot, skillRoot) {
+  const observed = new Set(commands.map((command) => copiedLauncherCommand(command, projectRoot, skillRoot)));
+  return Object.fromEntries(HOST_LIFECYCLE_COMMANDS.map((commandName) => [commandName, observed.has(commandName)]));
 }
 
 function finalHostPayload(events) {
@@ -1170,13 +1210,9 @@ function finalHostPayload(events) {
 export function parseHostObservationResult(host, result, { projectRoot, skillRoot }) {
   const events = parseJsonLines(result.stdout);
   if (!events || events.length === 0) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "jsonl_invalid");
-  const commands = events.flatMap((event) => collectHostCommands(event));
-  const expectedSkillRoot = resolve(skillRoot).replaceAll("\\", "/").toLowerCase();
-  const copiedSkillCommand = commands.some((command) => {
-    const normalized = command.replaceAll("\\", "/").toLowerCase();
-    return normalized.includes(expectedSkillRoot) && normalized.includes("luna-sidecar.mjs") && /(?:^|\s)start(?:\s|$)/.test(normalized);
-  });
-  if (!copiedSkillCommand) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "copied_skill_command_missing");
+  const commands = collectHostCommands(events);
+  const lifecycle = hostLifecyclePredicates(commands, projectRoot, skillRoot);
+  if (!lifecycle.start) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "copied_skill_command_missing");
   const receipts = events.flatMap((event) => collectHostOutputStrings(event)).flatMap((text) => parseObjectCandidates(text)).filter(isSidecarReceipt);
   const payload = finalHostPayload(events);
   if (!payload || payload.schemaVersion !== 1 || payload.skill !== "luna-sidecar" || payload.workflow !== "subagent" || payload.taskOutcome !== "not_evaluated") {
@@ -1189,7 +1225,6 @@ export function parseHostObservationResult(host, result, { projectRoot, skillRoo
   if (payload.sidecarReceipt.state !== "completed" || payload.sidecarReceipt.providerState !== "completed" || payload.sidecarReceipt.errorCode !== null || payload.sidecarReceipt.taskOutcome !== "not_evaluated") {
     throw new ReleaseSmokeError("host_schema_mismatch", "provider", "receipt_terminal_invalid");
   }
-  const lifecycle = hostLifecyclePredicates(commands, skillRoot);
   if (!lifecycleComplete(lifecycle)) throw new ReleaseSmokeError("host_schema_mismatch", "provider", "lifecycle_missing");
   return { events, payload, receipt: payload.sidecarReceipt, commands, lifecycle };
 }
@@ -1252,6 +1287,8 @@ export async function runHostObservation({
   cancellationCaller,
   schemaPath,
   environment,
+  hostEnvironment = {},
+  unavailableCode = null,
   run,
   deadline,
   commandLog = [],
@@ -1259,8 +1296,8 @@ export async function runHostObservation({
   terminate = terminateExactPid,
   waitGone = waitPidsGone,
 }) {
-  if (!hostVersion) {
-    const failureCode = host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable";
+  if (unavailableCode || !hostVersion) {
+    const failureCode = gapCodes.has(unavailableCode) ? unavailableCode : (host === "codex_cli" ? "codex_cli_unavailable" : "claude_code_unavailable");
     return { evidence: unavailableHostEvidence(host, failureCode), gaps: [failureCode], ownedPids: [] };
   }
   const invocation = buildHostInvocation(host, { projectRoot, skillRoot, schemaPath, environment });
@@ -1271,7 +1308,7 @@ export async function runHostObservation({
   try {
     result = await run(invocation.file, invocation.args, {
       cwd: invocation.cwd,
-      env: { ...environment, LUNA_SIDECAR_HOME: stateRoot },
+      env: { ...environment, ...hostEnvironment, LUNA_SIDECAR_HOME: stateRoot },
       input: invocation.input,
       deadline,
       timeout: CEILINGS_MS.parent,
@@ -1346,12 +1383,21 @@ export async function runHostObservations({
   schemaPath,
   codexVersion,
   claudeVersion,
+  claudeHostEnvironment = {},
+  claudeCredentials = null,
   inspect = inspectProcessIdentity,
   terminate = terminateExactPid,
 }) {
   const specs = [
     { host: "codex_cli", hostVersion: codexVersion, skillRoot: join(roots.project, ".agents", "skills", "luna-sidecar"), stateRoot: roots.hostCodexState },
-    { host: "claude_code", hostVersion: claudeVersion, skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"), stateRoot: roots.hostClaudeState },
+    {
+      host: "claude_code",
+      hostVersion: claudeVersion,
+      skillRoot: join(roots.project, ".claude", "skills", "luna-sidecar"),
+      stateRoot: roots.hostClaudeState,
+      hostEnvironment: claudeHostEnvironment,
+      unavailableCode: claudeCredentials === "missing" ? "claude_code_auth_unavailable" : null,
+    },
   ];
   const hosts = {};
   const gaps = [];
@@ -1670,6 +1716,35 @@ async function removeScratch(root) {
   } catch { return false; }
 }
 
+async function pathExists(path) {
+  try { await lstat(path); return true; }
+  catch (error) { return error.code !== "ENOENT"; }
+}
+
+const claudeCredentialsFile = ".credentials.json";
+const claudeAuthEnvironmentKeys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+function hasClaudeEnvironmentAuth(environment) {
+  return claudeAuthEnvironmentKeys.some((key) => typeof environment[key] === "string" && environment[key].trim().length > 0);
+}
+
+// Copies only the Claude login file into the private host config dir. Returns "copied" or
+// "missing"; the source path and the file contents never leave this function.
+async function copyClaudeCredentials(sourceEnvironment, targetRoot) {
+  const configured = sourceEnvironment.CLAUDE_CONFIG_DIR;
+  const sourceRoot = typeof configured === "string" && configured.length > 0 ? configured : join(homedir(), ".claude");
+  try {
+    const info = await lstat(join(sourceRoot, claudeCredentialsFile));
+    if (!info.isFile()) return "missing";
+    await copyFile(join(sourceRoot, claudeCredentialsFile), join(targetRoot, claudeCredentialsFile), fsConstants.COPYFILE_EXCL);
+    await chmod(join(targetRoot, claudeCredentialsFile), 0o600);
+    return "copied";
+  } catch {
+    await rm(join(targetRoot, claudeCredentialsFile), { force: true }).catch(() => {});
+    return "missing";
+  }
+}
+
 function versionFromOutput(output) {
   const match = String(output).match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/);
   return match?.[0] ?? null;
@@ -1778,6 +1853,8 @@ export async function orchestrateReleaseSmoke(options = {}) {
     roots.cancellationCaller = await createFreshRoot(scratch, "cancellation-caller");
     roots.hostCodexState = await createFreshRoot(roots.project, ".luna-host-state-codex");
     roots.hostClaudeState = await createFreshRoot(roots.project, ".luna-host-state-claude");
+    roots.hostClaudeConfig = await createFreshRoot(scratch, "host-claude-config");
+    await chmod(roots.hostClaudeConfig, 0o700);
     roots.temp = await createFreshRoot(scratch, "temp");
     const hostSchemaPath = join(roots.temp, "luna-host-observation-schema.json");
     await writeFile(hostSchemaPath, JSON.stringify(hostObservationSchema), "utf8");
@@ -1801,11 +1878,16 @@ export async function orchestrateReleaseSmoke(options = {}) {
     scenarios = await runLiveScenarios({ launcher: install.launchers.codex, roots, env: providerEnv, run, deadline, commandLog });
     gaps.push(...scenarios.gaps);
     if (scenarios.gaps.length > 0) failureStage = "provider";
-    const claudeProbe = await probeHostVersion({ host: "claude_code", run, environment: providerEnv, cwd: roots.project, deadline, commandLog });
-    claudeVersion = claudeProbe.version;
-    hostObservations = options.observeHosts
-      ? await options.observeHosts({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid })
-      : await runHostObservations({ roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid });
+    const copiedCredentials = await copyClaudeCredentials(sourceEnvironment, roots.hostClaudeConfig);
+    const claudeCredentials = copiedCredentials === "copied" ? "copied"
+      : hasClaudeEnvironmentAuth(providerEnv) ? "environment" : "missing";
+    const claudeHostEnvironment = { CLAUDE_CONFIG_DIR: roots.hostClaudeConfig };
+    if (claudeCredentials !== "missing") {
+      const claudeProbe = await probeHostVersion({ host: "claude_code", run, environment: { ...providerEnv, ...claudeHostEnvironment }, cwd: roots.project, deadline, commandLog });
+      claudeVersion = claudeProbe.version;
+    }
+    const hostOptions = { roots, environment: providerEnv, run, deadline, commandLog, schemaPath: hostSchemaPath, codexVersion, claudeVersion, claudeHostEnvironment, claudeCredentials, inspect: options.inspect ?? inspectProcessIdentity, terminate: options.terminate ?? terminateExactPid };
+    hostObservations = options.observeHosts ? await options.observeHosts(hostOptions) : await runHostObservations(hostOptions);
     gaps.push(...hostObservations.gaps);
     if (hostObservations.gaps.length > 0) failureStage ??= "provider";
   } catch (error) {
@@ -1828,7 +1910,9 @@ export async function orchestrateReleaseSmoke(options = {}) {
       cleanup.processesGone = true;
       cleanup.result = evaluateCleanupFacts(cleanup.facts);
     }
-    const scratchClean = !scratch || (cleanup.processesGone && await removeScratch(scratch));
+    const scratchRemoved = !scratch || (cleanup.processesGone && await removeScratch(scratch));
+    const claudeConfigGone = !roots.hostClaudeConfig || (await removeScratch(roots.hostClaudeConfig) && !(await pathExists(roots.hostClaudeConfig)));
+    const scratchClean = scratchRemoved && claudeConfigGone;
     cleanup.facts.scratchCleanupFailed = !scratchClean;
     cleanup.result = evaluateCleanupFacts(cleanup.facts);
     gaps.push(...cleanup.result.gaps);

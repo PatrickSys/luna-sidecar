@@ -160,10 +160,18 @@ test("only sealed canonical terminal raw logs are pruned, with compact evidence 
   const secondPath = join(harness.stateRoot, "workers", `${second.json().workerId}.json`);
   const firstWorker = JSON.parse(await readFile(firstPath, "utf8"));
   const secondWorker = JSON.parse(await readFile(secondPath, "utf8"));
-  await sparse(firstWorker.turns[0].stdoutPath, 130 * 1024 * 1024);
+  await sparse(firstWorker.turns[0].stdoutPath, 125 * 1024 * 1024);
   await sparse(firstWorker.turns[0].stderrPath, 1 * 1024 * 1024);
-  await sparse(secondWorker.turns[0].stdoutPath, 130 * 1024 * 1024);
+  await sparse(secondWorker.turns[0].stdoutPath, 125 * 1024 * 1024);
   await sparse(secondWorker.turns[0].stderrPath, 1 * 1024 * 1024);
+  const preservedPrompt = join(harness.stateRoot, "logs", `${firstWorker.turns[0].turnId}.prompt`);
+  const originalPrompt = join(harness.stateRoot, "prompts", `${firstWorker.turns[0].turnId}.prompt`);
+  const claimedPrompt = join(harness.stateRoot, "prompts", `${firstWorker.turns[0].turnId}.prompt.claimed`);
+  await sparse(preservedPrompt, 2 * 1024 * 1024);
+  await sparse(originalPrompt, 2 * 1024 * 1024);
+  await sparse(claimedPrompt, 2 * 1024 * 1024);
+  assert.equal(await rawBytes(join(harness.stateRoot, "logs")) < 256 * 1024 * 1024, true);
+  assert.equal(await rawBytes(join(harness.stateRoot, "logs")) + await rawBytes(join(harness.stateRoot, "prompts")) > 256 * 1024 * 1024, true);
 
   const [active, activeTwo] = await Promise.all([
     harness.invoke(explicitStartArgs(harness, "trigger pruning one"), { scenario: { stdoutChunks: ["active one\n"], linger: true, exitCode: 0 } }),
@@ -178,11 +186,17 @@ test("only sealed canonical terminal raw logs are pruned, with compact evidence 
   assert.equal(activeWorker.turns[0].logs.pruned, false);
   assert.equal(await isFile(firstWorker.turns[0].stdoutPath), false);
   assert.equal(await isFile(firstWorker.turns[0].stderrPath), false);
+  await assertFileMissing(preservedPrompt);
+  await assertFileMissing(originalPrompt);
+  await assertFileMissing(claimedPrompt);
   const retained = JSON.parse(await readFile(firstPath, "utf8"));
   assert.equal(retained.turns[0].logs.pruned, true);
   const prunedAt = retained.turns[0].logs.prunedAt;
   assert.equal((await stat(secondWorker.turns[0].stdoutPath)).isFile(), true);
-  assert.equal(await rawBytes(join(harness.stateRoot, "logs")) <= 256 * 1024 * 1024, true);
+  assert.equal(
+    await rawBytes(join(harness.stateRoot, "logs")) + await rawBytes(join(harness.stateRoot, "prompts")) <= 256 * 1024 * 1024,
+    true,
+  );
   for (const path of [activeStdout, activeStderr, activeTwoWorker.turns[0].stdoutPath, activeTwoWorker.turns[0].stderrPath]) {
     assert.equal(await isFile(path), true);
   }
@@ -307,6 +321,10 @@ async function sparse(path, bytes) {
 async function isFile(path) {
   try { return (await stat(path)).isFile(); }
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+async function assertFileMissing(path) {
+  assert.equal(await isFile(path), false);
 }
 
 async function rawBytes(root) {

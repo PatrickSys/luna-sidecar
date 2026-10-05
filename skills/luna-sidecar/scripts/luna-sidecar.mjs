@@ -2,9 +2,11 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import {
   link,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -654,7 +656,7 @@ async function publishPrompt(turn, prompt = null) {
   await mkdir(dirname(turn.promptPath), { recursive: true });
   const body = prompt ?? turn.promptBody ?? "";
   const temporary = `${turn.promptPath}.${randomUUID()}.tmp`;
-  await writeFile(temporary, body, "utf8");
+  await writeFile(temporary, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
   let published = false;
   try {
     await replaceFileWithRetry(temporary, turn.promptPath);
@@ -707,7 +709,6 @@ async function launchRunner(workerId, worker, { printResult }) {
         await delay(50);
       }
     }
-    await cleanupPublishedPrompt(latestTurn(worker), workerId);
     if (lastError) throw lastError;
     throw new SidecarError(`Could not start sidecar runner: ${outcome.error.message}`, "runner_spawn_failed", 1);
   }
@@ -803,7 +804,7 @@ async function runWorkerLifecycle(workerId) {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
     if (turn.sourceSchemaVersion === 0) {
-      markUnknown(current, "legacy_runner_unsupported", "A legacy turn cannot be replayed by the v2 runner");
+      await markUnknown(current, "legacy_runner_unsupported", "A legacy turn cannot be replayed by the v2 runner");
       rejectedDeadOwner = true;
       return syncProjection(current);
     }
@@ -812,12 +813,12 @@ async function runWorkerLifecycle(workerId) {
       if (live !== false) {
         throw new SidecarError("This turn already has a live or uncertain runner owner", "runner_already_owned", 1);
       }
-      markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive; prompt replay is forbidden");
+      await markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive; prompt replay is forbidden");
       rejectedDeadOwner = true;
       return syncProjection(current);
     }
     if (current.state !== "starting" || turn.providerState !== "not_started") {
-      markUnknown(current, "runner_ownership_invalid", "Runner ownership could not be established before provider launch");
+      await markUnknown(current, "runner_ownership_invalid", "Runner ownership could not be established before provider launch");
       rejectedDeadOwner = true;
       return syncProjection(current);
     }
@@ -984,7 +985,6 @@ async function runWorkerLifecycle(workerId) {
       } catch {
         warnings.add("stdin_receipt_unavailable");
       }
-      await cleanupPublishedPrompt(turn, workerId);
     });
 
     const cancelTimer = setInterval(() => {
@@ -1342,9 +1342,10 @@ function isDirectExecution() {
 }
 
 async function finalizeCancelled(workerId, stdoutMeta, stderrMeta) {
-  const result = await mutateWorker(workerId, (current) => {
+  const result = await mutateWorker(workerId, async (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state) && current.state !== "cancelling") return current;
+    await disposeTerminalPrompt(turn, "discard");
     turn.state = "cancelled";
     turn.providerState = "unknown";
     turn.completedAt = turn.completedAt ?? new Date().toISOString();
@@ -1385,7 +1386,7 @@ async function persistProviderReadiness(workerId, sessionId) {
 }
 
 async function finalizeProvider(workerId, facts) {
-  const result = await mutateWorker(workerId, (current) => {
+  const result = await mutateWorker(workerId, async (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
     if (facts.sessionId) turn.sessionId = facts.sessionId;
@@ -1431,6 +1432,7 @@ async function finalizeProvider(workerId, facts) {
       turn.errorCode = "missing_provider_completion";
       turn.error = controlledErrorMessage("missing_provider_completion");
     }
+    await disposeTerminalPrompt(turn, turn.state === "completed" ? "discard" : "preserve");
     return syncProjection(current);
   });
   const turn = latestTurn(result.worker);
@@ -1492,10 +1494,11 @@ function emptyLogMetadata() {
 }
 
 async function persistRunnerFailure(workerId, errorCode, error, providerState = "failed", stdoutMeta = emptyLogMetadata(), stderrMeta = emptyLogMetadata()) {
-  await mutateWorker(workerId, (current) => {
+  await mutateWorker(workerId, async (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
     errorCode = normalizeErrorCode(errorCode);
+    await disposeTerminalPrompt(turn, "preserve");
     turn.state = "failed";
     turn.providerState = providerState;
     turn.errorCode = errorCode;
@@ -1526,7 +1529,7 @@ async function resumeWorker(workerId, taskInput) {
           if (!active.runnerPid) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
           const live = await runnerLiveness(active.runnerPid);
           if (live !== false) throw new SidecarError("Worker already has an active turn", "active_turn", 1);
-          markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive");
+          await markUnknown(current, "runner_not_alive", "The recorded runner is no longer alive");
           becameUnknown = true;
           return syncProjection(current);
         }
@@ -1556,9 +1559,10 @@ function workerUnknown(workerId, worker) {
   return worker;
 }
 
-function markUnknown(worker, errorCode, message) {
+async function markUnknown(worker, errorCode, message) {
   const turn = latestTurn(worker);
   if (!turn || isTerminal(worker.state)) return;
+  await disposeTerminalPrompt(turn, "preserve");
   turn.state = "unknown";
   turn.providerState = "unknown";
   turn.errorCode = normalizeErrorCode(errorCode);
@@ -1632,7 +1636,7 @@ async function cancelWorker(workerId) {
       if (current.cancel?.requestId && current.state === "cancelling") return current;
       const live = turn.runnerPid ? await runnerLiveness(turn.runnerPid) : false;
       if (live !== true) {
-        markUnknown(current, "cancel_failed", "The live runner could not be verified; no process was signalled");
+        await markUnknown(current, "cancel_failed", "The live runner could not be verified; no process was signalled");
         turn.cancel = {
           requestId: randomUUID(),
           requestedAt: new Date().toISOString(),
@@ -1678,7 +1682,6 @@ async function cancelWorker(workerId) {
       const turn = latestTurn(existing);
       if (turn) {
         await removeCancelRequest(workerId, turn.turnId);
-        await cleanupPublishedPrompt(turn, workerId);
       }
       process.exitCode = 1;
     }
@@ -1701,7 +1704,7 @@ async function cancelWorker(workerId) {
     if (!turn || isTerminal(current.state) || current.state !== "cancelling") return current;
     const live = turn.runnerPid ? await runnerLiveness(turn.runnerPid) : false;
     if (live === false) {
-      markUnknown(current, "cancel_failed", "The runner exited before cancellation was acknowledged; no stored PID was signalled");
+      await markUnknown(current, "cancel_failed", "The runner exited before cancellation was acknowledged; no stored PID was signalled");
       if (turn.cancel) {
         turn.cancel.finishedAt = new Date().toISOString();
         turn.cancel.result = "cancel_failed";
@@ -1818,7 +1821,7 @@ async function finishStartingCancel(workerId) {
     if (current.state !== "cancelling") return current;
     const request = await readCancelRequest(turn.turnId);
     if (!matchesCancelRequest(current, turn, request)) {
-      markUnknown(current, "cancel_failed", "The committed cancellation request is missing or invalid; provider was not launched");
+      await markUnknown(current, "cancel_failed", "The committed cancellation request is missing or invalid; provider was not launched");
       if (turn.cancel) {
         turn.cancel.finishedAt = new Date().toISOString();
         turn.cancel.result = "cancel_failed";
@@ -1833,6 +1836,7 @@ async function finishStartingCancel(workerId) {
     turn.cancel.finishedAt = new Date().toISOString();
     turn.cancel.result = "cancelled";
     turn.cancel.errorCode = null;
+    await disposeTerminalPrompt(turn, "discard");
     turn.state = "cancelled";
     turn.providerState = "not_started";
     turn.completedAt = turn.cancel.finishedAt;
@@ -1846,17 +1850,16 @@ async function finishStartingCancel(workerId) {
   const turn = cancelledTurn ?? latestTurn(result.worker);
   if (turn) {
     await removeCancelRequest(workerId, turn.turnId);
-    await cleanupPublishedPrompt(turn, workerId);
   }
   return true;
 }
 
 async function persistUnknown(workerId, errorCode, message, cancelResult = null, stdoutMeta = null, stderrMeta = null) {
-  const result = await mutateWorker(workerId, (current) => {
+  const result = await mutateWorker(workerId, async (current) => {
     const turn = latestTurn(current);
     if (!turn || isTerminal(current.state)) return current;
     errorCode = normalizeErrorCode(errorCode);
-    markUnknown(current, errorCode, message);
+    await markUnknown(current, errorCode, message);
     if (stdoutMeta || stderrMeta) turn.logs = mergeLogMetadata(turn.logs, stdoutMeta ?? emptyLogMetadata(), stderrMeta ?? emptyLogMetadata());
     if (cancelResult && turn.cancel) {
       turn.cancel.finishedAt = new Date().toISOString();
@@ -1921,6 +1924,91 @@ async function cleanupPublishedPrompt(turn, workerId = null) {
       return syncProjection(current);
     }).catch(() => {});
   }
+}
+
+async function disposeTerminalPrompt(turn, disposition) {
+  if (!turn || turn.sourceSchemaVersion === 0) return;
+  const sourcePaths = [
+    join(promptsRoot, `${turn.turnId}.prompt.claimed`),
+    join(promptsRoot, `${turn.turnId}.prompt`),
+  ];
+  const archivePath = join(logsRoot, `${turn.turnId}.prompt`);
+  const addWarning = (warning) => {
+    turn.warnings = boundedWarnings([...(turn.warnings ?? []), warning]);
+  };
+
+  if (disposition === "discard") {
+    let failed = false;
+    for (const path of [...sourcePaths, archivePath]) {
+      try { await rm(path, { force: true }); }
+      catch { failed = true; }
+    }
+    if (failed) addWarning("prompt_cleanup_failed");
+    return;
+  }
+
+  let archiveExists = false;
+  try {
+    const details = await lstat(archivePath);
+    if (!details.isFile() || details.isSymbolicLink() || !await matchesPromptHash(archivePath, turn.promptSha256)) {
+      addWarning("prompt_archive_failed");
+      return;
+    }
+    archiveExists = true;
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      addWarning("prompt_archive_failed");
+      return;
+    }
+  }
+
+  if (archiveExists) {
+    for (const source of sourcePaths) {
+      try {
+        const details = await lstat(source);
+        if (details.isFile() || details.isSymbolicLink()) {
+          addWarning("prompt_archive_failed");
+          return;
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          addWarning("prompt_archive_failed");
+          return;
+        }
+      }
+    }
+  } else {
+    let archived = false;
+    for (const source of sourcePaths) {
+      try {
+        const details = await lstat(source);
+        if (!details.isFile() || details.isSymbolicLink()) {
+          addWarning("prompt_archive_failed");
+          return;
+        }
+        await rename(source, archivePath);
+        archived = true;
+        break;
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        addWarning("prompt_archive_failed");
+        return;
+      }
+    }
+    if (!archived) return;
+  }
+
+}
+
+async function matchesPromptHash(path, expectedHash) {
+  if (typeof expectedHash !== "string" || !/^[0-9a-f]{64}$/.test(expectedHash)) return false;
+  const digest = createHash("sha256");
+  try {
+    for await (const chunk of createReadStream(path)) digest.update(chunk);
+  } catch {
+    return false;
+  }
+  return digest.digest("hex") === expectedHash;
 }
 
 async function safeRealpath(cwd) {
@@ -1993,19 +2081,27 @@ async function collectPruneCandidates() {
     if (!worker) continue;
     for (const turn of worker.turns ?? []) {
       if (!turn || !isTerminal(turn.state) || !worker.workerId) continue;
-      const paths = [turn.stdoutPath, turn.stderrPath];
-      if (!paths.every((value, index) => isCanonicalLogPath(value, turn.turnId, index === 0 ? "jsonl" : "stderr.log"))) continue;
-      const sizes = await Promise.all(paths.map(rawFileSize));
-      if (sizes.some((value) => value === null)) continue;
+      const logPaths = [turn.stdoutPath, turn.stderrPath];
+      if (!logPaths.every((value, index) => isCanonicalLogPath(value, turn.turnId, index === 0 ? "jsonl" : "stderr.log"))) continue;
+      const promptPaths = [
+        join(logsRoot, `${turn.turnId}.prompt`),
+        join(promptsRoot, `${turn.turnId}.prompt`),
+        join(promptsRoot, `${turn.turnId}.prompt.claimed`),
+      ];
+      const logSizes = await Promise.all(logPaths.map(rawFileSize));
+      const promptSizes = await Promise.all(promptPaths.map(rawOptionalFileSize));
+      if (logSizes.some((value) => value === null) || promptSizes.some((value) => value === null)) continue;
+      const retainedPromptPaths = promptPaths.filter((value, index) => promptSizes[index].file);
       candidates.push({
         workerId,
         turnId: turn.turnId,
         eligible: pruneEligible(worker, turn),
         pruning: turn.logs?.pruning === true,
-        stdoutMissing: sizes[0].missing,
-        stderrMissing: sizes[1].missing,
-        missing: sizes.some((value) => value.missing),
-        bytes: sizes.reduce((sum, value) => sum + value.bytes, 0),
+        stdoutMissing: logSizes[0].missing,
+        stderrMissing: logSizes[1].missing,
+        promptPaths: retainedPromptPaths,
+        missing: logSizes.some((value) => value.missing),
+        bytes: [...logSizes, ...promptSizes].reduce((sum, value) => sum + value.bytes, 0),
         sortKey: `${turn.completedAt ?? turn.createdAt ?? ""}\u0000${workerId}\u0000${turn.turnId}`,
       });
     }
@@ -2035,7 +2131,11 @@ async function pruneOneTerminalTurn(candidate) {
   const current = await readWorker(candidate.workerId).catch(() => null);
   const turn = current?.turns?.find((value) => value.turnId === candidate.turnId);
   if (!turn || !pruneEligible(current, turn)) return false;
-  const paths = [turn.stdoutPath, turn.stderrPath];
+  const paths = [
+    turn.stdoutPath,
+    turn.stderrPath,
+    ...candidate.promptPaths,
+  ];
   const sizes = await Promise.all(paths.map(rawFileSize));
   if (sizes.some((value) => value === null)) return false;
   let failed = false;
@@ -2086,6 +2186,16 @@ async function rawFileSize(filePath) {
     return details.isFile() ? { bytes: details.size, missing: false } : null;
   } catch (error) {
     if (error.code === "ENOENT") return { bytes: 0, missing: true };
+    return null;
+  }
+}
+
+async function rawOptionalFileSize(filePath) {
+  try {
+    const details = await lstat(filePath);
+    return { bytes: details.isFile() ? details.size : 0, file: details.isFile() };
+  } catch (error) {
+    if (error.code === "ENOENT") return { bytes: 0, file: false };
     return null;
   }
 }
