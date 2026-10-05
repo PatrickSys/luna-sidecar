@@ -12,6 +12,8 @@ evidence_contract:
   missing_kinds: [exact_final_documentation_head_ci, real_host_runtime]
 review_status: passed
 git_delivery_check:
+  snapshot_commit: 72151ea9cd52f4d1d748c6ac7587cfdc2682faa6
+  snapshot_scope: original_pr_head_before_corrective_delivery
   branch: fix/phase5-live-evidence
   commits_ahead_of_main: 3
   pr_state: OPEN

@@ -7,7 +7,7 @@
 **Canonical source:** `PatrickSys/luna-sidecar`
 **Delivery policy:** Small verified commits may go directly to `main`; never force-push and never overwrite unexpected remote movement.
 
-**Current State (2026-10-05):** Phase 5 implementation and locally executable verification are present, including PR 1's host-evidence, authentication and prompt-retention corrections. Public `full-access` remains persisted as `full-access` while Codex argv uses installed `danger-full-access`, and explicit start/resume cwd invocation includes `--skip-git-repo-check`. The corrected implementation has successful exact-head Windows/Linux CI and fresh independent corrective-merge reviews; `.planning/phases/05-simple-subagent-ux/05-PR1-VERIFICATION.md` records the evidence and scope. Successful exact-commit real Codex and Claude host observations remain missing, so release closure stays open and `releaseReady` stays false.
+**Current State (2026-10-05):** Phase 5 implementation and locally executable verification are present, including PR 1's host-evidence, authentication and prompt-retention corrections. Public `full-access` remains persisted as `full-access` while Codex argv uses installed `danger-full-access`, and explicit start/resume cwd invocation includes `--skip-git-repo-check`. Implementation commit `af42ec4` has successful exact-head Windows/Linux CI and fresh independent corrective-merge reviews; `.planning/phases/05-simple-subagent-ux/05-PR1-VERIFICATION.md` records the evidence and scope. Successful exact-commit real Codex and Claude host observations remain missing, so release closure stays open and `releaseReady` stays false.
 
 ## Phase 5 final-shape amendment
 
