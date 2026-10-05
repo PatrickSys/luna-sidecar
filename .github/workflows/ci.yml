@@ -24,5 +24,47 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Diagnose bounded Windows metadata lookup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @'
+          import { spawnSync } from 'node:child_process';
+          import { join } from 'node:path';
+          import { buildMinimalTestEnvironment } from './test/helpers/cli-harness.mjs';
+          const root = process.env.SystemRoot;
+          const psHome = join(root, 'System32', 'WindowsPowerShell', 'v1.0');
+          const executable = join(psHome, 'powershell.exe');
+          const minimal = buildMinimalTestEnvironment(null, { LUNA_HARNESS_PID: String(process.pid) });
+          const os = { PATH: [join(root, 'System32'), root, psHome].join(';'), SystemDrive: process.env.SystemDrive };
+          const profile = Object.fromEntries(['USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH'].filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]]));
+          const cases = [
+            ['wmi-minimal', {}, 'wmi', false],
+            ['wmi-os', os, 'wmi', false],
+            ['wmi-profile', profile, 'wmi', false],
+            ['wmi-modulepath', { PSModulePath: process.env.PSModulePath }, 'wmi', false],
+            ['wmi-explicit-module', {}, 'wmi', true],
+            ['wmi-platform', { ...os, ...profile, PSModulePath: process.env.PSModulePath }, 'wmi', false],
+            ['cim-minimal', {}, 'cim', false],
+            ['cim-os', os, 'cim', false],
+            ['cim-profile', profile, 'cim', false],
+            ['cim-explicit-module', {}, 'cim', true],
+            ['direct-wmi-minimal', {}, 'direct', false],
+          ];
+          for (const [name, extra, api, explicit] of cases) {
+            const module = api === 'wmi' ? 'Microsoft.PowerShell.Management' : 'CimCmdlets';
+            const load = explicit ? `Import-Module (Join-Path $PSHOME 'Modules/${module}/${module}.psd1'); [Console]::Error.WriteLine('stage:module_loaded');` : '';
+            const command = api === 'wmi' ? 'Get-WmiObject' : 'Get-CimInstance';
+            const query = api === 'wmi' ? `${command} -Class` : `${command} -ClassName`;
+            const lookup = api === 'direct'
+              ? "Add-Type -AssemblyName System.Management; [Console]::Error.WriteLine('stage:assembly_loaded'); $searcher = [System.Management.ManagementObjectSearcher]::new(('SELECT ProcessId FROM Win32_Process WHERE ProcessId = ' + [int]$env:LUNA_HARNESS_PID)); $p = @($searcher.Get())[0];"
+              : `${load} Get-Command ${command} -ErrorAction Stop | Out-Null; [Console]::Error.WriteLine('stage:cmdlet_resolved'); $p = ${query} Win32_Process -Filter ('ProcessId = ' + [int]$env:LUNA_HARNESS_PID);`;
+            const script = `$ErrorActionPreference = 'Stop'; [Console]::Error.WriteLine('stage:script_started'); ${lookup} [Console]::Error.WriteLine('stage:query_returned'); [Console]::Out.WriteLine([int]$p.ProcessId);`;
+            const started = performance.now();
+            const result = spawnSync(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { env: { ...minimal, ...extra }, encoding: 'utf8', timeout: 5000, windowsHide: true });
+            const stages = [...(result.stderr ?? '').matchAll(/stage:(script_started|module_loaded|cmdlet_resolved|assembly_loaded|query_returned)/g)].map(m => m[1]);
+            console.log(JSON.stringify({ name, elapsedMs: Math.ceil(performance.now() - started), status: result.status, signal: result.signal, error: result.error?.code ?? null, stages, exactPid: result.stdout?.trim() === String(process.pid) }));
+          }
+          '@ | node --input-type=module
       - run: npm test
       - run: git diff --check
